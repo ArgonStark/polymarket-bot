@@ -144,21 +144,21 @@ class TradingBot:
         trading_mode = self.config.trading.mode.upper()
 
         logger.info("=" * 60)
-        logger.info(f"  POLYMARKET 15-MIN CRYPTO ARBITRAGE BOT")
+        logger.info("  POLYMARKET 15-MIN CRYPTO ARBITRAGE BOT")
         logger.info(f"  Mode: {mode} ({trading_mode})")
         logger.info("=" * 60)
 
-        # Try to fetch real account info if client is available
-        if self.client:
+        # Try to fetch real account info if client is available and configured
+        if self.client is not None:
             try:
-                # Fetch balance
+                # Fetch balance using SDK
                 balance = get_account_balance(self.client)
                 if balance is not None:
                     logger.info(f"  Account Balance: ${balance:,.2f} USDC")
                 else:
-                    logger.info("  Account Balance: Unable to fetch")
+                    logger.info("  Account Balance: Unable to fetch (check API credentials)")
 
-                # Fetch open orders count
+                # Fetch open orders count using SDK
                 from .execution.client import get_open_orders
                 open_orders = get_open_orders(self.client)
                 logger.info(f"  Open Orders: {len(open_orders)}")
@@ -166,15 +166,17 @@ class TradingBot:
             except Exception as e:
                 logger.warning(f"  Could not fetch account info: {e}")
         else:
+            # No client available
+            simulated_balance = (
+                self.config.trading.base_position_size
+                * self.config.trading.max_concurrent_positions
+                * 5
+            )
             if self.config.dry_run:
-                simulated_balance = (
-                    self.config.trading.base_position_size
-                    * self.config.trading.max_concurrent_positions
-                    * 5
-                )
                 logger.info(f"  Simulated Balance: ${simulated_balance:,.2f} USDC")
+                logger.info("  (Wallet not configured - simulation only)")
             else:
-                logger.warning("  Account: Not connected (client creation failed)")
+                logger.warning("  Account: Not connected (configure PK and FUNDER in .env)")
 
         # Display key trading parameters
         logger.info("-" * 60)
