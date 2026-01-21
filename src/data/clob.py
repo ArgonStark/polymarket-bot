@@ -46,6 +46,7 @@ class CLOBFeed:
     _ping_timeout: int = field(init=False, default=10)
     _retry_count: int = 0
     _circuit_open: bool = False  # Circuit breaker state
+    _shutdown: bool = False  # Graceful shutdown flag
 
     def __post_init__(self):
         """Initialize WebSocket settings from config."""
@@ -290,7 +291,7 @@ class CLOBFeed:
         """
         loop = asyncio.get_running_loop()
 
-        while not self._circuit_open:
+        while not self._circuit_open and not self._shutdown:
             try:
                 url = self.config.endpoints.clob_ws_url
 
@@ -334,12 +335,22 @@ class CLOBFeed:
                 )
                 return
 
+            # Check shutdown before reconnecting
+            if self._shutdown:
+                logger.info("CLOB shutdown requested, stopping reconnection")
+                return
+
             # Reconnect with exponential backoff
             logger.warning(
                 f"CLOB reconnecting in {self._reconnect_delay:.1f}s... "
                 f"(attempt {self._retry_count}/{self._max_retries})"
             )
             await asyncio.sleep(self._reconnect_delay)
+
+            # Check shutdown again after sleep
+            if self._shutdown:
+                logger.info("CLOB shutdown requested, stopping reconnection")
+                return
 
             self._reconnect_delay = min(
                 self._reconnect_delay * 2, self._max_reconnect_delay
@@ -353,7 +364,8 @@ class CLOBFeed:
         logger.info("CLOB circuit breaker reset")
 
     def disconnect(self):
-        """Close the WebSocket connection."""
+        """Close the WebSocket connection and stop reconnection attempts."""
+        self._shutdown = True  # Prevent reconnection attempts
         if self._ws:
             self._ws.close()
             self._connected = False
