@@ -129,6 +129,9 @@ class RiskManager:
         """
         Adjust signal size to fit within risk limits.
 
+        Uses compounding: position size scales with current bankroll.
+        As you win, positions get bigger. As you lose, they get smaller.
+
         Args:
             signal: Signal to adjust
 
@@ -136,16 +139,36 @@ class RiskManager:
             Adjusted signal (may have reduced size)
         """
         trading = self.config.trading
+
+        # Compounding: use percentage of CURRENT bankroll, not fixed size
+        # This means positions grow as you win and shrink as you lose
+        base_from_bankroll = self.current_bankroll * trading.max_position_pct
+
+        # Also respect the configured base position size as a minimum guide
+        # In aggressive mode, base_position_size is lower, so bankroll % dominates
+        target_size = max(base_from_bankroll, trading.base_position_size)
+
+        # Cap at max allowed per position
         max_size = self.current_bankroll * trading.max_position_pct
-        available = self.current_bankroll * 0.95  # Keep 5% buffer
+        available = self.current_bankroll * 0.90  # Keep 10% buffer for fees
 
-        max_allowed = min(max_size, available, trading.base_position_size)
+        # Final position size
+        position_size = min(target_size, max_size, available)
 
-        if signal.size_usd > max_allowed:
-            ratio = max_allowed / signal.size_usd
-            signal.size_usd = max_allowed
-            signal.size_shares = signal.size_shares * ratio
-            logger.info(f"Adjusted signal size to ${max_allowed:.2f}")
+        # Ensure minimum viable trade size ($5)
+        if position_size < 5.0:
+            logger.warning(f"Position size ${position_size:.2f} below minimum, skipping")
+            signal.size_usd = 0
+            signal.size_shares = 0
+            return signal
+
+        # Scale signal to target size
+        if signal.size_usd != position_size:
+            if signal.size_usd > 0:
+                ratio = position_size / signal.size_usd
+                signal.size_shares = signal.size_shares * ratio
+            signal.size_usd = position_size
+            logger.debug(f"Compounded position size: ${position_size:.2f} ({trading.max_position_pct:.0%} of ${self.current_bankroll:.2f})")
 
         return signal
 

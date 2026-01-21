@@ -224,21 +224,34 @@ class SignalGenerator:
         """
         Determine order action based on edge and urgency.
 
-        Decision matrix:
-        - edge >= 50% AND time < 60s -> MARKET (guaranteed fill)
-        - edge >= 40% AND time < 120s -> LIMIT (may take)
-        - edge >= 30% AND time > 120s -> POST_ONLY (earn rebates)
+        POST-FEE UPDATE (Jan 2025): Polymarket introduced dynamic taker fees
+        up to 3.15% near 50% odds. Strategy now prioritizes MAKER orders
+        to earn rebates instead of paying fees.
+
+        Decision matrix (fee-aware):
+        - edge >= 50% AND time < 30s -> MARKET (only when very urgent)
+        - edge >= 30% AND time < 60s -> LIMIT (aggressive maker)
+        - edge >= min_edge -> POST_ONLY (earn rebates, preferred)
         - Otherwise -> SKIP
         """
         trading = self.config.trading
 
-        if edge >= trading.edge_for_market and time_remaining < trading.time_for_market:
+        # Only use MARKET orders when absolutely necessary (time critical)
+        # Fees are too high otherwise
+        if edge >= trading.edge_for_market and time_remaining < 30:
             return OrderAction.MARKET
 
-        elif edge >= trading.edge_for_limit and time_remaining < trading.time_for_limit:
+        # LIMIT when edge is good and time is moderate
+        # But prefer POST_ONLY when possible
+        elif edge >= trading.edge_for_limit and time_remaining < trading.time_for_market:
             return OrderAction.LIMIT
 
-        elif edge >= trading.edge_for_post_only and time_remaining > trading.time_for_limit:
+        # POST_ONLY is the preferred action - earns rebates, avoids fees
+        elif edge >= trading.edge_for_post_only:
+            return OrderAction.POST_ONLY
+
+        # Even with lower edge, try POST_ONLY if we have time
+        elif edge >= trading.min_edge and time_remaining > 60:
             return OrderAction.POST_ONLY
 
         else:
@@ -280,19 +293,27 @@ class SignalGenerator:
         """
         Calculate position size in USD and shares.
 
-        Uses base position size from config, potentially
-        adjusted by edge strength.
+        Uses Kelly-inspired sizing: bet more when edge is higher.
+        Position size scales from base_position_size up to 2x
+        based on edge strength.
 
         Returns:
             Tuple of (size_usd, size_shares)
         """
         trading = self.config.trading
 
-        # Start with base position size
-        size_usd = trading.base_position_size
+        # Base position size
+        base_size = trading.base_position_size
 
-        # Could add Kelly sizing or edge-based scaling here
-        # For now, use fixed size
+        # Kelly-inspired scaling: higher edge = larger position
+        # Clamp edge between 0 and 0.5 for scaling
+        edge_factor = min(edge, 0.5) / 0.5  # 0 to 1 based on edge
+
+        # Scale from 1x to 2x base size based on edge
+        # 10% edge = 1x, 50% edge = 2x
+        kelly_multiplier = 1.0 + edge_factor
+
+        size_usd = base_size * kelly_multiplier
 
         # Convert to shares
         price = max(0.01, min(0.99, price))

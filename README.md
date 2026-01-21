@@ -166,28 +166,50 @@ Options:
 
 ## Order Execution Strategy
 
-The bot uses different order types based on edge strength and time urgency:
+### Fee-Aware Strategy (Updated Jan 2025)
+
+**IMPORTANT**: Polymarket introduced dynamic taker fees up to **3.15%** near 50% odds.
+The bot now prioritizes **MAKER orders (POST_ONLY)** to earn rebates instead of paying fees.
 
 | Edge | Time Remaining | Action | Description |
 |------|----------------|--------|-------------|
-| ≥50% | <60s | MARKET (FOK) | Guaranteed fill |
-| ≥40% | <120s | LIMIT (GTC) | May take liquidity |
-| ≥30% | >120s | POST_ONLY | Earn maker rebates |
-| <30% | - | SKIP | Edge too low |
+| ≥40% | <30s | MARKET (FOK) | Only when very urgent |
+| ≥20% | <45s | LIMIT (GTC) | Aggressive maker |
+| ≥8% | >60s | POST_ONLY | **Preferred** - earns rebates |
+| <8% | - | SKIP | Edge too low |
 
-### Fee Structure
+### Fee Structure (Dynamic Fees)
 
-**Taker Fees (avoid when possible):**
+**Taker Fees (AVOID - fees are higher now):**
 ```
 fee_rate = 0.25 × (price × (1 - price))²
 ```
-- At 50% odds: ~1.56% fee
-- At 30% odds: ~0.56% fee
-- At 10% odds: ~0.08% fee
+- At 50% odds: up to **3.15%** fee (dynamic)
+- At 30% odds: ~1.5% fee
+- At 10% odds: ~0.2% fee
 
-**Maker Rebates:**
+**Maker Rebates (PRIORITIZED):**
 - 100% of collected taker fees redistributed to makers
 - Daily USDC payments proportional to filled maker volume
+- **This is now the primary profit mechanism**
+
+### Aggressive Mode
+
+For high-risk/high-reward trading (inspired by @0x8dxd who turned $313 → $414K):
+
+```bash
+# Copy aggressive config
+cp .env.aggressive .env
+# Edit with your credentials, then:
+python main.py --dry-run  # Test first!
+```
+
+**Aggressive mode features:**
+- Lower edge threshold (8% vs 25%)
+- Compounding position sizing (scales with wins)
+- Kelly-inspired sizing (bigger edge = bigger bet)
+- Prioritizes POST_ONLY orders (earn rebates)
+- Higher daily loss tolerance (40%)
 
 ## Project Structure
 

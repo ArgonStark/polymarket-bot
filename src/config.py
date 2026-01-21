@@ -39,6 +39,12 @@ class APIConfig:
 class TradingConfig:
     """Trading parameters and thresholds."""
 
+    # Trading mode: "conservative", "normal", or "aggressive"
+    # Aggressive mode enables compounding and Kelly-based sizing
+    mode: str = field(
+        default_factory=lambda: os.getenv("TRADING_MODE", "normal")
+    )
+
     # Minimum edge required to enter a trade (as decimal, e.g., 0.25 = 25%)
     min_edge: float = field(
         default_factory=lambda: float(os.getenv("MIN_EDGE", "0.25"))
