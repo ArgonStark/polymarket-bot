@@ -346,15 +346,17 @@ class GammaAPI:
                     return None
 
             # Parse timestamps - try multiple field names
+            # IMPORTANT: Use endDate first (full datetime), NOT endDateIso (date only)
+            # API returns endDateIso as just "2026-01-21" without time!
             end_time_str = (
-                market.get("endDateIso")
-                or market.get("endDate")
+                market.get("endDate")
                 or market.get("end_date_iso")
+                or market.get("endDateIso")  # Last resort - date only
             )
             start_time_str = (
-                market.get("startDateIso")
-                or market.get("startDate")
+                market.get("startDate")
                 or market.get("start_date_iso")
+                or market.get("startDateIso")  # Last resort - date only
             )
 
             if not end_time_str:
