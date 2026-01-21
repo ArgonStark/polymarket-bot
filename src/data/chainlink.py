@@ -38,11 +38,24 @@ class ChainlinkFeed:
     _prices: dict[str, float] = field(default_factory=dict)
     _price_history: dict[str, PriceHistory] = field(default_factory=dict)
     _connected: bool = False
-    _reconnect_delay: float = 1.0
-    _max_reconnect_delay: float = 60.0
+    _reconnect_delay: float = field(init=False)
+    _max_reconnect_delay: float = field(init=False)
+    _max_retries: int = field(init=False)
+    _ping_interval: int = field(init=False)
+    _ping_timeout: int = field(init=False)
+    _retry_count: int = 0
+    _circuit_open: bool = False  # Circuit breaker state
 
     def __post_init__(self):
-        """Initialize price history for supported assets."""
+        """Initialize price history and WebSocket settings from config."""
+        # Initialize WebSocket settings from config
+        self._reconnect_delay = self.config.websocket.initial_reconnect_delay
+        self._max_reconnect_delay = self.config.websocket.max_reconnect_delay
+        self._max_retries = self.config.websocket.max_retries
+        self._ping_interval = self.config.websocket.ping_interval
+        self._ping_timeout = self.config.websocket.ping_timeout
+
+        # Initialize price history for supported assets
         for asset in self.config.supported_assets:
             symbol = f"{asset.lower()}/usd"
             self._price_history[symbol] = PriceHistory(asset=asset)
@@ -92,7 +105,8 @@ class ChainlinkFeed:
         """Handle WebSocket connection opened."""
         logger.info("Chainlink WebSocket connected")
         self._connected = True
-        self._reconnect_delay = 1.0  # Reset reconnect delay
+        self._reconnect_delay = self.config.websocket.initial_reconnect_delay  # Reset reconnect delay
+        self._retry_count = 0  # Reset retry count on successful connection
 
         # Subscribe to crypto prices
         subscribe_msg = {
@@ -198,11 +212,11 @@ class ChainlinkFeed:
         Connect to Chainlink WebSocket asynchronously.
 
         Runs the blocking WebSocket in a thread pool executor.
-        Handles automatic reconnection with exponential backoff.
+        Handles automatic reconnection with exponential backoff and circuit breaker.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
-        while True:
+        while not self._circuit_open:
             try:
                 url = self.config.endpoints.chainlink_rtds_url
 
@@ -217,21 +231,52 @@ class ChainlinkFeed:
                 logger.info(f"Connecting to Chainlink feed: {url}")
 
                 # Run in thread pool to not block event loop
+                ping_int = self._ping_interval
+                ping_to = self._ping_timeout
                 await loop.run_in_executor(
                     None,
-                    lambda: self._ws.run_forever(ping_interval=30, ping_timeout=10),
+                    lambda: self._ws.run_forever(ping_interval=ping_int, ping_timeout=ping_to),
                 )
 
+                # If we get here, connection was successful then closed
+                # Reset retry count on successful connection
+                if self._connected:
+                    self._retry_count = 0
+                    self._reconnect_delay = self.config.websocket.initial_reconnect_delay
+
+            except asyncio.CancelledError:
+                logger.info("Chainlink connection cancelled")
+                return
             except Exception as e:
                 logger.error(f"Chainlink connection error: {e}")
 
+            # Check circuit breaker
+            self._retry_count += 1
+            if self._retry_count >= self._max_retries:
+                self._circuit_open = True
+                logger.error(
+                    f"Chainlink circuit breaker OPEN after {self._retry_count} failures. "
+                    f"Feed will not auto-reconnect. Manual intervention required."
+                )
+                return
+
             # Reconnect with exponential backoff
-            logger.info(f"Reconnecting in {self._reconnect_delay:.1f}s...")
+            logger.warning(
+                f"Chainlink reconnecting in {self._reconnect_delay:.1f}s... "
+                f"(attempt {self._retry_count}/{self._max_retries})"
+            )
             await asyncio.sleep(self._reconnect_delay)
 
             self._reconnect_delay = min(
                 self._reconnect_delay * 2, self._max_reconnect_delay
             )
+
+    def reset_circuit_breaker(self):
+        """Reset circuit breaker to allow reconnection."""
+        self._circuit_open = False
+        self._retry_count = 0
+        self._reconnect_delay = self.config.websocket.initial_reconnect_delay
+        logger.info("Chainlink circuit breaker reset")
 
     def disconnect(self):
         """Close the WebSocket connection."""

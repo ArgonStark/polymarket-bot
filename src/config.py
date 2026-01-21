@@ -69,17 +69,29 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("DAILY_LOSS_LIMIT", "0.20"))
     )
 
-    # Edge thresholds for different order types
-    edge_for_post_only: float = 0.30  # 30% edge -> POST_ONLY
-    edge_for_limit: float = 0.40       # 40% edge -> LIMIT (may take)
-    edge_for_market: float = 0.50      # 50% edge -> MARKET (guaranteed fill)
+    # Edge thresholds for different order types (configurable via env)
+    edge_for_post_only: float = field(
+        default_factory=lambda: float(os.getenv("EDGE_FOR_POST_ONLY", "0.30"))
+    )  # 30% edge -> POST_ONLY
+    edge_for_limit: float = field(
+        default_factory=lambda: float(os.getenv("EDGE_FOR_LIMIT", "0.40"))
+    )  # 40% edge -> LIMIT (may take)
+    edge_for_market: float = field(
+        default_factory=lambda: float(os.getenv("EDGE_FOR_MARKET", "0.50"))
+    )  # 50% edge -> MARKET (guaranteed fill)
 
-    # Time thresholds for urgency
-    time_for_market: float = 60.0      # < 60s remaining -> MARKET
-    time_for_limit: float = 120.0      # < 120s remaining -> LIMIT
+    # Time thresholds for urgency (configurable via env)
+    time_for_market: float = field(
+        default_factory=lambda: float(os.getenv("TIME_FOR_MARKET", "60.0"))
+    )  # < 60s remaining -> MARKET
+    time_for_limit: float = field(
+        default_factory=lambda: float(os.getenv("TIME_FOR_LIMIT", "120.0"))
+    )  # < 120s remaining -> LIMIT
 
     # Order timeout for maker orders (seconds)
-    maker_order_timeout: float = 30.0
+    maker_order_timeout: float = field(
+        default_factory=lambda: float(os.getenv("MAKER_ORDER_TIMEOUT", "30.0"))
+    )
 
 
 @dataclass
@@ -96,6 +108,36 @@ class VolatilityConfig:
         """Get volatility for an asset."""
         asset_lower = asset.lower()
         return getattr(self, asset_lower, 0.005)  # Default 0.5%
+
+
+@dataclass
+class WebSocketConfig:
+    """WebSocket connection and retry settings."""
+
+    # Maximum consecutive reconnection attempts before circuit breaker opens
+    max_retries: int = field(
+        default_factory=lambda: int(os.getenv("WS_MAX_RETRIES", "10"))
+    )
+
+    # Initial reconnect delay (seconds)
+    initial_reconnect_delay: float = field(
+        default_factory=lambda: float(os.getenv("WS_RECONNECT_DELAY", "1.0"))
+    )
+
+    # Maximum reconnect delay (seconds)
+    max_reconnect_delay: float = field(
+        default_factory=lambda: float(os.getenv("WS_MAX_RECONNECT_DELAY", "60.0"))
+    )
+
+    # Ping interval for keepalive (seconds)
+    ping_interval: int = field(
+        default_factory=lambda: int(os.getenv("WS_PING_INTERVAL", "30"))
+    )
+
+    # Ping timeout (seconds)
+    ping_timeout: int = field(
+        default_factory=lambda: int(os.getenv("WS_PING_TIMEOUT", "10"))
+    )
 
 
 @dataclass
@@ -149,6 +191,7 @@ class BotConfig:
     api: APIConfig = field(default_factory=APIConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
     volatility: VolatilityConfig = field(default_factory=VolatilityConfig)
+    websocket: WebSocketConfig = field(default_factory=WebSocketConfig)
     endpoints: EndpointsConfig = field(default_factory=EndpointsConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
 

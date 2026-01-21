@@ -232,7 +232,15 @@ class GammaAPI:
             target_price = self._extract_price_from_question(question)
             if target_price is None or target_price == 0:
                 # Try to get from market metadata
-                target_price = market.get("startPrice") or market.get("targetPrice") or 0.0
+                target_price = market.get("startPrice") or market.get("targetPrice")
+
+            # Validate target price - CRITICAL: cannot be 0 or None (causes division by zero)
+            if not target_price or target_price <= 0:
+                logger.warning(
+                    f"Market missing valid target price: {condition_id} "
+                    f"(extracted: {target_price})"
+                )
+                return None
 
             # Parse timestamps - try multiple field names
             end_time_str = (

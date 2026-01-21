@@ -14,8 +14,9 @@ from .config import BotConfig
 from .models import MarketState, ChainlinkPrice, Signal, OrderAction, Side
 from .data import ChainlinkFeed, CLOBFeed, GammaAPI
 from .execution import create_trading_client, OrderExecutor
+from .execution.client import get_account_balance
 from .strategy import SignalGenerator, RiskManager
-from .utils import log_trade
+from .utils import log_trade, shutdown_notification_executor
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,10 @@ class TradingBot:
         self.markets: dict[str, MarketState] = {}  # Active trading markets
         self.expiring_markets: dict[str, MarketState] = {}  # Pending settlement
         self.settled_markets: set[str] = set()  # Already settled (prevent re-processing)
+        self._markets_lock = asyncio.Lock()  # Thread safety for market operations
+
+        # Token-to-market mapping for fast lookups
+        self._token_to_market: dict[str, str] = {}  # token_id -> condition_id
 
         # Timing trackers
         self.last_market_refresh = None
@@ -113,13 +118,11 @@ class TradingBot:
                 config=self.config,
             )
 
-        # Initialize risk manager with starting bankroll
-        # In production, fetch actual balance
-        initial_bankroll = float(
-            self.config.trading.base_position_size
-            * self.config.trading.max_concurrent_positions
-            * 3
-        )
+        # Initialize risk manager with actual bankroll
+        initial_bankroll = await self._get_initial_bankroll()
+        if initial_bankroll <= 0:
+            logger.error("Cannot start: No bankroll available")
+            return False
         self.risk_manager.initialize(initial_bankroll)
 
         logger.info("Trading bot initialized successfully")
@@ -165,7 +168,46 @@ class TradingBot:
         self.clob_feed.disconnect()
         self.gamma_api.close()
 
+        # Shutdown notification thread pool
+        shutdown_notification_executor()
+
         logger.info("Trading bot shutdown complete")
+
+    async def _get_initial_bankroll(self) -> float:
+        """
+        Get initial bankroll from exchange or config fallback.
+
+        Returns:
+            USDC balance, or fallback amount in dry run mode
+        """
+        if self.config.dry_run:
+            # Use configured fallback for dry run
+            fallback = (
+                self.config.trading.base_position_size
+                * self.config.trading.max_concurrent_positions
+                * 5  # 5x buffer for testing
+            )
+            logger.info(f"[DRY RUN] Using simulated bankroll: ${fallback:.2f}")
+            return fallback
+
+        # Try to fetch actual balance from exchange
+        if self.client:
+            try:
+                balance = get_account_balance(self.client)
+                if balance is not None and balance > 0:
+                    logger.info(f"Fetched account balance: ${balance:.2f} USDC")
+                    return balance
+                else:
+                    logger.warning("Account balance is zero or unavailable")
+            except Exception as e:
+                logger.error(f"Failed to fetch account balance: {e}")
+
+        # Fallback: require manual configuration
+        logger.error(
+            "Could not fetch balance. Please ensure your wallet is funded "
+            "and API credentials are correct."
+        )
+        return 0.0
 
     async def _run_chainlink_feed(self):
         """Run Chainlink price feed in background."""
@@ -259,36 +301,42 @@ class TradingBot:
             # Fetch active 15-min crypto markets
             new_markets = self.gamma_api.get_15min_crypto_markets()
 
-            # Update markets dict
-            new_market_ids = set()
-            for market in new_markets:
-                market_id = market.condition_id
-                new_market_ids.add(market_id)
+            # Update markets dict with lock
+            async with self._markets_lock:
+                new_market_ids = set()
+                for market in new_markets:
+                    market_id = market.condition_id
+                    new_market_ids.add(market_id)
 
-                # Skip already settled markets
-                if market_id in self.settled_markets:
-                    continue
+                    # Skip already settled markets
+                    if market_id in self.settled_markets:
+                        continue
 
-                # Skip markets already in expiring queue
-                if market_id in self.expiring_markets:
-                    continue
+                    # Skip markets already in expiring queue
+                    if market_id in self.expiring_markets:
+                        continue
 
-                if market_id not in self.markets:
-                    # New market discovered - subscribe to order book
-                    self.markets[market_id] = market
-                    self.clob_feed.subscribe(market.up_token_id)
-                    self.clob_feed.subscribe(market.down_token_id)
-                    logger.info(
-                        f"NEW MARKET: {market.asset} | "
-                        f"Target: ${market.target_price:,.2f} | "
-                        f"Ends: {market.end_time.strftime('%H:%M:%S')} | "
-                        f"Time: {market.time_remaining:.0f}s"
-                    )
-                else:
-                    # Update existing market state
-                    self.markets[market_id].best_bid = market.best_bid
-                    self.markets[market_id].best_ask = market.best_ask
-                    self.markets[market_id].last_updated = now
+                    if market_id not in self.markets:
+                        # New market discovered - subscribe to order book
+                        self.markets[market_id] = market
+
+                        # Update token-to-market mapping for O(1) lookups
+                        self._token_to_market[market.up_token_id] = market_id
+                        self._token_to_market[market.down_token_id] = market_id
+
+                        self.clob_feed.subscribe(market.up_token_id)
+                        self.clob_feed.subscribe(market.down_token_id)
+                        logger.info(
+                            f"NEW MARKET: {market.asset} | "
+                            f"Target: ${market.target_price:,.2f} | "
+                            f"Ends: {market.end_time.strftime('%H:%M:%S')} | "
+                            f"Time: {market.time_remaining:.0f}s"
+                        )
+                    else:
+                        # Update existing market state
+                        self.markets[market_id].best_bid = market.best_bid
+                        self.markets[market_id].best_ask = market.best_ask
+                        self.markets[market_id].last_updated = now
 
             self.last_market_refresh = now
             logger.debug(
@@ -306,24 +354,24 @@ class TradingBot:
         Markets are moved when time_remaining < min_time_remaining,
         which prevents new trades but keeps them for settlement tracking.
         """
-        now = datetime.now(timezone.utc)
         min_time = self.config.trading.min_time_remaining
 
-        # Find markets that should stop trading
-        markets_to_expire = []
-        for market_id, market in self.markets.items():
-            if market.time_remaining <= min_time:
-                markets_to_expire.append(market_id)
+        async with self._markets_lock:
+            # Find markets that should stop trading
+            markets_to_expire = []
+            for market_id, market in self.markets.items():
+                if market.time_remaining <= min_time:
+                    markets_to_expire.append(market_id)
 
-        # Move them to expiring queue
-        for market_id in markets_to_expire:
-            market = self.markets.pop(market_id)
-            self.expiring_markets[market_id] = market
-            logger.info(
-                f"EXPIRING: {market.asset} | "
-                f"Time remaining: {market.time_remaining:.0f}s | "
-                f"Target: ${market.target_price:,.2f}"
-            )
+            # Move them to expiring queue
+            for market_id in markets_to_expire:
+                market = self.markets.pop(market_id)
+                self.expiring_markets[market_id] = market
+                logger.info(
+                    f"EXPIRING: {market.asset} | "
+                    f"Time remaining: {market.time_remaining:.0f}s | "
+                    f"Target: ${market.target_price:,.2f}"
+                )
 
     async def _check_settlements(self):
         """
@@ -334,29 +382,32 @@ class TradingBot:
         2. If resolved, calculate P&L and close position
         3. Move to settled set
         """
-        now = datetime.now(timezone.utc)
+        async with self._markets_lock:
+            markets_to_settle = []
+            for market_id, market in self.expiring_markets.items():
+                # Check if market has passed end time (with small buffer)
+                if market.time_remaining <= -2.0:  # 2 second buffer after expiry
+                    markets_to_settle.append(market_id)
 
-        markets_to_settle = []
-        for market_id, market in self.expiring_markets.items():
-            # Check if market has passed end time (with small buffer)
-            if market.time_remaining <= -2.0:  # 2 second buffer after expiry
-                markets_to_settle.append(market_id)
+            for market_id in markets_to_settle:
+                market = self.expiring_markets[market_id]
+                await self._settle_market(market)
 
-        for market_id in markets_to_settle:
-            market = self.expiring_markets[market_id]
-            await self._settle_market(market)
+                # Move to settled set and cleanup
+                self.expiring_markets.pop(market_id, None)
+                self.settled_markets.add(market_id)
 
-            # Move to settled set and cleanup
-            self.expiring_markets.pop(market_id, None)
-            self.settled_markets.add(market_id)
+                # Clean up token-to-market mapping
+                self._token_to_market.pop(market.up_token_id, None)
+                self._token_to_market.pop(market.down_token_id, None)
 
-            # Unsubscribe from order book
-            self.clob_feed.unsubscribe(market.up_token_id)
-            self.clob_feed.unsubscribe(market.down_token_id)
+                # Unsubscribe from order book
+                self.clob_feed.unsubscribe(market.up_token_id)
+                self.clob_feed.unsubscribe(market.down_token_id)
 
-            # Cleanup old settled markets (keep last 100)
-            if len(self.settled_markets) > 100:
-                self.settled_markets = set(list(self.settled_markets)[-100:])
+                # Cleanup old settled markets (keep last 100)
+                if len(self.settled_markets) > 100:
+                    self.settled_markets = set(list(self.settled_markets)[-100:])
 
     async def _settle_market(self, market: MarketState):
         """
@@ -538,16 +589,23 @@ class TradingBot:
 
     def _on_orderbook_update(self, token_id: str, orderbook):
         """Handle order book update."""
-        # Find market with this token (check both active and expiring)
-        all_markets = {**self.markets, **self.expiring_markets}
-        for market in all_markets.values():
-            if market.up_token_id == token_id:
-                if orderbook.best_bid is not None:
-                    market.best_bid = orderbook.best_bid
-                if orderbook.best_ask is not None:
-                    market.best_ask = orderbook.best_ask
-                market.last_updated = datetime.now(timezone.utc)
-                break
+        # Use token-to-market mapping for O(1) lookup instead of O(n) iteration
+        market_id = self._token_to_market.get(token_id)
+        if not market_id:
+            return
+
+        # Find market in active or expiring dict
+        market = self.markets.get(market_id) or self.expiring_markets.get(market_id)
+        if not market:
+            return
+
+        # Only update prices for UP token (which determines market price)
+        if token_id == market.up_token_id:
+            if orderbook.best_bid is not None:
+                market.best_bid = orderbook.best_bid
+            if orderbook.best_ask is not None:
+                market.best_ask = orderbook.best_ask
+            market.last_updated = datetime.now(timezone.utc)
 
     def get_status(self) -> dict:
         """Get current bot status."""

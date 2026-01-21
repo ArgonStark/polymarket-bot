@@ -4,6 +4,8 @@ Logging utilities for the trading bot.
 Provides structured logging for trades, signals, and bot events.
 """
 
+import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -15,6 +17,12 @@ import requests
 
 from ..models import Signal, TradeResult
 from ..config import BotConfig
+
+
+# Thread pool for non-blocking notification delivery
+_notification_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="notify"
+)
 
 
 def setup_logging(
@@ -120,12 +128,12 @@ def log_trade(
     except Exception as e:
         logger.error(f"Failed to write trade log: {e}")
 
-    # Send notifications if configured
+    # Send notifications in background thread pool (non-blocking)
     if config.notifications.telegram_enabled:
-        _send_telegram_notification(entry, config)
+        _notification_executor.submit(_send_telegram_notification, entry, config)
 
     if config.notifications.discord_enabled:
-        _send_discord_notification(entry, config)
+        _notification_executor.submit(_send_discord_notification, entry, config)
 
 
 def _send_telegram_notification(entry: dict, config: BotConfig):
@@ -247,3 +255,13 @@ def log_bot_stop(config: BotConfig):
     logger.info("=" * 60)
     logger.info("BOT SHUTDOWN")
     logger.info("=" * 60)
+
+
+def shutdown_notification_executor():
+    """Shutdown the notification thread pool executor."""
+    logger = logging.getLogger(__name__)
+    try:
+        _notification_executor.shutdown(wait=False)
+        logger.debug("Notification executor shutdown")
+    except Exception as e:
+        logger.warning(f"Error shutting down notification executor: {e}")

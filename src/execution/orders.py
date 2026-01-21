@@ -20,6 +20,40 @@ from ..config import BotConfig
 logger = logging.getLogger(__name__)
 
 
+def _validate_order_response(response: dict) -> tuple[bool, str]:
+    """
+    Validate order response from the API.
+
+    Args:
+        response: API response dict
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    if response is None:
+        return False, "Empty response from API"
+
+    if not isinstance(response, dict):
+        return False, f"Invalid response type: {type(response)}"
+
+    # Check for error indicators
+    if "error" in response:
+        return False, f"API error: {response['error']}"
+
+    if "errorMsg" in response:
+        return False, f"API error: {response['errorMsg']}"
+
+    if response.get("status") == "error":
+        return False, f"Order rejected: {response.get('message', 'Unknown error')}"
+
+    # Check for required fields
+    order_id = response.get("orderID") or response.get("order_id")
+    if not order_id:
+        return False, "Response missing order ID"
+
+    return True, ""
+
+
 @dataclass
 class OrderExecutor:
     """
@@ -95,7 +129,13 @@ class OrderExecutor:
                 options=options,
             )
 
-            order_id = response.get("orderID", "")
+            # Validate response
+            is_valid, error_msg = _validate_order_response(response)
+            if not is_valid:
+                logger.error(f"Maker order rejected: {error_msg}")
+                return TradeResult(success=False, error_message=error_msg)
+
+            order_id = response.get("orderID") or response.get("order_id", "")
             logger.info(
                 f"MAKER ORDER placed: {side} {size_shares:.2f} shares "
                 f"@ {price:.4f} - Order ID: {order_id[:16]}..."
@@ -163,7 +203,13 @@ class OrderExecutor:
             signed_order = self.client.create_order(order_args)
             response = self.client.post_order(signed_order, OrderType.GTC)
 
-            order_id = response.get("orderID", "")
+            # Validate response
+            is_valid, error_msg = _validate_order_response(response)
+            if not is_valid:
+                logger.error(f"Limit order rejected: {error_msg}")
+                return TradeResult(success=False, error_message=error_msg)
+
+            order_id = response.get("orderID") or response.get("order_id", "")
             logger.info(
                 f"LIMIT ORDER placed: {side} {size_shares:.2f} shares "
                 f"@ {price:.4f} - Order ID: {order_id[:16]}..."
@@ -234,9 +280,24 @@ class OrderExecutor:
             signed_order = self.client.create_order(order_args)
             response = self.client.post_order(signed_order, OrderType.FOK)
 
-            order_id = response.get("orderID", "")
-            filled_size = float(response.get("filledSize", 0))
-            filled_price = float(response.get("avgPrice", price))
+            # Validate response
+            is_valid, error_msg = _validate_order_response(response)
+            if not is_valid:
+                logger.error(f"Market order rejected: {error_msg}")
+                return TradeResult(success=False, error_message=error_msg)
+
+            order_id = response.get("orderID") or response.get("order_id", "")
+
+            # Extract fill information with safe parsing
+            filled_size_raw = response.get("filledSize") or response.get("size_matched", 0)
+            filled_price_raw = response.get("avgPrice") or response.get("price", price)
+            try:
+                filled_size = float(filled_size_raw) if filled_size_raw else 0.0
+                filled_price = float(filled_price_raw) if filled_price_raw else price
+            except (ValueError, TypeError):
+                logger.warning(f"Failed to parse fill data: size={filled_size_raw}, price={filled_price_raw}")
+                filled_size = 0.0
+                filled_price = price
 
             logger.info(
                 f"MARKET ORDER executed: {side} ${size_usd:.2f} "
