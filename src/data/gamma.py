@@ -6,6 +6,7 @@ about active 15-minute cryptocurrency prediction markets.
 """
 
 import re
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -125,6 +126,10 @@ class GammaAPI:
         """
         Parse API market response into MarketState.
 
+        Handles both formats:
+        - tokens array with token objects
+        - clobTokenIds/outcomePrices as JSON strings
+
         Args:
             market: Raw market dict from API
             asset: Asset symbol (BTC, ETH, etc.)
@@ -136,68 +141,123 @@ class GammaAPI:
             condition_id = market.get("conditionId", "")
             question = market.get("question", "")
 
-            # Extract tokens (outcomes)
-            tokens = market.get("tokens", [])
-            if len(tokens) < 2:
-                logger.warning(f"Market missing tokens: {condition_id}")
-                return None
+            # Parse clobTokenIds - may be JSON string or list
+            clob_token_ids = market.get("clobTokenIds")
+            if isinstance(clob_token_ids, str):
+                try:
+                    clob_token_ids = json.loads(clob_token_ids)
+                except json.JSONDecodeError:
+                    clob_token_ids = []
 
-            # Find UP and DOWN tokens
+            # Parse outcomePrices - may be JSON string or list
+            outcome_prices = market.get("outcomePrices")
+            if isinstance(outcome_prices, str):
+                try:
+                    outcome_prices = json.loads(outcome_prices)
+                except json.JSONDecodeError:
+                    outcome_prices = []
+
+            # Get outcomes list
+            outcomes = market.get("outcomes", [])
+            if isinstance(outcomes, str):
+                try:
+                    outcomes = json.loads(outcomes)
+                except json.JSONDecodeError:
+                    outcomes = []
+
+            # Also try tokens array (alternative format)
+            tokens = market.get("tokens", [])
+
+            # Determine UP and DOWN token IDs
             up_token_id = None
             down_token_id = None
-
-            for token in tokens:
-                outcome = token.get("outcome", "").lower()
-                token_id = token.get("token_id", "")
-
-                if "up" in outcome or "yes" in outcome or ">=" in outcome:
-                    up_token_id = token_id
-                elif "down" in outcome or "no" in outcome or "<" in outcome:
-                    down_token_id = token_id
-
-            if not up_token_id or not down_token_id:
-                # Try to assign by index
-                if len(tokens) >= 2:
-                    up_token_id = tokens[0].get("token_id", "")
-                    down_token_id = tokens[1].get("token_id", "")
-                else:
-                    logger.warning(f"Cannot identify UP/DOWN tokens: {condition_id}")
-                    return None
-
-            # Parse target price from question
-            target_price = self._extract_price_from_question(question)
-            if target_price is None:
-                # Try to get from market metadata
-                target_price = market.get("startPrice", 0.0)
-
-            # Parse timestamps
-            end_time_str = market.get("endDateIso")
-            start_time_str = market.get("startDateIso")
-
-            if end_time_str:
-                end_time = datetime.fromisoformat(
-                    end_time_str.replace("Z", "+00:00")
-                )
-            else:
-                logger.warning(f"Market missing end time: {condition_id}")
-                return None
-
-            if start_time_str:
-                start_time = datetime.fromisoformat(
-                    start_time_str.replace("Z", "+00:00")
-                )
-            else:
-                start_time = end_time  # Fallback
-
-            # Get current best prices
             best_bid = 0.0
             best_ask = 1.0
 
-            for token in tokens:
-                if token.get("token_id") == up_token_id:
-                    best_bid = float(token.get("bestBid", 0.0) or 0.0)
-                    best_ask = float(token.get("bestAsk", 1.0) or 1.0)
-                    break
+            # Method 1: Use outcomes + clobTokenIds
+            if outcomes and clob_token_ids and len(outcomes) >= 2 and len(clob_token_ids) >= 2:
+                up_index = None
+                down_index = None
+
+                for i, outcome in enumerate(outcomes):
+                    outcome_lower = str(outcome).lower()
+                    if any(kw in outcome_lower for kw in ["up", "yes", "higher", ">="]):
+                        up_index = i
+                    elif any(kw in outcome_lower for kw in ["down", "no", "lower", "<"]):
+                        down_index = i
+
+                # Default to index 0=UP, 1=DOWN if not found
+                if up_index is None:
+                    up_index = 0
+                if down_index is None:
+                    down_index = 1
+
+                if len(clob_token_ids) > max(up_index, down_index):
+                    up_token_id = clob_token_ids[up_index]
+                    down_token_id = clob_token_ids[down_index]
+
+                    # Get prices from outcomePrices
+                    if outcome_prices and len(outcome_prices) > up_index:
+                        up_price = float(outcome_prices[up_index])
+                        best_bid = max(0.01, up_price - 0.01)
+                        best_ask = min(0.99, up_price + 0.01)
+
+            # Method 2: Use tokens array (fallback)
+            if not up_token_id or not down_token_id:
+                if len(tokens) >= 2:
+                    for token in tokens:
+                        outcome = str(token.get("outcome", "")).lower()
+                        token_id = token.get("token_id", "")
+
+                        if any(kw in outcome for kw in ["up", "yes", "higher", ">="]):
+                            up_token_id = token_id
+                            best_bid = float(token.get("bestBid", 0.0) or 0.0)
+                            best_ask = float(token.get("bestAsk", 1.0) or 1.0)
+                        elif any(kw in outcome for kw in ["down", "no", "lower", "<"]):
+                            down_token_id = token_id
+
+                    # Fallback to index assignment
+                    if not up_token_id and len(tokens) >= 1:
+                        up_token_id = tokens[0].get("token_id", "")
+                        best_bid = float(tokens[0].get("bestBid", 0.0) or 0.0)
+                        best_ask = float(tokens[0].get("bestAsk", 1.0) or 1.0)
+                    if not down_token_id and len(tokens) >= 2:
+                        down_token_id = tokens[1].get("token_id", "")
+
+            if not up_token_id or not down_token_id:
+                logger.warning(f"Cannot identify UP/DOWN tokens: {condition_id}")
+                return None
+
+            # Parse target price from question
+            target_price = self._extract_price_from_question(question)
+            if target_price is None or target_price == 0:
+                # Try to get from market metadata
+                target_price = market.get("startPrice") or market.get("targetPrice") or 0.0
+
+            # Parse timestamps - try multiple field names
+            end_time_str = (
+                market.get("endDateIso")
+                or market.get("endDate")
+                or market.get("end_date_iso")
+            )
+            start_time_str = (
+                market.get("startDateIso")
+                or market.get("startDate")
+                or market.get("start_date_iso")
+            )
+
+            if not end_time_str:
+                logger.warning(f"Market missing end time: {condition_id}")
+                return None
+
+            # Parse end time
+            end_time = self._parse_datetime(end_time_str)
+            if not end_time:
+                logger.warning(f"Could not parse end time: {end_time_str}")
+                return None
+
+            # Parse start time
+            start_time = self._parse_datetime(start_time_str) if start_time_str else end_time
 
             return MarketState(
                 condition_id=condition_id,
@@ -213,8 +273,39 @@ class GammaAPI:
             )
 
         except Exception as e:
-            logger.error(f"Failed to parse market: {e}")
+            logger.error(f"Failed to parse market {market.get('conditionId', 'unknown')}: {e}")
             return None
+
+    def _parse_datetime(self, dt_str: str) -> Optional[datetime]:
+        """Parse datetime string in various formats."""
+        if not dt_str:
+            return None
+
+        try:
+            # Handle ISO format with Z suffix
+            if dt_str.endswith("Z"):
+                dt_str = dt_str[:-1] + "+00:00"
+            return datetime.fromisoformat(dt_str)
+        except ValueError:
+            pass
+
+        # Try other common formats
+        formats = [
+            "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+        ]
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(dt_str, fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except ValueError:
+                continue
+
+        return None
 
     def _extract_price_from_question(self, question: str) -> Optional[float]:
         """
