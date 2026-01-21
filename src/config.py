@@ -16,9 +16,24 @@ class WalletConfig:
     private_key: str = field(default_factory=lambda: os.getenv("PK", ""))
     funder_address: str = field(default_factory=lambda: os.getenv("FUNDER", ""))
 
+    @property
+    def is_proxy_wallet(self) -> bool:
+        """Check if using proxy wallet mode (browser/Magic wallet)."""
+        return bool(self.funder_address)
+
+    @property
+    def signature_type(self) -> int:
+        """Get signature type based on wallet configuration.
+
+        Returns:
+            0 for standard EOA wallet
+            1 for proxy wallet (Magic/browser wallet with funder)
+        """
+        return 1 if self.is_proxy_wallet else 0
+
     def validate(self) -> bool:
-        """Check if wallet is configured."""
-        return bool(self.private_key and self.funder_address)
+        """Check if wallet is configured (at minimum, private key required)."""
+        return bool(self.private_key)
 
 
 @dataclass

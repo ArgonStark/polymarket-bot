@@ -21,8 +21,12 @@ def create_trading_client(config: BotConfig) -> Optional[ClobClient]:
     """
     Create and configure a trading client for Polymarket CLOB.
 
-    Handles authentication using either:
-    1. Existing API credentials from environment
+    Supports two wallet types:
+    - EOA wallet (signature_type=0): Standard externally owned account
+    - Proxy wallet (signature_type=1): Magic/browser wallet with funder address
+
+    Authentication methods:
+    1. Existing API credentials from environment (recommended)
     2. Deriving new credentials from private key
 
     Args:
@@ -34,23 +38,38 @@ def create_trading_client(config: BotConfig) -> Optional[ClobClient]:
     # Validate wallet configuration
     if not config.wallet.validate():
         logger.warning(
-            "Wallet not configured. Set PK and FUNDER environment variables."
+            "Wallet not configured. Set PK environment variable."
         )
         return None
 
     try:
-        # Create base client
-        client = ClobClient(
-            host=config.endpoints.clob_api_url,
-            key=config.wallet.private_key,
-            chain_id=POLYGON,
-            funder=config.wallet.funder_address,
-            signature_type=1,  # Magic/email wallet signature type
-        )
+        # Determine wallet type
+        signature_type = config.wallet.signature_type
+        wallet_mode = "proxy wallet" if config.wallet.is_proxy_wallet else "EOA wallet"
+        logger.info(f"Creating client with {wallet_mode} (signature_type={signature_type})")
+
+        # Create base client based on wallet type
+        if config.wallet.is_proxy_wallet:
+            # Proxy wallet mode (Magic/browser wallet)
+            client = ClobClient(
+                host=config.endpoints.clob_api_url,
+                key=config.wallet.private_key,
+                chain_id=POLYGON,
+                funder=config.wallet.funder_address,
+                signature_type=1,
+            )
+        else:
+            # Standard EOA wallet mode
+            client = ClobClient(
+                host=config.endpoints.clob_api_url,
+                key=config.wallet.private_key,
+                chain_id=POLYGON,
+                signature_type=0,
+            )
 
         # Set up API credentials
         if config.api.is_configured:
-            # Use existing credentials
+            # Use existing credentials (recommended for production)
             creds = ApiCreds(
                 api_key=config.api.api_key,
                 api_secret=config.api.api_secret,
@@ -65,13 +84,19 @@ def create_trading_client(config: BotConfig) -> Optional[ClobClient]:
                 derived_creds = client.create_or_derive_api_creds()
                 client.set_api_creds(derived_creds)
                 logger.info(
-                    f"Derived API credentials. "
-                    f"API Key: {derived_creds.api_key[:8]}... "
-                    f"Save these to your .env file!"
+                    f"Derived API credentials successfully. "
+                    f"API Key: {derived_creds.api_key[:8]}..."
+                )
+                # Log the credentials so user can save them
+                logger.info(
+                    "Save these credentials to your .env file:\n"
+                    f"  CLOB_API_KEY={derived_creds.api_key}\n"
+                    f"  CLOB_SECRET={derived_creds.api_secret}\n"
+                    f"  CLOB_PASS_PHRASE={derived_creds.api_passphrase}"
                 )
             except Exception as e:
                 logger.warning(f"Could not derive API credentials: {e}")
-                # Client can still work for some operations without L2 auth
+                logger.warning("Some operations requiring L2 auth will not work")
 
         logger.info("Trading client created successfully")
         return client
