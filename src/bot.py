@@ -99,9 +99,11 @@ class TradingBot:
                 logger.error(f"Config error: {error}")
             return False
 
-        # Create trading client
+        # Always try to create trading client to fetch account info
+        # (even in dry-run mode, we want to show real balance if configured)
+        self.client = create_trading_client(self.config)
+
         if not self.config.dry_run:
-            self.client = create_trading_client(self.config)
             if not self.client:
                 logger.error("Failed to create trading client")
                 return False
@@ -118,6 +120,9 @@ class TradingBot:
                 config=self.config,
             )
 
+        # Display startup info (balance, account status, etc.)
+        await self._display_startup_info()
+
         # Initialize risk manager with actual bankroll
         initial_bankroll = await self._get_initial_bankroll()
         if initial_bankroll <= 0:
@@ -127,6 +132,60 @@ class TradingBot:
 
         logger.info("Trading bot initialized successfully")
         return True
+
+    async def _display_startup_info(self):
+        """
+        Display account information at startup.
+
+        Shows balance, trading mode, and key configuration parameters
+        regardless of whether running in simulation or live mode.
+        """
+        mode = "SIMULATION" if self.config.dry_run else "LIVE TRADING"
+        trading_mode = self.config.trading.mode.upper()
+
+        logger.info("=" * 60)
+        logger.info(f"  POLYMARKET 15-MIN CRYPTO ARBITRAGE BOT")
+        logger.info(f"  Mode: {mode} ({trading_mode})")
+        logger.info("=" * 60)
+
+        # Try to fetch real account info if client is available
+        if self.client:
+            try:
+                # Fetch balance
+                balance = get_account_balance(self.client)
+                if balance is not None:
+                    logger.info(f"  Account Balance: ${balance:,.2f} USDC")
+                else:
+                    logger.info("  Account Balance: Unable to fetch")
+
+                # Fetch open orders count
+                from .execution.client import get_open_orders
+                open_orders = get_open_orders(self.client)
+                logger.info(f"  Open Orders: {len(open_orders)}")
+
+            except Exception as e:
+                logger.warning(f"  Could not fetch account info: {e}")
+        else:
+            if self.config.dry_run:
+                simulated_balance = (
+                    self.config.trading.base_position_size
+                    * self.config.trading.max_concurrent_positions
+                    * 5
+                )
+                logger.info(f"  Simulated Balance: ${simulated_balance:,.2f} USDC")
+            else:
+                logger.warning("  Account: Not connected (client creation failed)")
+
+        # Display key trading parameters
+        logger.info("-" * 60)
+        logger.info(f"  Min Edge: {self.config.trading.min_edge:.0%}")
+        logger.info(f"  Min Time Remaining: {self.config.trading.min_time_remaining}s")
+        logger.info(f"  Base Position Size: ${self.config.trading.base_position_size:.2f}")
+        logger.info(f"  Max Position %: {self.config.trading.max_position_pct:.0%}")
+        logger.info(f"  Max Concurrent Positions: {self.config.trading.max_concurrent_positions}")
+        logger.info(f"  Daily Loss Limit: {self.config.trading.daily_loss_limit:.0%}")
+        logger.info(f"  Supported Assets: {', '.join(self.config.supported_assets)}")
+        logger.info("=" * 60)
 
     async def start(self):
         """Start the trading bot."""
