@@ -48,14 +48,14 @@ class GammaAPI:
 
     def get_active_markets(
         self,
-        tag: str = "crypto",
+        tag: Optional[str] = None,
         limit: int = 100,
     ) -> list[dict]:
         """
-        Fetch all active markets with given tag.
+        Fetch all active markets, optionally filtered by tag.
 
         Args:
-            tag: Market tag to filter by (default: "crypto")
+            tag: Market tag to filter by (None for no tag filter)
             limit: Maximum number of markets to return
 
         Returns:
@@ -65,15 +65,19 @@ class GammaAPI:
         params = {
             "active": True,
             "closed": False,
-            "tag": tag,
             "limit": limit,
         }
+
+        # Only add tag filter if specified
+        if tag:
+            params["tag"] = tag
 
         try:
             response = self._session.get(url, params=params, timeout=10)
             response.raise_for_status()
             markets = response.json()
-            logger.debug(f"Fetched {len(markets)} active {tag} markets")
+            tag_desc = tag if tag else "all"
+            logger.debug(f"Fetched {len(markets)} active {tag_desc} markets")
             return markets
         except requests.RequestException as e:
             logger.error(f"Failed to fetch markets: {e}")
@@ -83,40 +87,95 @@ class GammaAPI:
         """
         Fetch currently active 15-minute crypto markets.
 
-        Filters markets by:
-        - Contains "15" in the question (15-minute markets)
-        - Contains a supported asset (BTC, ETH, SOL, XRP)
+        These markets must be fetched by constructing specific slugs:
+        - Format: {asset}-updown-15m-{unix_timestamp}
+        - Timestamp is the market start time (every 15 min: :00, :15, :30, :45)
 
         Returns:
             List of MarketState objects for active 15-min markets
         """
-        markets = self.get_active_markets(tag="crypto")
         filtered = []
+        now = datetime.now(timezone.utc)
+        current_ts = int(now.timestamp())
 
-        for market in markets:
-            question = market.get("question", "").lower()
+        # Round down to nearest 15 minutes (900 seconds)
+        base_ts = (current_ts // 900) * 900
 
-            # Check for 15-minute market
-            if "15" not in question:
+        # Generate timestamps for current and next few periods
+        # Check current, previous (may still be active), and next period
+        timestamps = [
+            base_ts - 900,   # Previous period (may still be in final minutes)
+            base_ts,         # Current period
+            base_ts + 900,   # Next period (for upcoming)
+        ]
+
+        # Supported assets with their slug prefix
+        asset_slugs = {
+            "BTC": "btc-updown-15m-",
+            "ETH": "eth-updown-15m-",
+            "SOL": "sol-updown-15m-",
+            "XRP": "xrp-updown-15m-",
+        }
+
+        for asset, slug_prefix in asset_slugs.items():
+            # Only fetch supported assets
+            if asset not in self.config.supported_assets:
                 continue
 
-            # Check for supported asset
-            asset = None
-            for supported_asset in self.config.supported_assets:
-                if supported_asset.lower() in question:
-                    asset = supported_asset
-                    break
+            for ts in timestamps:
+                slug = f"{slug_prefix}{ts}"
+                market = self._fetch_market_by_slug(slug)
 
-            if not asset:
-                continue
+                if market:
+                    # Check if market is active and not closed
+                    if not market.get("active", False) or market.get("closed", True):
+                        continue
 
-            # Parse market into MarketState
-            market_state = self._parse_market(market, asset)
-            if market_state:
-                filtered.append(market_state)
+                    # Check if market is still accepting orders
+                    if not market.get("acceptingOrders", False):
+                        continue
+
+                    # Parse market into MarketState
+                    market_state = self._parse_market(market, asset)
+                    if market_state:
+                        # Only include if not already in list and has time remaining
+                        time_remaining = (market_state.end_time - now).total_seconds()
+                        if time_remaining > 0:
+                            # Avoid duplicates
+                            if not any(m.condition_id == market_state.condition_id for m in filtered):
+                                filtered.append(market_state)
+
+        # Sort by end time (soonest first)
+        filtered.sort(key=lambda m: m.end_time)
 
         logger.info(f"Found {len(filtered)} active 15-minute crypto markets")
         return filtered
+
+    def _fetch_market_by_slug(self, slug: str) -> Optional[dict]:
+        """
+        Fetch a specific market by its slug.
+
+        Args:
+            slug: Market slug (e.g., btc-updown-15m-1769027400)
+
+        Returns:
+            Market dict or None if not found
+        """
+        url = f"{self.base_url}/markets"
+        params = {"slug": slug}
+
+        try:
+            response = self._session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            markets = response.json()
+
+            if markets and len(markets) > 0:
+                return markets[0]
+            return None
+
+        except requests.RequestException as e:
+            logger.debug(f"Failed to fetch market {slug}: {e}")
+            return None
 
     def _parse_market(
         self,
@@ -130,6 +189,11 @@ class GammaAPI:
         - tokens array with token objects
         - clobTokenIds/outcomePrices as JSON strings
 
+        For 15-minute markets:
+        - Slug format: {asset}-updown-15m-{unix_timestamp}
+        - Outcomes are always ["Up", "Down"]
+        - Start time can be extracted from slug timestamp
+
         Args:
             market: Raw market dict from API
             asset: Asset symbol (BTC, ETH, etc.)
@@ -140,6 +204,7 @@ class GammaAPI:
         try:
             condition_id = market.get("conditionId", "")
             question = market.get("question", "")
+            slug = market.get("slug", "")
 
             # Parse clobTokenIds - may be JSON string or list
             clob_token_ids = market.get("clobTokenIds")
@@ -181,12 +246,13 @@ class GammaAPI:
 
                 for i, outcome in enumerate(outcomes):
                     outcome_lower = str(outcome).lower()
-                    if any(kw in outcome_lower for kw in ["up", "yes", "higher", ">="]):
+                    # 15-min markets use exactly "Up" and "Down"
+                    if outcome_lower == "up" or any(kw in outcome_lower for kw in ["yes", "higher", ">="]):
                         up_index = i
-                    elif any(kw in outcome_lower for kw in ["down", "no", "lower", "<"]):
+                    elif outcome_lower == "down" or any(kw in outcome_lower for kw in ["no", "lower", "<"]):
                         down_index = i
 
-                # Default to index 0=UP, 1=DOWN if not found
+                # Default to index 0=UP, 1=DOWN if not found (standard for 15-min markets)
                 if up_index is None:
                     up_index = 0
                 if down_index is None:
@@ -209,14 +275,14 @@ class GammaAPI:
                         outcome = str(token.get("outcome", "")).lower()
                         token_id = token.get("token_id", "")
 
-                        if any(kw in outcome for kw in ["up", "yes", "higher", ">="]):
+                        if outcome == "up" or any(kw in outcome for kw in ["yes", "higher", ">="]):
                             up_token_id = token_id
                             best_bid = float(token.get("bestBid", 0.0) or 0.0)
                             best_ask = float(token.get("bestAsk", 1.0) or 1.0)
-                        elif any(kw in outcome for kw in ["down", "no", "lower", "<"]):
+                        elif outcome == "down" or any(kw in outcome for kw in ["no", "lower", "<"]):
                             down_token_id = token_id
 
-                    # Fallback to index assignment
+                    # Fallback to index assignment (15-min markets: index 0=Up, 1=Down)
                     if not up_token_id and len(tokens) >= 1:
                         up_token_id = tokens[0].get("token_id", "")
                         best_bid = float(tokens[0].get("bestBid", 0.0) or 0.0)
@@ -228,19 +294,36 @@ class GammaAPI:
                 logger.warning(f"Cannot identify UP/DOWN tokens: {condition_id}")
                 return None
 
-            # Parse target price from question
+            # Parse target price from question or metadata
             target_price = self._extract_price_from_question(question)
             if target_price is None or target_price == 0:
                 # Try to get from market metadata
                 target_price = market.get("startPrice") or market.get("targetPrice")
 
-            # Validate target price - CRITICAL: cannot be 0 or None (causes division by zero)
+            # For 15-min markets, target price may not be in API response
+            # Use a placeholder that will be updated from Chainlink at runtime
             if not target_price or target_price <= 0:
-                logger.warning(
-                    f"Market missing valid target price: {condition_id} "
-                    f"(extracted: {target_price})"
-                )
-                return None
+                # Check if this is a 15-minute market (has updown-15m in slug)
+                if "-updown-15m-" in slug.lower():
+                    # Use a temporary placeholder - will be updated from Chainlink
+                    # The bot should fetch the actual price from Chainlink stream
+                    target_price = self._get_placeholder_price(asset)
+                    if target_price and target_price > 0:
+                        logger.debug(
+                            f"Using placeholder target price for {asset}: {target_price}"
+                        )
+                    else:
+                        logger.warning(
+                            f"Market missing valid target price: {condition_id} "
+                            f"(15-min market, will need Chainlink price)"
+                        )
+                        return None
+                else:
+                    logger.warning(
+                        f"Market missing valid target price: {condition_id} "
+                        f"(extracted: {target_price})"
+                    )
+                    return None
 
             # Parse timestamps - try multiple field names
             end_time_str = (
@@ -264,8 +347,19 @@ class GammaAPI:
                 logger.warning(f"Could not parse end time: {end_time_str}")
                 return None
 
-            # Parse start time
-            start_time = self._parse_datetime(start_time_str) if start_time_str else end_time
+            # Parse start time - for 15-min markets, try to extract from slug timestamp
+            start_time = None
+            if start_time_str:
+                start_time = self._parse_datetime(start_time_str)
+
+            if not start_time:
+                # Try to extract start time from slug (format: asset-updown-15m-{timestamp})
+                start_time = self._extract_start_time_from_slug(slug)
+
+            if not start_time:
+                # Fallback: start time is 15 minutes before end time
+                from datetime import timedelta
+                start_time = end_time - timedelta(minutes=15)
 
             return MarketState(
                 condition_id=condition_id,
@@ -283,6 +377,51 @@ class GammaAPI:
         except Exception as e:
             logger.error(f"Failed to parse market {market.get('conditionId', 'unknown')}: {e}")
             return None
+
+    def _extract_start_time_from_slug(self, slug: str) -> Optional[datetime]:
+        """
+        Extract start time from 15-minute market slug.
+
+        Slug format: {asset}-updown-15m-{unix_timestamp}
+        Example: btc-updown-15m-1769027400
+
+        Args:
+            slug: Market slug
+
+        Returns:
+            Start time as datetime or None
+        """
+        match = re.search(r"-(\d{10})$", slug)
+        if match:
+            try:
+                timestamp = int(match.group(1))
+                return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            except (ValueError, OSError):
+                pass
+        return None
+
+    def _get_placeholder_price(self, asset: str) -> Optional[float]:
+        """
+        Get a placeholder price for an asset when target price is not available.
+
+        These are approximate values that should be updated from Chainlink.
+        Used only to allow market parsing to succeed initially.
+
+        Args:
+            asset: Asset symbol (BTC, ETH, etc.)
+
+        Returns:
+            Placeholder price or None
+        """
+        # Approximate prices as of 2025 - these are just placeholders
+        # The actual target price should come from Chainlink at market start
+        placeholders = {
+            "BTC": 100000.0,
+            "ETH": 3500.0,
+            "SOL": 200.0,
+            "XRP": 2.5,
+        }
+        return placeholders.get(asset.upper())
 
     def _parse_datetime(self, dt_str: str) -> Optional[datetime]:
         """Parse datetime string in various formats."""
@@ -440,8 +579,7 @@ class GammaAPI:
         """
         Fetch 15-minute markets starting soon.
 
-        Looks for markets that haven't started yet but will
-        start within the lookahead window.
+        Looks for markets that will start within the lookahead window.
 
         Args:
             lookahead_minutes: How far ahead to look (default 30 min)
@@ -449,57 +587,49 @@ class GammaAPI:
         Returns:
             List of upcoming MarketState objects
         """
-        # Fetch markets including those not yet active
-        url = f"{self.base_url}/markets"
-        params = {
-            "closed": False,
-            "tag": "crypto",
-            "limit": 100,
-        }
-
-        try:
-            response = self._session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            markets = response.json()
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch upcoming markets: {e}")
-            return []
-
         now = datetime.now(timezone.utc)
+        current_ts = int(now.timestamp())
         upcoming = []
 
-        for market in markets:
-            question = market.get("question", "").lower()
+        # Round up to next 15-minute boundary
+        base_ts = ((current_ts // 900) + 1) * 900
 
-            # Check for 15-minute market
-            if "15" not in question:
+        # Generate timestamps for upcoming periods within lookahead window
+        num_periods = (lookahead_minutes // 15) + 1
+        timestamps = [base_ts + (i * 900) for i in range(num_periods)]
+
+        # Supported assets with their slug prefix
+        asset_slugs = {
+            "BTC": "btc-updown-15m-",
+            "ETH": "eth-updown-15m-",
+            "SOL": "sol-updown-15m-",
+            "XRP": "xrp-updown-15m-",
+        }
+
+        for asset, slug_prefix in asset_slugs.items():
+            # Only fetch supported assets
+            if asset not in self.config.supported_assets:
                 continue
 
-            # Check for supported asset
-            asset = None
-            for supported_asset in self.config.supported_assets:
-                if supported_asset.lower() in question:
-                    asset = supported_asset
-                    break
+            for ts in timestamps:
+                start_time = datetime.fromtimestamp(ts, tz=timezone.utc)
+                time_until_start = (start_time - now).total_seconds() / 60
 
-            if not asset:
-                continue
+                # Only include markets starting within lookahead window
+                if time_until_start <= 0 or time_until_start > lookahead_minutes:
+                    continue
 
-            # Check timing
-            start_time_str = market.get("startDateIso")
-            if not start_time_str:
-                continue
+                slug = f"{slug_prefix}{ts}"
+                market = self._fetch_market_by_slug(slug)
 
-            start_time = datetime.fromisoformat(
-                start_time_str.replace("Z", "+00:00")
-            )
+                if market:
+                    # Parse market into MarketState
+                    market_state = self._parse_market(market, asset)
+                    if market_state:
+                        upcoming.append(market_state)
 
-            # Only include markets starting within lookahead window
-            time_until_start = (start_time - now).total_seconds() / 60
-            if 0 < time_until_start <= lookahead_minutes:
-                market_state = self._parse_market(market, asset)
-                if market_state:
-                    upcoming.append(market_state)
+        # Sort by start time (soonest first)
+        upcoming.sort(key=lambda m: m.start_time)
 
         logger.debug(f"Found {len(upcoming)} upcoming 15-minute markets")
         return upcoming
