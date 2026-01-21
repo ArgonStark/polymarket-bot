@@ -111,6 +111,27 @@ cp .env.example .env
 | `MAX_CONCURRENT_POSITIONS` | 5 | Max open positions |
 | `DAILY_LOSS_LIMIT` | 0.20 | Daily loss limit (20%) |
 
+### Edge and Time Thresholds
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EDGE_FOR_POST_ONLY` | 0.30 | Min edge for maker orders |
+| `EDGE_FOR_LIMIT` | 0.40 | Min edge for limit orders |
+| `EDGE_FOR_MARKET` | 0.50 | Min edge for market orders |
+| `TIME_FOR_MARKET` | 60 | Seconds remaining for market orders |
+| `TIME_FOR_LIMIT` | 120 | Seconds remaining for limit orders |
+| `MAKER_ORDER_TIMEOUT` | 30 | Maker order timeout (seconds) |
+
+### WebSocket Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WS_MAX_RETRIES` | 10 | Max reconnect attempts before circuit breaker |
+| `WS_RECONNECT_DELAY` | 1.0 | Initial reconnect delay (seconds) |
+| `WS_MAX_RECONNECT_DELAY` | 60.0 | Max reconnect delay (seconds) |
+| `WS_PING_INTERVAL` | 30 | Keepalive ping interval (seconds) |
+| `WS_PING_TIMEOUT` | 10 | Ping timeout (seconds) |
+
 ### Optional Notifications
 
 | Variable | Description |
@@ -205,6 +226,14 @@ polymarket-bot/
 2. **Daily Loss Limit**: Automatically halts trading at 20% daily loss
 3. **Minimum Time**: Won't trade with less than 45 seconds remaining
 4. **Edge Threshold**: Requires 25%+ edge to enter trades
+
+### Connection Resilience
+
+- **Circuit Breaker**: WebSocket feeds automatically reconnect with exponential backoff
+- **Max Retries**: After 10 consecutive failures, circuit breaker opens to prevent resource exhaustion
+- **Feed Monitoring**: Trading halts if both Chainlink and CLOB feeds fail
+- **Thread Safety**: Market operations use async locks to prevent race conditions
+- **Non-blocking Notifications**: Trade alerts sent via background thread pool
 
 ### Key Principles
 

@@ -100,8 +100,11 @@ class CLOBFeed:
             "channel": "market",
             "assets_ids": [token_id],
         }
-        ws.send(json.dumps(subscribe_msg))
-        logger.info(f"Subscribed to token: {token_id[:16]}...")
+        try:
+            ws.send(json.dumps(subscribe_msg))
+            logger.info(f"Subscribed to token: {token_id[:16]}...")
+        except Exception as e:
+            logger.error(f"Failed to subscribe to {token_id[:16]}: {e}")
 
     def subscribe(self, token_id: str):
         """
@@ -135,8 +138,11 @@ class CLOBFeed:
                 "channel": "market",
                 "assets_ids": [token_id],
             }
-            self._ws.send(json.dumps(unsubscribe_msg))
-            logger.info(f"Unsubscribed from token: {token_id[:16]}...")
+            try:
+                self._ws.send(json.dumps(unsubscribe_msg))
+                logger.info(f"Unsubscribed from token: {token_id[:16]}...")
+            except Exception as e:
+                logger.error(f"Failed to unsubscribe from {token_id[:16]}: {e}")
 
     def _on_message(self, ws, message: str):
         """Handle incoming WebSocket message."""

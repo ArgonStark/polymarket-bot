@@ -232,6 +232,19 @@ class TradingBot:
 
         while self._running:
             try:
+                # Check if data feeds are healthy (circuit breakers)
+                if self.chainlink_feed._circuit_open and self.clob_feed._circuit_open:
+                    logger.critical(
+                        "CRITICAL: Both data feeds have circuit breakers open. "
+                        "Trading halted until feeds recover."
+                    )
+                    await asyncio.sleep(30.0)
+                    continue
+                elif self.chainlink_feed._circuit_open:
+                    logger.warning("Chainlink feed circuit breaker open - trading with stale prices")
+                elif self.clob_feed._circuit_open:
+                    logger.warning("CLOB feed circuit breaker open - trading with stale order books")
+
                 # Discover and refresh markets
                 await self._refresh_markets()
 

@@ -119,8 +119,11 @@ class ChainlinkFeed:
                 }
             ],
         }
-        ws.send(json.dumps(subscribe_msg))
-        logger.info(f"Subscribed to {self.config.endpoints.chainlink_topic}")
+        try:
+            ws.send(json.dumps(subscribe_msg))
+            logger.info(f"Subscribed to {self.config.endpoints.chainlink_topic}")
+        except Exception as e:
+            logger.error(f"Failed to send subscription message: {e}")
 
     def _on_message(self, ws, message: str):
         """Handle incoming WebSocket message."""
