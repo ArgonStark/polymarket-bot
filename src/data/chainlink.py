@@ -45,6 +45,7 @@ class ChainlinkFeed:
     _ping_timeout: int = field(init=False)
     _retry_count: int = 0
     _circuit_open: bool = False  # Circuit breaker state
+    _shutdown: bool = False  # Graceful shutdown flag
 
     def __post_init__(self):
         """Initialize price history and WebSocket settings from config."""
@@ -219,7 +220,7 @@ class ChainlinkFeed:
         """
         loop = asyncio.get_running_loop()
 
-        while not self._circuit_open:
+        while not self._circuit_open and not self._shutdown:
             try:
                 url = self.config.endpoints.chainlink_rtds_url
 
@@ -263,12 +264,22 @@ class ChainlinkFeed:
                 )
                 return
 
+            # Check shutdown before reconnecting
+            if self._shutdown:
+                logger.info("Chainlink shutdown requested, stopping reconnection")
+                return
+
             # Reconnect with exponential backoff
             logger.warning(
                 f"Chainlink reconnecting in {self._reconnect_delay:.1f}s... "
                 f"(attempt {self._retry_count}/{self._max_retries})"
             )
             await asyncio.sleep(self._reconnect_delay)
+
+            # Check shutdown again after sleep
+            if self._shutdown:
+                logger.info("Chainlink shutdown requested, stopping reconnection")
+                return
 
             self._reconnect_delay = min(
                 self._reconnect_delay * 2, self._max_reconnect_delay
@@ -282,7 +293,8 @@ class ChainlinkFeed:
         logger.info("Chainlink circuit breaker reset")
 
     def disconnect(self):
-        """Close the WebSocket connection."""
+        """Close the WebSocket connection and stop reconnection attempts."""
+        self._shutdown = True  # Prevent reconnection attempts
         if self._ws:
             self._ws.close()
             self._connected = False
