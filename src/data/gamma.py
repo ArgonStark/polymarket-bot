@@ -287,6 +287,124 @@ class GammaAPI:
             logger.error(f"Failed to fetch prices for {condition_id}: {e}")
             return None
 
+    def get_market_resolution(self, condition_id: str) -> Optional[dict]:
+        """
+        Fetch resolution/settlement status for a market.
+
+        Args:
+            condition_id: Market condition ID
+
+        Returns:
+            Dict with resolution info:
+            - resolved: bool
+            - winning_outcome: "UP" or "DOWN" or None
+            - resolution_price: float (Chainlink settlement price)
+        """
+        market = self.get_market_by_id(condition_id)
+        if not market:
+            return None
+
+        try:
+            resolved = market.get("resolved", False)
+            if not resolved:
+                return {"resolved": False, "winning_outcome": None, "resolution_price": None}
+
+            # Determine winning outcome from token payouts
+            tokens = market.get("tokens", [])
+            winning_outcome = None
+            resolution_price = market.get("resolutionPrice")
+
+            for token in tokens:
+                winner = token.get("winner", False)
+                if winner:
+                    outcome = token.get("outcome", "").lower()
+                    if "up" in outcome or "yes" in outcome or ">=" in outcome:
+                        winning_outcome = "UP"
+                    elif "down" in outcome or "no" in outcome or "<" in outcome:
+                        winning_outcome = "DOWN"
+                    break
+
+            return {
+                "resolved": True,
+                "winning_outcome": winning_outcome,
+                "resolution_price": resolution_price,
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to parse resolution for {condition_id}: {e}")
+            return None
+
+    def get_upcoming_markets(
+        self,
+        lookahead_minutes: int = 30,
+    ) -> list[MarketState]:
+        """
+        Fetch 15-minute markets starting soon.
+
+        Looks for markets that haven't started yet but will
+        start within the lookahead window.
+
+        Args:
+            lookahead_minutes: How far ahead to look (default 30 min)
+
+        Returns:
+            List of upcoming MarketState objects
+        """
+        # Fetch markets including those not yet active
+        url = f"{self.base_url}/markets"
+        params = {
+            "closed": False,
+            "tag": "crypto",
+            "limit": 100,
+        }
+
+        try:
+            response = self._session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            markets = response.json()
+        except requests.RequestException as e:
+            logger.error(f"Failed to fetch upcoming markets: {e}")
+            return []
+
+        now = datetime.now(timezone.utc)
+        upcoming = []
+
+        for market in markets:
+            question = market.get("question", "").lower()
+
+            # Check for 15-minute market
+            if "15" not in question:
+                continue
+
+            # Check for supported asset
+            asset = None
+            for supported_asset in self.config.supported_assets:
+                if supported_asset.lower() in question:
+                    asset = supported_asset
+                    break
+
+            if not asset:
+                continue
+
+            # Check timing
+            start_time_str = market.get("startDateIso")
+            if not start_time_str:
+                continue
+
+            start_time = datetime.fromisoformat(
+                start_time_str.replace("Z", "+00:00")
+            )
+
+            # Only include markets starting within lookahead window
+            time_until_start = (start_time - now).total_seconds() / 60
+            if 0 < time_until_start <= lookahead_minutes:
+                market_state = self._parse_market(market, asset)
+                if market_state:
+                    upcoming.append(market_state)
+
+        logger.debug(f"Found {len(upcoming)} upcoming 15-minute markets")
+        return upcoming
+
     def close(self):
         """Close HTTP session."""
         if self._session:
