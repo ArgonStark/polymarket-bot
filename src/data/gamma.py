@@ -424,7 +424,7 @@ class GammaAPI:
         return placeholders.get(asset.upper())
 
     def _parse_datetime(self, dt_str: str) -> Optional[datetime]:
-        """Parse datetime string in various formats."""
+        """Parse datetime string in various formats. Always returns UTC timezone-aware datetime."""
         if not dt_str:
             return None
 
@@ -432,7 +432,11 @@ class GammaAPI:
             # Handle ISO format with Z suffix
             if dt_str.endswith("Z"):
                 dt_str = dt_str[:-1] + "+00:00"
-            return datetime.fromisoformat(dt_str)
+            dt = datetime.fromisoformat(dt_str)
+            # Ensure timezone-aware (default to UTC if naive)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
         except ValueError:
             pass
 
@@ -440,6 +444,7 @@ class GammaAPI:
         formats = [
             "%Y-%m-%dT%H:%M:%S.%f%z",
             "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S.%f",
             "%Y-%m-%dT%H:%M:%S",
             "%Y-%m-%d %H:%M:%S",
         ]
