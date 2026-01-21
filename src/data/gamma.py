@@ -109,6 +109,8 @@ class GammaAPI:
             base_ts + 900,   # Next period (for upcoming)
         ]
 
+        logger.debug(f"Checking market timestamps: {timestamps} (base: {base_ts})")
+
         # Supported assets with their slug prefix
         asset_slugs = {
             "BTC": "btc-updown-15m-",
@@ -126,24 +128,42 @@ class GammaAPI:
                 slug = f"{slug_prefix}{ts}"
                 market = self._fetch_market_by_slug(slug)
 
-                if market:
-                    # Check if market is active and not closed
-                    if not market.get("active", False) or market.get("closed", True):
-                        continue
+                if not market:
+                    logger.debug(f"No market found for slug: {slug}")
+                    continue
 
-                    # Check if market is still accepting orders
-                    if not market.get("acceptingOrders", False):
-                        continue
+                # Check if market is active and not closed
+                is_active = market.get("active", False)
+                is_closed = market.get("closed", True)
+                accepting_orders = market.get("acceptingOrders", False)
 
-                    # Parse market into MarketState
-                    market_state = self._parse_market(market, asset)
-                    if market_state:
-                        # Only include if not already in list and has time remaining
-                        time_remaining = (market_state.end_time - now).total_seconds()
-                        if time_remaining > 0:
-                            # Avoid duplicates
-                            if not any(m.condition_id == market_state.condition_id for m in filtered):
-                                filtered.append(market_state)
+                logger.debug(
+                    f"Market {slug}: active={is_active}, closed={is_closed}, "
+                    f"accepting={accepting_orders}"
+                )
+
+                if not is_active or is_closed:
+                    continue
+
+                # Check if market is still accepting orders
+                if not accepting_orders:
+                    continue
+
+                # Parse market into MarketState
+                market_state = self._parse_market(market, asset)
+                if not market_state:
+                    logger.debug(f"Failed to parse market: {slug}")
+                    continue
+
+                # Only include if not already in list and has time remaining
+                time_remaining = (market_state.end_time - now).total_seconds()
+                logger.debug(f"Market {slug}: time_remaining={time_remaining:.0f}s")
+
+                if time_remaining > 0:
+                    # Avoid duplicates
+                    if not any(m.condition_id == market_state.condition_id for m in filtered):
+                        filtered.append(market_state)
+                        logger.debug(f"Added market: {asset} ending at {market_state.end_time}")
 
         # Sort by end time (soonest first)
         filtered.sort(key=lambda m: m.end_time)

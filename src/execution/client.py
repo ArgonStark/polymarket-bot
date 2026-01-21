@@ -25,9 +25,10 @@ def create_trading_client(config: BotConfig) -> Optional[ClobClient]:
     - EOA wallet (signature_type=0): Standard externally owned account
     - Proxy wallet (signature_type=1): Magic/browser wallet with funder address
 
-    Authentication methods:
-    1. Existing API credentials from environment (recommended)
-    2. Deriving new credentials from private key
+    Authentication levels:
+    - L0: No auth (public endpoints only)
+    - L1: Private key (can derive API keys)
+    - L2: Private key + API creds (full access)
 
     Args:
         config: Bot configuration with wallet and API settings
@@ -48,38 +49,33 @@ def create_trading_client(config: BotConfig) -> Optional[ClobClient]:
         wallet_mode = "proxy wallet" if config.wallet.is_proxy_wallet else "EOA wallet"
         logger.info(f"Creating client with {wallet_mode} (signature_type={signature_type})")
 
-        # Create base client based on wallet type
-        if config.wallet.is_proxy_wallet:
-            # Proxy wallet mode (Magic/browser wallet)
-            client = ClobClient(
-                host=config.endpoints.clob_api_url,
-                key=config.wallet.private_key,
-                chain_id=POLYGON,
-                funder=config.wallet.funder_address,
-                signature_type=1,
-            )
-        else:
-            # Standard EOA wallet mode
-            client = ClobClient(
-                host=config.endpoints.clob_api_url,
-                key=config.wallet.private_key,
-                chain_id=POLYGON,
-                signature_type=0,
-            )
+        # Build client kwargs based on wallet type
+        client_kwargs = {
+            "host": config.endpoints.clob_api_url,
+            "key": config.wallet.private_key,
+            "chain_id": POLYGON,
+            "signature_type": signature_type,
+        }
 
-        # Set up API credentials
+        # Add funder for proxy wallet mode
+        if config.wallet.is_proxy_wallet:
+            client_kwargs["funder"] = config.wallet.funder_address
+
+        # Add credentials if available (enables L2 mode)
         if config.api.is_configured:
-            # Use existing credentials (recommended for production)
-            creds = ApiCreds(
+            client_kwargs["creds"] = ApiCreds(
                 api_key=config.api.api_key,
                 api_secret=config.api.api_secret,
                 api_passphrase=config.api.api_passphrase,
             )
-            client.set_api_creds(creds)
-            logger.info("Using existing API credentials")
-        else:
-            # Derive new credentials from private key
-            logger.info("Deriving API credentials from private key...")
+            logger.info("Using existing API credentials (L2 mode)")
+
+        # Create client
+        client = ClobClient(**client_kwargs)
+
+        # If no creds provided, try to derive them
+        if not config.api.is_configured:
+            logger.info("No API credentials configured, attempting to derive...")
             try:
                 derived_creds = client.create_or_derive_api_creds()
                 client.set_api_creds(derived_creds)
@@ -96,19 +92,23 @@ def create_trading_client(config: BotConfig) -> Optional[ClobClient]:
                 )
             except Exception as e:
                 logger.warning(f"Could not derive API credentials: {e}")
-                logger.warning("Some operations requiring L2 auth will not work")
+                logger.warning("L2 operations (balance, orders) will not work")
 
-        logger.info("Trading client created successfully")
+        logger.info(f"Trading client created successfully (mode: L{client.mode})")
         return client
 
     except Exception as e:
         logger.error(f"Failed to create trading client: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
         return None
 
 
 def get_account_balance(client: Optional[ClobClient]) -> Optional[float]:
     """
     Get USDC balance for the trading account.
+
+    Requires L2 authentication.
 
     Args:
         client: Configured ClobClient (can be None)
@@ -119,15 +119,23 @@ def get_account_balance(client: Optional[ClobClient]) -> Optional[float]:
     if client is None:
         return None
 
+    # Check if client has L2 auth
+    if client.mode < 2:  # L2 = 2
+        logger.warning("Client not in L2 mode, cannot fetch balance")
+        return None
+
     try:
-        # Use SDK method with proper params
-        balance_info = client.get_balance_allowance()
+        # Create proper params with signature_type
+        # signature_type=-1 means "use client's default"
+        params = BalanceAllowanceParams(signature_type=-1)
+        balance_info = client.get_balance_allowance(params)
+
         if balance_info:
-            # The SDK returns balance in wei for USDC (6 decimals)
+            # Balance is typically returned as string in micro-units
             balance = balance_info.get("balance", 0)
             if isinstance(balance, str):
                 balance = float(balance)
-            # Convert from micro-units if needed (USDC has 6 decimals)
+            # USDC has 6 decimals, but check if already in correct units
             if balance > 1_000_000:
                 balance = balance / 1_000_000
             return float(balance)
@@ -141,6 +149,8 @@ def get_open_orders(client: Optional[ClobClient]) -> list[dict]:
     """
     Get all open orders for the account.
 
+    Requires L2 authentication.
+
     Args:
         client: Configured ClobClient (can be None)
 
@@ -148,6 +158,11 @@ def get_open_orders(client: Optional[ClobClient]) -> list[dict]:
         List of open order dictionaries
     """
     if client is None:
+        return []
+
+    # Check if client has L2 auth
+    if client.mode < 2:
+        logger.warning("Client not in L2 mode, cannot fetch orders")
         return []
 
     try:
@@ -162,6 +177,8 @@ def get_trades(client: Optional[ClobClient], limit: int = 100) -> list[dict]:
     """
     Get recent trades for the account.
 
+    Requires L2 authentication.
+
     Args:
         client: Configured ClobClient (can be None)
         limit: Maximum number of trades to return
@@ -170,6 +187,11 @@ def get_trades(client: Optional[ClobClient], limit: int = 100) -> list[dict]:
         List of trade dictionaries
     """
     if client is None:
+        return []
+
+    # Check if client has L2 auth
+    if client.mode < 2:
+        logger.warning("Client not in L2 mode, cannot fetch trades")
         return []
 
     try:
@@ -184,6 +206,8 @@ def cancel_all_orders(client: Optional[ClobClient]) -> bool:
     """
     Cancel all open orders.
 
+    Requires L2 authentication.
+
     Args:
         client: Configured ClobClient (can be None)
 
@@ -191,6 +215,10 @@ def cancel_all_orders(client: Optional[ClobClient]) -> bool:
         True if successful, False otherwise
     """
     if client is None:
+        return False
+
+    if client.mode < 2:
+        logger.warning("Client not in L2 mode, cannot cancel orders")
         return False
 
     try:
@@ -206,6 +234,8 @@ def cancel_order(client: Optional[ClobClient], order_id: str) -> bool:
     """
     Cancel a specific order.
 
+    Requires L2 authentication.
+
     Args:
         client: Configured ClobClient (can be None)
         order_id: ID of order to cancel
@@ -214,6 +244,10 @@ def cancel_order(client: Optional[ClobClient], order_id: str) -> bool:
         True if successful, False otherwise
     """
     if client is None:
+        return False
+
+    if client.mode < 2:
+        logger.warning("Client not in L2 mode, cannot cancel order")
         return False
 
     try:
