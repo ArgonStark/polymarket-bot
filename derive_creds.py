@@ -37,9 +37,9 @@ def main():
         creds = client.create_or_derive_api_creds()
 
         print("\nSuccess! Add these to your .env file:\n")
-        print(f"POLY_API_KEY={creds.api_key}")
-        print(f"POLY_API_SECRET={creds.api_secret}")
-        print(f"POLY_PASSPHRASE={creds.api_passphrase}")
+        print(f"CLOB_API_KEY={creds.api_key}")
+        print(f"CLOB_SECRET={creds.api_secret}")
+        print(f"CLOB_PASS_PHRASE={creds.api_passphrase}")
         print("\n" + "=" * 60)
         print("Note: These credentials are derived from your private key.")
         print("They will be the same each time you run this script.")
