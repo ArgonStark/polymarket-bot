@@ -36,20 +36,27 @@ def _validate_order_response(response: dict) -> tuple[bool, str]:
     if not isinstance(response, dict):
         return False, f"Invalid response type: {type(response)}"
 
-    # Check for error indicators
+    # Check for error indicators - handle empty strings and nested errors
     if "error" in response:
-        return False, f"API error: {response['error']}"
+        error = response["error"]
+        if isinstance(error, dict):
+            error_msg = error.get("message") or error.get("error") or str(error)
+        else:
+            error_msg = str(error) if error else "Unknown API error"
+        return False, error_msg
 
     if "errorMsg" in response:
-        return False, f"API error: {response['errorMsg']}"
+        error_msg = response["errorMsg"] or "Unknown API error"
+        return False, error_msg
 
     if response.get("status") == "error":
-        return False, f"Order rejected: {response.get('message', 'Unknown error')}"
+        return False, response.get("message", "Unknown error")
 
     # Check for required fields
     order_id = response.get("orderID") or response.get("order_id")
     if not order_id:
-        return False, "Response missing order ID"
+        logger.debug(f"Order response without ID: {response}")
+        return False, "No order ID in response"
 
     return True, ""
 
@@ -135,10 +142,7 @@ class OrderExecutor:
                 return TradeResult(success=False, error_message=error_msg)
 
             order_id = response.get("orderID") or response.get("order_id", "")
-            logger.info(
-                f"MAKER ORDER placed: {side} {size_shares:.2f} shares "
-                f"@ {price:.4f} - Order ID: {order_id[:16]}..."
-            )
+            logger.info(f"ORDER PLACED (maker) | ID: {order_id[:12]}...")
 
             return TradeResult(
                 success=True,
@@ -209,10 +213,7 @@ class OrderExecutor:
                 return TradeResult(success=False, error_message=error_msg)
 
             order_id = response.get("orderID") or response.get("order_id", "")
-            logger.info(
-                f"LIMIT ORDER placed: {side} {size_shares:.2f} shares "
-                f"@ {price:.4f} - Order ID: {order_id[:16]}..."
-            )
+            logger.info(f"ORDER PLACED (limit) | ID: {order_id[:12]}...")
 
             return TradeResult(
                 success=True,
@@ -349,21 +350,18 @@ class OrderExecutor:
         else:
             token_id = signal.market.down_token_id
 
-        logger.info(
-            f"Executing {signal.recommended_action.value} signal: "
-            f"{signal.side.value} {signal.market.asset} | "
-            f"Price: {signal.recommended_price:.4f} | "
-            f"Size: {signal.size_shares:.2f} shares (${signal.size_usd:.2f}) | "
-            f"Token: {token_id[:16]}..."
-        )
-
         # Check that client exists for live trading
         if not self.config.dry_run and self.client is None:
             logger.error("Cannot execute trade: client not initialized")
             return TradeResult(success=False, error_message="Client not initialized")
 
+        order_type = signal.recommended_action.value
+        logger.info(
+            f"[{signal.market.asset}] {order_type} BUY {signal.side.value} | "
+            f"{signal.size_shares:.1f} shares @ {signal.recommended_price:.2f} (${signal.size_usd:.2f})"
+        )
+
         if signal.recommended_action == OrderAction.POST_ONLY:
-            logger.info(f"Placing POST_ONLY order: BUY {signal.size_shares:.2f} @ {signal.recommended_price:.4f}")
             return self.place_maker_order(
                 token_id=token_id,
                 side="BUY",
@@ -373,7 +371,6 @@ class OrderExecutor:
             )
 
         elif signal.recommended_action == OrderAction.LIMIT:
-            logger.info(f"Placing LIMIT order: BUY {signal.size_shares:.2f} @ {signal.recommended_price:.4f}")
             return self.place_limit_order(
                 token_id=token_id,
                 side="BUY",

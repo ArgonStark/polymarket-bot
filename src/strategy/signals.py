@@ -160,9 +160,10 @@ class SignalGenerator:
             true_prob = true_prob_up
             market_prob = market_prob_up
             entry_price = market.best_ask
+            price_diff = current_price - market.target_price
             logger.info(
-                f"SIGNAL: {market.asset} UP | Edge={edge:.1%} | "
-                f"Chainlink=${current_price:,.2f} > Target=${market.target_price:,.2f}"
+                f"[{market.asset}] SIGNAL UP | Edge: {edge:.1%} | "
+                f"Price: ${current_price:,.2f} (+${price_diff:,.2f} above target)"
             )
         elif edge_down >= min_edge:
             side = Side.DOWN
@@ -170,9 +171,10 @@ class SignalGenerator:
             true_prob = 1 - true_prob_up
             market_prob = market_prob_down
             entry_price = 1 - market.best_bid
+            price_diff = market.target_price - current_price
             logger.info(
-                f"SIGNAL: {market.asset} DOWN | Edge={edge:.1%} | "
-                f"Chainlink=${current_price:,.2f} < Target=${market.target_price:,.2f}"
+                f"[{market.asset}] SIGNAL DOWN | Edge: {edge:.1%} | "
+                f"Price: ${current_price:,.2f} (-${price_diff:,.2f} below target)"
             )
         else:
             # No sufficient edge - return skip signal
@@ -246,42 +248,28 @@ class SignalGenerator:
         """
         Determine order action based on edge and urgency.
 
-        POST-FEE UPDATE (Jan 2025): Polymarket introduced dynamic taker fees
-        up to 3.15% near 50% odds. Strategy now prioritizes MAKER orders
-        to earn rebates instead of paying fees.
+        UPDATED: Now prefers LIMIT orders for reliable execution.
+        With high edge (35-50%), the small taker fee (~0.02%) is negligible.
+        Getting the fill matters more than saving on fees.
 
-        Decision matrix (fee-aware):
-        - edge >= 15% AND time < 45s -> MARKET (urgent, high edge)
-        - edge >= 8% AND time < 90s -> LIMIT (good edge, moderate urgency)
-        - edge >= 3% -> POST_ONLY (earn rebates, preferred)
+        Decision matrix:
+        - edge >= 15% AND time < 45s -> MARKET (urgent, guaranteed fill)
+        - edge >= 3% -> LIMIT (reliable execution, default choice)
         - Otherwise -> SKIP
         """
         trading = self.config.trading
 
-        # MARKET orders: Use only when we have high edge AND limited time
-        # This pays taker fees but guarantees execution
+        # MARKET orders: Use only when we have high edge AND very limited time
+        # This guarantees execution when we need to get in before expiry
         if edge >= trading.edge_for_market and time_remaining < 45:
-            logger.debug(f"Action: MARKET (edge={edge:.1%}, time={time_remaining:.0f}s)")
             return OrderAction.MARKET
 
-        # LIMIT orders: Good edge with moderate time pressure
-        # May cross spread but still reasonable
-        elif edge >= trading.edge_for_limit and time_remaining < 90:
-            logger.debug(f"Action: LIMIT (edge={edge:.1%}, time={time_remaining:.0f}s)")
+        # LIMIT orders: Default choice for reliable execution
+        # Will fill immediately if there's liquidity, or sit on book if not
+        elif edge >= trading.min_edge:
             return OrderAction.LIMIT
 
-        # POST_ONLY: Preferred for most situations - earns maker rebates
-        elif edge >= trading.edge_for_post_only:
-            logger.debug(f"Action: POST_ONLY (edge={edge:.1%})")
-            return OrderAction.POST_ONLY
-
-        # Minimum edge but plenty of time - try POST_ONLY
-        elif edge >= trading.min_edge and time_remaining > 60:
-            logger.debug(f"Action: POST_ONLY (min edge={edge:.1%}, time={time_remaining:.0f}s)")
-            return OrderAction.POST_ONLY
-
         else:
-            logger.debug(f"Action: SKIP (edge={edge:.1%} < min={trading.min_edge:.1%})")
             return OrderAction.SKIP
 
     def _calculate_entry_price(
@@ -293,23 +281,19 @@ class SignalGenerator:
     ) -> float:
         """Calculate recommended entry price for order."""
         if action == OrderAction.MARKET:
-            # Aggressive price for immediate fill
-            return 0.99 if side == Side.UP else 0.01
+            # Very aggressive price for guaranteed immediate fill
+            return 0.99 if side == Side.UP else 0.99
 
         elif action == OrderAction.LIMIT:
-            # Slightly aggressive price
+            # Buy at best ask to fill immediately
+            # For UP: buy UP token at its best_ask
+            # For DOWN: buy DOWN token at (1 - UP's best_bid)
             if side == Side.UP:
-                return min(0.99, market.best_ask + 0.02)
+                return min(0.99, market.best_ask)
             else:
-                return max(0.01, (1 - market.best_bid) + 0.02)
+                return min(0.99, 1 - market.best_bid)
 
-        elif action == OrderAction.POST_ONLY:
-            # Price at or better than current bid to sit on book
-            if side == Side.UP:
-                return min(0.99, market.best_bid + 0.01)
-            else:
-                return max(0.01, (1 - market.best_ask) + 0.01)
-
+        # Fallback
         return market.best_ask if side == Side.UP else (1 - market.best_bid)
 
     def _calculate_position_size(
