@@ -125,15 +125,23 @@ def get_account_balance(client: Optional[ClobClient]) -> Optional[float]:
         return None
 
     try:
-        # Use the client's configured signature type
+        # Get the signature type from the client's builder
         # 0 = EOA wallet, 1 = proxy/browser wallet
-        sig_type = getattr(client, 'signature_type', 0)
+        # The sig_type is stored in client.builder.sig_type
+        sig_type = 0  # default to EOA
+        if hasattr(client, 'builder') and client.builder is not None:
+            sig_type = getattr(client.builder, 'sig_type', 0) or 0
+
+        logger.debug(f"Fetching balance with signature_type={sig_type}")
+
         # AssetType.COLLATERAL = USDC collateral balance
         params = BalanceAllowanceParams(
             asset_type=AssetType.COLLATERAL,
             signature_type=sig_type,
         )
         balance_info = client.get_balance_allowance(params)
+
+        logger.debug(f"Balance API response: {balance_info}")
 
         if balance_info:
             # Balance is typically returned as string in micro-units
@@ -147,6 +155,8 @@ def get_account_balance(client: Optional[ClobClient]) -> Optional[float]:
         return None
     except Exception as e:
         logger.error(f"Failed to get balance: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
         return None
 
 
