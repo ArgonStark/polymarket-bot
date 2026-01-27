@@ -489,26 +489,35 @@ class GammaAPI:
         - "Will BTC be above $97,500 at 3:15 PM?" -> 97500.0
         - "ETH 15min: >= $3,245.50?" -> 3245.50
 
+        Note: For 15-minute "Up or Down" markets, there is NO price in the
+        question text. These markets use the Chainlink price at market start
+        as the reference. Return None for these cases.
+
         Args:
             question: Market question text
 
         Returns:
-            Extracted price or None
+            Extracted price or None if no price found
         """
-        # Pattern: $XX,XXX.XX or $XX,XXX or $XXXXX
-        patterns = [
-            r"\$([0-9,]+\.?[0-9]*)",
-            r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)",
-        ]
+        # Skip "Up or Down" markets - they don't have a target price in the question
+        # The target is the Chainlink price at market start
+        if "Up or Down" in question:
+            return None
 
-        for pattern in patterns:
-            match = re.search(pattern, question)
-            if match:
-                price_str = match.group(1).replace(",", "")
-                try:
-                    return float(price_str)
-                except ValueError:
-                    continue
+        # Only match explicit dollar amounts like $97,500 or $3,245.50
+        # Don't match arbitrary numbers (like dates: "January 27")
+        pattern = r"\$([0-9,]+\.?[0-9]*)"
+        match = re.search(pattern, question)
+        if match:
+            price_str = match.group(1).replace(",", "")
+            try:
+                price = float(price_str)
+                # Sanity check: crypto prices should be reasonable
+                # BTC: $10k-$500k, ETH: $100-$50k, SOL: $1-$1k, XRP: $0.1-$50
+                if price >= 0.1:  # At least 10 cents
+                    return price
+            except ValueError:
+                pass
 
         return None
 

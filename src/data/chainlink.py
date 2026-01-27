@@ -128,6 +128,10 @@ class ChainlinkFeed:
 
     def _on_message(self, ws, message: str):
         """Handle incoming WebSocket message."""
+        # Skip empty messages (keepalive/ping)
+        if not message or not message.strip():
+            return
+
         try:
             data = json.loads(message)
 
@@ -174,8 +178,10 @@ class ChainlinkFeed:
             elif data.get("type") == "error":
                 logger.error(f"WebSocket error: {data}")
 
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse message: {e}")
+        except json.JSONDecodeError:
+            # Silently ignore parse errors for keepalive/ping messages
+            if message and message.strip() and message not in ('', 'ping', 'pong'):
+                logger.debug(f"Non-JSON Chainlink message: {message[:50]}...")
         except Exception as e:
             logger.error(f"Error processing message: {e}")
 

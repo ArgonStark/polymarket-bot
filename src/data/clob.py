@@ -147,32 +147,52 @@ class CLOBFeed:
 
     def _on_message(self, ws, message: str):
         """Handle incoming WebSocket message."""
+        # Skip empty messages
+        if not message or not message.strip():
+            return
+
         try:
             data = json.loads(message)
-            msg_type = data.get("type")
 
-            if msg_type == "book":
-                # Full order book snapshot
-                self._handle_book_snapshot(data)
+            # Handle list responses (batch messages)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        self._process_message(item)
+                return
 
-            elif msg_type == "price_change":
-                # Price level update
-                self._handle_price_change(data)
+            # Handle single dict message
+            if isinstance(data, dict):
+                self._process_message(data)
 
-            elif msg_type == "trade":
-                # Trade execution
-                self._handle_trade(data)
-
-            elif msg_type == "subscribed":
-                logger.debug(f"Subscription confirmed: {data}")
-
-            elif msg_type == "error":
-                logger.error(f"CLOB WebSocket error: {data}")
-
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse CLOB message: {e}")
+        except json.JSONDecodeError:
+            # Silently ignore parse errors for keepalive/ping messages
+            if message not in ('', 'ping', 'pong'):
+                logger.debug(f"Non-JSON CLOB message: {message[:50]}...")
         except Exception as e:
             logger.error(f"Error processing CLOB message: {e}")
+
+    def _process_message(self, data: dict):
+        """Process a single CLOB message."""
+        msg_type = data.get("type")
+
+        if msg_type == "book":
+            # Full order book snapshot
+            self._handle_book_snapshot(data)
+
+        elif msg_type == "price_change":
+            # Price level update
+            self._handle_price_change(data)
+
+        elif msg_type == "trade":
+            # Trade execution
+            self._handle_trade(data)
+
+        elif msg_type == "subscribed":
+            logger.debug(f"Subscription confirmed: {data}")
+
+        elif msg_type == "error":
+            logger.error(f"CLOB WebSocket error: {data}")
 
     def _handle_book_snapshot(self, data: dict):
         """Handle full order book snapshot."""
