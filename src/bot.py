@@ -100,6 +100,12 @@ class TradingBot:
         # Cached API positions (updated by _sync_existing_orders)
         self._api_positions: dict[str, dict] = {}  # asset -> position info
 
+        # Pending orders tracking - orders placed but not yet filled
+        # Key: order_id, Value: dict with signal, ml_data, placed_time
+        self._pending_orders: dict[str, dict] = {}
+        self._order_check_interval = 5.0  # Check pending orders every 5 seconds
+        self.last_order_check = None
+
         # Timing trackers
         self.last_market_refresh = None
         self.last_settlement_check = None
@@ -323,6 +329,123 @@ class TradingBot:
         except Exception as e:
             logger.debug(f"Balance sync failed: {e}")
 
+    async def _check_pending_orders(self):
+        """
+        Check pending orders for fills and update positions accordingly.
+
+        This ensures we only record positions when orders are actually filled,
+        not just when they're placed.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Check if we need to run
+        if self.last_order_check:
+            elapsed = (now - self.last_order_check).total_seconds()
+            if elapsed < self._order_check_interval:
+                return
+
+        self.last_order_check = now
+
+        if not self._pending_orders:
+            return
+
+        if self.client is None or self.executor is None:
+            return
+
+        orders_to_remove = []
+
+        for order_id, order_data in list(self._pending_orders.items()):
+            try:
+                # Check order status
+                order_info = self.executor.get_order_status(order_id)
+
+                if order_info is None:
+                    # Order not found - might have been filled or cancelled
+                    # Check how long we've been waiting
+                    placed_time = order_data.get("placed_time")
+                    if placed_time:
+                        wait_time = (now - placed_time).total_seconds()
+                        if wait_time > 120:  # 2 minutes timeout
+                            logger.warning(
+                                f"Order {order_id[:16]}... not found after {wait_time:.0f}s - removing"
+                            )
+                            orders_to_remove.append(order_id)
+                            # Restore cooldown to allow new order
+                            asset = order_data.get("asset")
+                            if asset and asset in self._last_order_time:
+                                del self._last_order_time[asset]
+                    continue
+
+                signal = order_data.get("signal")
+                asset = order_data.get("asset", signal.market.asset if signal else "???")
+
+                if order_info.status.value == "FILLED":
+                    # Order filled - record the position
+                    logger.info(
+                        f"✅ ORDER FILLED: {asset} | "
+                        f"Shares: {order_info.filled_size:.2f} @ {order_info.price:.4f}"
+                    )
+
+                    if signal:
+                        # Record position with risk manager
+                        self.risk_manager.record_position_open(
+                            signal=signal,
+                            entry_price=order_info.price,
+                            shares=order_info.filled_size,
+                            ml_volatility=order_data.get("ml_volatility"),
+                            ml_momentum=order_data.get("ml_momentum"),
+                            ml_confidence=order_data.get("ml_confidence"),
+                            ml_arb_type=order_data.get("ml_arb_type"),
+                            ml_spread=order_data.get("ml_spread"),
+                            ml_bid_depth=order_data.get("ml_bid_depth"),
+                            ml_ask_depth=order_data.get("ml_ask_depth"),
+                            ml_price_trend=order_data.get("ml_price_trend"),
+                            ml_distance_from_target=order_data.get("ml_distance_from_target"),
+                        )
+
+                    orders_to_remove.append(order_id)
+
+                elif order_info.status.value == "PARTIAL":
+                    # Partially filled - log progress
+                    fill_pct = order_info.fill_pct * 100
+                    logger.info(
+                        f"⏳ ORDER PARTIAL: {asset} | "
+                        f"Filled: {fill_pct:.0f}% ({order_info.filled_size:.2f} shares)"
+                    )
+
+                elif order_info.status.value in ["CANCELLED", "EXPIRED", "REJECTED"]:
+                    # Order failed - remove and allow retry
+                    logger.warning(
+                        f"❌ ORDER {order_info.status.value}: {asset} | "
+                        f"Order ID: {order_id[:16]}..."
+                    )
+                    orders_to_remove.append(order_id)
+                    # Clear cooldown to allow immediate retry
+                    if asset in self._last_order_time:
+                        del self._last_order_time[asset]
+
+                elif order_info.status.value == "OPEN":
+                    # Still open - check if we should cancel (market expiring soon)
+                    if signal and signal.market.time_remaining < 30:
+                        logger.warning(
+                            f"⚠️ Cancelling unfilled order for {asset} - market expiring"
+                        )
+                        self.executor.cancel_order(order_id)
+                        orders_to_remove.append(order_id)
+                        if asset in self._last_order_time:
+                            del self._last_order_time[asset]
+
+            except Exception as e:
+                logger.error(f"Error checking order {order_id[:16]}...: {e}")
+
+        # Remove processed orders
+        for order_id in orders_to_remove:
+            self._pending_orders.pop(order_id, None)
+
+        # Log pending orders count
+        if self._pending_orders:
+            logger.debug(f"Pending orders: {len(self._pending_orders)}")
+
     async def _display_startup_info(self):
         """
         Display account information at startup.
@@ -543,6 +666,9 @@ class TradingBot:
                 # Sync balance and open orders periodically
                 await self._sync_balance()
                 await self._sync_existing_orders()
+
+                # Check pending orders for fills
+                await self._check_pending_orders()
 
                 # Move expiring markets out of active trading
                 await self._check_expiring_markets()
@@ -1058,6 +1184,11 @@ class TradingBot:
             pos_str = ", ".join(active_positions)
             status_parts.append(f"{Colors.BRIGHT_YELLOW}📊 {pos_str}{Colors.RESET}")
 
+        # Show pending orders count
+        pending_count = len(self._pending_orders) if hasattr(self, '_pending_orders') else 0
+        if pending_count > 0:
+            status_parts.append(f"{Colors.DIM}⏳ {pending_count} pending{Colors.RESET}")
+
         if price_str:
             status_parts.append(f"{Colors.DIM}{price_str}{Colors.RESET}")
 
@@ -1065,17 +1196,18 @@ class TradingBot:
 
     def _has_active_position(self, asset: str) -> bool:
         """
-        Check if we already have an active position for this asset.
+        Check if we already have an active position or pending order for this asset.
 
         Checks:
         1. Internal position tracking (risk_manager.positions)
         2. Cached API positions (updated by _sync_existing_orders)
+        3. Pending orders (orders placed but not yet filled)
 
         Args:
             asset: Asset symbol (BTC, ETH, SOL, XRP)
 
         Returns:
-            True if position exists, False otherwise
+            True if position or pending order exists, False otherwise
         """
         # Check internal tracking
         for pos in self.risk_manager.positions.values():
@@ -1085,6 +1217,12 @@ class TradingBot:
         # Check cached API positions (stored during sync)
         if hasattr(self, '_api_positions') and asset in self._api_positions:
             return True
+
+        # Check pending orders
+        if hasattr(self, '_pending_orders'):
+            for order_data in self._pending_orders.values():
+                if order_data.get("asset") == asset:
+                    return True
 
         return False
 
@@ -1158,30 +1296,61 @@ class TradingBot:
             ml_price_trend = getattr(signal, '_ml_price_trend', None)
             ml_distance_from_target = getattr(signal, '_ml_distance_from_target', None)
 
-            # Record position with risk manager (including ML data for outcome tracking)
-            self.risk_manager.record_position_open(
-                signal=signal,
-                entry_price=result.filled_price or signal.recommended_price,
-                shares=result.filled_size or signal.size_shares,
-                ml_volatility=ml_volatility,
-                ml_momentum=ml_momentum,
-                ml_confidence=ml_confidence,
-                ml_arb_type=ml_arb_type,
-                ml_spread=ml_spread,
-                ml_bid_depth=ml_bid_depth,
-                ml_ask_depth=ml_ask_depth,
-                ml_price_trend=ml_price_trend,
-                ml_distance_from_target=ml_distance_from_target,
-            )
             conf_str = f" (ML: {ml_confidence:.0%})" if ml_confidence else ""
             arb_str = f" [{ml_arb_type}]" if ml_arb_type and ml_arb_type != "none" else ""
-            logger.info(f"    {Colors.BRIGHT_GREEN}✓ FILLED @ {signal.recommended_price:.2f}{conf_str}{arb_str}{Colors.RESET}")
 
-            # Log positions AFTER trade
-            logger.info(
-                f"📋 POST-TRADE [{asset}]: Tracked positions={len(self.risk_manager.positions)} | "
-                f"Bankroll=${self.risk_manager.current_bankroll:.2f}"
-            )
+            # Check if order was immediately filled (market orders or crossing limit orders)
+            if result.filled_size and result.filled_size > 0:
+                # Order filled immediately - record position
+                self.risk_manager.record_position_open(
+                    signal=signal,
+                    entry_price=result.filled_price or signal.recommended_price,
+                    shares=result.filled_size,
+                    ml_volatility=ml_volatility,
+                    ml_momentum=ml_momentum,
+                    ml_confidence=ml_confidence,
+                    ml_arb_type=ml_arb_type,
+                    ml_spread=ml_spread,
+                    ml_bid_depth=ml_bid_depth,
+                    ml_ask_depth=ml_ask_depth,
+                    ml_price_trend=ml_price_trend,
+                    ml_distance_from_target=ml_distance_from_target,
+                )
+                logger.info(f"    {Colors.BRIGHT_GREEN}✓ FILLED @ {result.filled_price:.2f}{conf_str}{arb_str}{Colors.RESET}")
+
+                # Log positions AFTER trade
+                logger.info(
+                    f"📋 POST-TRADE [{asset}]: Tracked positions={len(self.risk_manager.positions)} | "
+                    f"Bankroll=${self.risk_manager.current_bankroll:.2f}"
+                )
+            else:
+                # Order placed but not filled yet - track as pending
+                logger.info(
+                    f"    {Colors.BRIGHT_YELLOW}⏳ ORDER PLACED @ {signal.recommended_price:.2f} "
+                    f"(waiting for fill){conf_str}{arb_str}{Colors.RESET}"
+                )
+
+                # Store order details for later fill checking
+                self._pending_orders[result.order_id] = {
+                    "signal": signal,
+                    "asset": asset,
+                    "placed_time": now,
+                    "price": signal.recommended_price,
+                    "size_shares": signal.size_shares,
+                    "ml_volatility": ml_volatility,
+                    "ml_momentum": ml_momentum,
+                    "ml_confidence": ml_confidence,
+                    "ml_arb_type": ml_arb_type,
+                    "ml_spread": ml_spread,
+                    "ml_bid_depth": ml_bid_depth,
+                    "ml_ask_depth": ml_ask_depth,
+                    "ml_price_trend": ml_price_trend,
+                    "ml_distance_from_target": ml_distance_from_target,
+                }
+
+                logger.info(
+                    f"📋 PENDING ORDER [{asset}]: {len(self._pending_orders)} orders waiting for fill"
+                )
         else:
             # Set shorter cooldown (30s) on failures to prevent spam
             self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
