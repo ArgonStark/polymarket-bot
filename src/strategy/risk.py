@@ -83,7 +83,10 @@ class RiskManager:
         - Trading is enabled
         - Position limit not exceeded
         - No duplicate positions
-        - Size within limits
+        - Have sufficient capital (basic check)
+
+        Note: Position size is NOT validated here - it will be adjusted
+        by adjust_signal_size() to fit within limits.
 
         Args:
             signal: Signal to validate
@@ -108,19 +111,13 @@ class RiskManager:
                 f"Max positions ({trading.max_concurrent_positions}) reached",
             )
 
-        # Check position size limits
-        max_size = self.current_bankroll * trading.max_position_pct
-        if signal.size_usd > max_size:
+        # Basic capital check - need at least $5 available to trade
+        min_trade_size = 5.0
+        available = self.current_bankroll * 0.90  # Keep 10% buffer
+        if available < min_trade_size:
             return (
                 False,
-                f"Position size ${signal.size_usd:.2f} exceeds max ${max_size:.2f}",
-            )
-
-        # Check we have enough capital
-        if signal.size_usd > self.current_bankroll * 0.95:  # Keep 5% buffer
-            return (
-                False,
-                f"Insufficient capital for ${signal.size_usd:.2f} position",
+                f"Insufficient capital: ${available:.2f} available (need ${min_trade_size})",
             )
 
         return (True, "")
@@ -145,7 +142,6 @@ class RiskManager:
         base_from_bankroll = self.current_bankroll * trading.max_position_pct
 
         # Also respect the configured base position size as a minimum guide
-        # In aggressive mode, base_position_size is lower, so bankroll % dominates
         target_size = max(base_from_bankroll, trading.base_position_size)
 
         # Cap at max allowed per position
@@ -155,9 +151,18 @@ class RiskManager:
         # Final position size
         position_size = min(target_size, max_size, available)
 
+        logger.debug(
+            f"Size calc for {signal.market.asset}: bankroll=${self.current_bankroll:.2f}, "
+            f"base_from_bankroll=${base_from_bankroll:.2f}, target=${target_size:.2f}, "
+            f"max=${max_size:.2f}, available=${available:.2f}, final=${position_size:.2f}"
+        )
+
         # Ensure minimum viable trade size ($5)
         if position_size < 5.0:
-            logger.warning(f"Position size ${position_size:.2f} below minimum, skipping")
+            logger.warning(
+                f"Position size ${position_size:.2f} below $5 minimum for {signal.market.asset}, "
+                f"skipping (bankroll=${self.current_bankroll:.2f})"
+            )
             signal.size_usd = 0
             signal.size_shares = 0
             return signal
@@ -168,7 +173,10 @@ class RiskManager:
                 ratio = position_size / signal.size_usd
                 signal.size_shares = signal.size_shares * ratio
             signal.size_usd = position_size
-            logger.debug(f"Compounded position size: ${position_size:.2f} ({trading.max_position_pct:.0%} of ${self.current_bankroll:.2f})")
+            logger.info(
+                f"Position size for {signal.market.asset}: ${position_size:.2f} "
+                f"({trading.max_position_pct:.0%} of ${self.current_bankroll:.2f} bankroll)"
+            )
 
         return signal
 
