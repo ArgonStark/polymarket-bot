@@ -60,46 +60,48 @@ class TradingConfig:
         default_factory=lambda: os.getenv("TRADING_MODE", "normal")
     )
 
-    # Minimum edge required to enter a trade (as decimal, e.g., 0.25 = 25%)
+    # Minimum edge required to enter a trade (as decimal, e.g., 0.05 = 5%)
+    # Realistic values: 3-8% is typical for arbitrage opportunities
     min_edge: float = field(
-        default_factory=lambda: float(os.getenv("MIN_EDGE", "0.25"))
+        default_factory=lambda: float(os.getenv("MIN_EDGE", "0.03"))
     )
 
     # Minimum time remaining before market close (seconds)
     min_time_remaining: float = field(
-        default_factory=lambda: float(os.getenv("MIN_TIME_REMAINING", "45"))
+        default_factory=lambda: float(os.getenv("MIN_TIME_REMAINING", "30"))
     )
 
     # Base position size in USD
     base_position_size: float = field(
-        default_factory=lambda: float(os.getenv("BASE_POSITION_SIZE", "50"))
+        default_factory=lambda: float(os.getenv("BASE_POSITION_SIZE", "25"))
     )
 
     # Maximum position as percentage of bankroll
     max_position_pct: float = field(
-        default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.10"))
+        default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.15"))
     )
 
     # Maximum concurrent positions
     max_concurrent_positions: int = field(
-        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
+        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "8"))
     )
 
     # Daily loss limit as percentage of starting bankroll
     daily_loss_limit: float = field(
-        default_factory=lambda: float(os.getenv("DAILY_LOSS_LIMIT", "0.20"))
+        default_factory=lambda: float(os.getenv("DAILY_LOSS_LIMIT", "0.25"))
     )
 
     # Edge thresholds for different order types (configurable via env)
+    # These are realistic thresholds for actual trading
     edge_for_post_only: float = field(
-        default_factory=lambda: float(os.getenv("EDGE_FOR_POST_ONLY", "0.30"))
-    )  # 30% edge -> POST_ONLY
+        default_factory=lambda: float(os.getenv("EDGE_FOR_POST_ONLY", "0.03"))
+    )  # 3% edge -> POST_ONLY (maker orders, earn rebates)
     edge_for_limit: float = field(
-        default_factory=lambda: float(os.getenv("EDGE_FOR_LIMIT", "0.40"))
-    )  # 40% edge -> LIMIT (may take)
+        default_factory=lambda: float(os.getenv("EDGE_FOR_LIMIT", "0.08"))
+    )  # 8% edge -> LIMIT (may take liquidity)
     edge_for_market: float = field(
-        default_factory=lambda: float(os.getenv("EDGE_FOR_MARKET", "0.50"))
-    )  # 50% edge -> MARKET (guaranteed fill)
+        default_factory=lambda: float(os.getenv("EDGE_FOR_MARKET", "0.15"))
+    )  # 15% edge -> MARKET (guaranteed fill, pays fees)
 
     # Time thresholds for urgency (configurable via env)
     time_for_market: float = field(
