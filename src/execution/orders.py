@@ -50,7 +50,9 @@ def _validate_order_response(response: dict) -> tuple[bool, str]:
         return False, error_msg
 
     if "errorMsg" in response:
-        error_msg = response["errorMsg"] or "Unknown API error"
+        error_msg = response["errorMsg"]
+        if not error_msg:
+            error_msg = f"API error (response: {response})"
         return False, error_msg
 
     if response.get("status") == "error":
@@ -208,9 +210,13 @@ class OrderExecutor:
             signed_order = self.client.create_order(order_args)
             response = self.client.post_order(signed_order, OrderType.GTC)
 
+            # Log raw response for debugging
+            logger.debug(f"Order API response: {response}")
+
             # Validate response
             is_valid, error_msg = _validate_order_response(response)
             if not is_valid:
+                logger.warning(f"Order rejected. Response: {response}")
                 return TradeResult(success=False, error_message=error_msg)
 
             order_id = response.get("orderID") or response.get("order_id", "")
