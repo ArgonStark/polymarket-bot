@@ -154,7 +154,7 @@ class TradingBot:
         return True
 
     async def _sync_existing_orders(self, force: bool = False):
-        """Sync existing open orders from Polymarket to prevent duplicates."""
+        """Sync existing orders and positions from Polymarket."""
         now = datetime.now(timezone.utc)
 
         # Check if sync is needed (unless forced)
@@ -167,33 +167,42 @@ class TradingBot:
             return
 
         try:
-            from .execution.client import get_open_orders
-            open_orders = get_open_orders(self.client)
+            from .execution.client import get_open_orders, get_active_positions
+
             self.last_orders_sync = now
-
-            # Map token IDs to assets
-            token_to_asset = {
-                "btc": "BTC", "eth": "ETH", "sol": "SOL", "xrp": "XRP"
-            }
-
             synced_assets = set()
+
+            # 1. Sync open orders (unfilled)
+            open_orders = get_open_orders(self.client)
+            token_to_asset = {"btc": "BTC", "eth": "ETH", "sol": "SOL", "xrp": "XRP"}
+
             for order in open_orders:
-                # Try to identify asset from order data
                 asset_id = order.get("asset_id", "").lower()
                 market = order.get("market", "").lower()
 
                 for key, asset in token_to_asset.items():
                     if key in asset_id or key in market:
                         synced_assets.add(asset)
-                        # Set cooldown so we don't trade this asset
-                        self._last_order_time[asset] = datetime.now(timezone.utc)
+                        self._last_order_time[asset] = now
                         break
 
+            # 2. Sync active positions (filled trades in active markets)
+            positions = get_active_positions(self.client)
+            for asset, pos_info in positions.items():
+                synced_assets.add(asset)
+                self._last_order_time[asset] = now
+                # Update bankroll to reflect held positions
+                if asset not in [p.market.asset for p in self.risk_manager.positions.values()]:
+                    cost = pos_info.get("cost", 0)
+                    if cost > 0:
+                        self.risk_manager.current_bankroll -= cost
+                        logger.info(f"Found position: {asset} ${cost:.2f}")
+
             if synced_assets:
-                logger.info(f"Synced open orders: {', '.join(synced_assets)}")
+                logger.info(f"Active: {', '.join(synced_assets)} | Bankroll: ${self.risk_manager.current_bankroll:.2f}")
 
         except Exception as e:
-            logger.warning(f"Could not sync existing orders: {e}")
+            logger.warning(f"Could not sync orders/positions: {e}")
 
     async def _sync_balance(self):
         """Periodically sync bankroll with actual Polymarket balance."""
@@ -228,6 +237,7 @@ class TradingBot:
 
         balance = None
         open_orders_count = 0
+        positions_count = 0
 
         # Try to fetch real account info if client is available and configured
         if self.client is not None:
@@ -236,9 +246,13 @@ class TradingBot:
                 balance = get_account_balance(self.client)
 
                 # Fetch open orders count using SDK
-                from .execution.client import get_open_orders
+                from .execution.client import get_open_orders, get_active_positions
                 open_orders = get_open_orders(self.client)
                 open_orders_count = len(open_orders)
+
+                # Fetch active positions
+                positions = get_active_positions(self.client)
+                positions_count = len(positions)
 
             except Exception as e:
                 logger.warning(f"Could not fetch account info: {e}")
@@ -256,7 +270,7 @@ class TradingBot:
             mode=f"{mode} ({trading_mode})",
             balance=balance,
             open_orders=open_orders_count,
-            positions=0,  # No positions at startup
+            positions=positions_count,
             daily_pnl=0.0,
             win_rate=0.0,
         )
