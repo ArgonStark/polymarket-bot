@@ -715,12 +715,20 @@ class TradingBot:
         market.last_updated = datetime.now(timezone.utc)
 
     async def _execute_signal(self, signal: Signal):
-        """
-        Execute a trading signal.
+        """Execute a trading signal."""
+        # Get current price for logging
+        current_price = self.signal_generator.get_price(signal.market.asset)
+        target = signal.market.target_price
 
-        Args:
-            signal: Signal to execute
-        """
+        # Log the trade attempt with all relevant info
+        direction = ">" if signal.side == Side.UP else "<"
+        logger.info(
+            f">>> {signal.market.asset} {signal.side.value} | "
+            f"Edge: {signal.edge:.0%} | "
+            f"${current_price:,.0f} {direction} ${target:,.0f} | "
+            f"Size: ${signal.size_usd:.2f}"
+        )
+
         # Execute through order executor
         result = self.executor.execute_signal(signal)
 
@@ -731,12 +739,9 @@ class TradingBot:
                 entry_price=result.filled_price or signal.recommended_price,
                 shares=result.filled_size or signal.size_shares,
             )
-            logger.info(
-                f"[{signal.market.asset}] POSITION OPENED | "
-                f"{signal.side.value} {signal.size_shares:.1f} shares @ {signal.recommended_price:.2f}"
-            )
+            logger.info(f"    FILLED @ {signal.recommended_price:.2f}")
         else:
-            logger.warning(f"[{signal.market.asset}] ORDER FAILED: {result.error_message}")
+            logger.warning(f"    FAILED: {result.error_message}")
 
     def _on_chainlink_price(self, price: ChainlinkPrice):
         """Handle Chainlink price update."""

@@ -160,22 +160,12 @@ class SignalGenerator:
             true_prob = true_prob_up
             market_prob = market_prob_up
             entry_price = market.best_ask
-            price_diff = current_price - market.target_price
-            logger.info(
-                f"[{market.asset}] SIGNAL UP | Edge: {edge:.1%} | "
-                f"Price: ${current_price:,.2f} (+${price_diff:,.2f} above target)"
-            )
         elif edge_down >= min_edge:
             side = Side.DOWN
             edge = edge_down
             true_prob = 1 - true_prob_up
             market_prob = market_prob_down
             entry_price = 1 - market.best_bid
-            price_diff = market.target_price - current_price
-            logger.info(
-                f"[{market.asset}] SIGNAL DOWN | Edge: {edge:.1%} | "
-                f"Price: ${current_price:,.2f} (-${price_diff:,.2f} below target)"
-            )
         else:
             # No sufficient edge - return skip signal
             best_edge = max(edge_up, edge_down)
