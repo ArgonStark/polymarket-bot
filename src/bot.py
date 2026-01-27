@@ -675,6 +675,61 @@ class TradingBot:
         # Update signal generator with new price
         self.signal_generator.update_price(price.symbol, price.price)
 
+        # Update target prices for markets that need it
+        # For "Up or Down" markets, the target is the Chainlink price at market start
+        self._update_market_target_prices(price)
+
+    def _update_market_target_prices(self, price: ChainlinkPrice):
+        """
+        Update target prices for markets using Chainlink data.
+
+        For "Up or Down" 15-minute markets, the target price is the
+        Chainlink price at the market's start time. If we don't have
+        the exact start price, we use the first Chainlink price we
+        receive after the market starts.
+
+        Args:
+            price: Latest Chainlink price update
+        """
+        # Map Chainlink symbol (btc/usd) to asset (BTC)
+        symbol_map = {
+            "btc/usd": "BTC",
+            "eth/usd": "ETH",
+            "sol/usd": "SOL",
+            "xrp/usd": "XRP",
+        }
+        asset = symbol_map.get(price.symbol.lower())
+        if not asset:
+            return
+
+        now = datetime.now(timezone.utc)
+
+        # Update target prices for matching markets
+        for market in list(self.markets.values()):
+            if market.asset != asset:
+                continue
+
+            # Check if this market needs its target price updated
+            # Condition: market has started (now >= start_time) and target is placeholder
+            if now >= market.start_time:
+                # Check if current target is a placeholder (approximate values)
+                placeholder_prices = {
+                    "BTC": 100000.0,
+                    "ETH": 3500.0,
+                    "SOL": 200.0,
+                    "XRP": 2.5,
+                }
+                expected_placeholder = placeholder_prices.get(asset, 0)
+
+                # If target is still the placeholder, update it with Chainlink price
+                if abs(market.target_price - expected_placeholder) < 1:
+                    old_target = market.target_price
+                    market.target_price = price.price
+                    logger.info(
+                        f"Updated {asset} target price: "
+                        f"${old_target:,.2f} -> ${price.price:,.2f} (from Chainlink)"
+                    )
+
     def _on_orderbook_update(self, token_id: str, orderbook):
         """Handle order book update."""
         # Use token-to-market mapping for O(1) lookup instead of O(n) iteration
