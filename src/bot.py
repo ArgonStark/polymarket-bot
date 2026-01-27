@@ -7,7 +7,7 @@ risk management, and order execution.
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from .config import BotConfig
@@ -78,9 +78,15 @@ class TradingBot:
         self.last_market_refresh = None
         self.last_settlement_check = None
 
+        # Period tracking for 15-minute market transitions
+        # When a period boundary is crossed, we need to refresh markets with new target prices
+        self._current_period_ts: int = 0  # Current 15-min period timestamp
+        self._period_transition_wait_until: Optional[datetime] = None  # Wait for price data
+
         # Intervals (seconds)
         self.settlement_check_interval = 5.0  # Check settlements frequently
         self.market_discovery_interval = 15.0  # Discover new markets every 15s
+        self.period_transition_delay = 5.0  # Seconds to wait after period boundary for price data
 
         # Control flags
         self._running = False
@@ -375,6 +381,53 @@ class TradingBot:
     async def _refresh_markets(self):
         """Refresh list of active 15-minute markets."""
         now = datetime.now(timezone.utc)
+        current_ts = int(now.timestamp())
+
+        # Calculate current 15-minute period (rounds down to :00, :15, :30, :45)
+        current_period_ts = (current_ts // 900) * 900
+
+        # Detect period boundary crossing
+        if self._current_period_ts > 0 and current_period_ts != self._current_period_ts:
+            logger.info(
+                f"PERIOD BOUNDARY: Transitioning from {self._current_period_ts} "
+                f"to {current_period_ts}"
+            )
+
+            # Wait for new price data to become available
+            # The API needs a few seconds after period boundary to have closePrice
+            if self._period_transition_wait_until is None:
+                wait_seconds = self.period_transition_delay
+                self._period_transition_wait_until = now + timedelta(seconds=wait_seconds)
+                logger.info(
+                    f"Waiting {wait_seconds}s for new period price data..."
+                )
+
+            # If still waiting, don't refresh yet
+            if now < self._period_transition_wait_until:
+                logger.debug(
+                    f"Still waiting for period transition "
+                    f"({(self._period_transition_wait_until - now).total_seconds():.1f}s remaining)"
+                )
+                return
+
+            # Wait period complete - clear old markets and reset transition state
+            logger.info("Period transition complete - refreshing markets with new prices")
+            self._period_transition_wait_until = None
+
+            # Clear markets from old period (they should be in expiring/settled by now)
+            async with self._markets_lock:
+                old_markets = list(self.markets.keys())
+                for market_id in old_markets:
+                    market = self.markets.get(market_id)
+                    if market and market.time_remaining <= 0:
+                        self.markets.pop(market_id, None)
+                        logger.debug(f"Removed expired market: {market.asset}")
+
+            # Force refresh by clearing last_market_refresh
+            self.last_market_refresh = None
+
+        # Update current period tracking
+        self._current_period_ts = current_period_ts
 
         # Check if refresh is needed
         if self.last_market_refresh:
@@ -423,9 +476,18 @@ class TradingBot:
                         )
                     else:
                         # Update existing market state
-                        self.markets[market_id].best_bid = market.best_bid
-                        self.markets[market_id].best_ask = market.best_ask
-                        self.markets[market_id].last_updated = now
+                        existing = self.markets[market_id]
+                        existing.best_bid = market.best_bid
+                        existing.best_ask = market.best_ask
+                        existing.last_updated = now
+
+                        # IMPORTANT: Update target price if it changed (period transition)
+                        if market.target_price != existing.target_price:
+                            logger.info(
+                                f"TARGET PRICE UPDATE {market.asset}: "
+                                f"${existing.target_price:,.2f} → ${market.target_price:,.2f}"
+                            )
+                            existing.target_price = market.target_price
 
             self.last_market_refresh = now
 
