@@ -16,6 +16,7 @@ from .data import ChainlinkFeed, CLOBFeed, GammaAPI
 from .execution import create_trading_client, OrderExecutor
 from .execution.client import get_account_balance
 from .strategy import SignalGenerator, RiskManager
+from .strategy.ml_predictor import get_ml_predictor, MLSignalPredictor
 from .utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
 
 
@@ -61,6 +62,13 @@ class TradingBot:
         self.executor = None
         self.signal_generator = SignalGenerator(config=config)
         self.risk_manager = RiskManager(config=config)
+
+        # ML Signal Predictor
+        self.ml_predictor: Optional[MLSignalPredictor] = None
+        if config.trading.ml_enabled:
+            self.ml_predictor = get_ml_predictor()
+            self.ml_predictor.min_confidence = config.trading.ml_min_confidence
+            self.ml_predictor.min_training_samples = config.trading.ml_min_samples
 
         # Market state - three-stage lifecycle
         self.markets: dict[str, MarketState] = {}  # Active trading markets
@@ -727,12 +735,15 @@ class TradingBot:
             payout = 0.0
             pnl = -position.cost_basis
 
+        # Color the result
+        result_color = Colors.BRIGHT_GREEN if won else Colors.BRIGHT_RED
+        result_emoji = "🎉" if won else "💔"
         logger.info(
-            f"POSITION CLOSED: {market.asset} {position_side} | "
+            f"{result_color}{result_emoji} POSITION CLOSED: {market.asset} {position_side} | "
             f"{'WIN' if won else 'LOSS'} | "
             f"Shares: {position.shares:.2f} | "
             f"Entry: {position.entry_price:.4f} | "
-            f"P&L: ${pnl:+.2f}"
+            f"P&L: ${pnl:+.2f}{Colors.RESET}"
         )
 
         # Record with risk manager
@@ -741,6 +752,23 @@ class TradingBot:
             exit_price=1.0 if won else 0.0,
             pnl=pnl,
         )
+
+        # Record ML outcome for model learning
+        if self.ml_predictor and position.ml_volatility is not None:
+            # We need to recreate the signal to record the outcome
+            # Create a minimal signal-like object for ML recording
+            from types import SimpleNamespace
+            fake_signal = SimpleNamespace(
+                edge=0.0,  # Not needed for outcome
+                market=market,
+                side=position.side,
+            )
+            self.ml_predictor.record_outcome(
+                signal=fake_signal,
+                volatility=position.ml_volatility,
+                price_momentum=position.ml_momentum or 0.0,
+                won=won,
+            )
 
     async def _process_market(self, market: MarketState):
         """
@@ -783,6 +811,32 @@ class TradingBot:
         if signal.size_usd <= 0 or signal.size_shares <= 0:
             logger.debug(f"Signal for {market.asset} rejected: size too small")
             return
+
+        # ML filter - check predicted win probability
+        if self.ml_predictor:
+            volatility = self.config.volatility.get(market.asset)
+            # Calculate simple momentum from Chainlink price
+            price_momentum = 0.0
+            current_price = self.signal_generator.get_price(market.asset)
+            if current_price and market.target_price:
+                # Positive if price > target, negative if below
+                price_momentum = (current_price - market.target_price) / market.target_price
+                price_momentum = max(-1, min(1, price_momentum * 10))  # Scale and clamp
+
+            should_trade, confidence, ml_reason = self.ml_predictor.should_trade(
+                signal, volatility, price_momentum
+            )
+            if not should_trade:
+                rejection_key = f"{market.condition_id}:ml"
+                if rejection_key not in self._logged_rejections:
+                    self._logged_rejections.add(rejection_key)
+                    logger.info(f"[{market.asset}] 🤖 {ml_reason}")
+                return
+
+            # Store ML data with signal for outcome recording
+            signal._ml_volatility = volatility
+            signal._ml_momentum = price_momentum
+            signal._ml_confidence = confidence
 
         # Execute the signal
         await self._execute_signal(signal)
@@ -884,13 +938,22 @@ class TradingBot:
             # Set full cooldown for successful orders
             self._last_order_time[asset] = now
 
-            # Record position with risk manager
+            # Get ML data if available
+            ml_volatility = getattr(signal, '_ml_volatility', None)
+            ml_momentum = getattr(signal, '_ml_momentum', None)
+            ml_confidence = getattr(signal, '_ml_confidence', None)
+
+            # Record position with risk manager (including ML data for outcome tracking)
             self.risk_manager.record_position_open(
                 signal=signal,
                 entry_price=result.filled_price or signal.recommended_price,
                 shares=result.filled_size or signal.size_shares,
+                ml_volatility=ml_volatility,
+                ml_momentum=ml_momentum,
+                ml_confidence=ml_confidence,
             )
-            logger.info(f"    {Colors.BRIGHT_GREEN}✓ FILLED @ {signal.recommended_price:.2f}{Colors.RESET}")
+            conf_str = f" (ML: {ml_confidence:.0%})" if ml_confidence else ""
+            logger.info(f"    {Colors.BRIGHT_GREEN}✓ FILLED @ {signal.recommended_price:.2f}{conf_str}{Colors.RESET}")
         else:
             # Set shorter cooldown (30s) on failures to prevent spam
             self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)

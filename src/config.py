@@ -91,6 +91,50 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("DAILY_LOSS_LIMIT", "0.25"))
     )
 
+    # === Advanced Loss Protection ===
+
+    # Stop trading after X consecutive losses
+    max_consecutive_losses: int = field(
+        default_factory=lambda: int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+    )
+
+    # Stop trading if account drops X% from peak (drawdown protection)
+    max_drawdown_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_DRAWDOWN_PCT", "0.15"))
+    )
+
+    # Pause trading if win rate drops below this (after min_trades_for_winrate)
+    min_win_rate: float = field(
+        default_factory=lambda: float(os.getenv("MIN_WIN_RATE", "0.40"))
+    )
+
+    # Minimum trades before win rate check kicks in
+    min_trades_for_winrate: int = field(
+        default_factory=lambda: int(os.getenv("MIN_TRADES_FOR_WINRATE", "5"))
+    )
+
+    # Cooling off period after hitting any limit (minutes)
+    cooloff_period_minutes: int = field(
+        default_factory=lambda: int(os.getenv("COOLOFF_PERIOD_MINUTES", "30"))
+    )
+
+    # === Machine Learning Settings ===
+
+    # Enable ML signal filtering
+    ml_enabled: bool = field(
+        default_factory=lambda: os.getenv("ML_ENABLED", "true").lower() == "true"
+    )
+
+    # Minimum ML confidence to take a trade (0.5 = 50%)
+    ml_min_confidence: float = field(
+        default_factory=lambda: float(os.getenv("ML_MIN_CONFIDENCE", "0.55"))
+    )
+
+    # Minimum training samples before ML filtering kicks in
+    ml_min_samples: int = field(
+        default_factory=lambda: int(os.getenv("ML_MIN_SAMPLES", "10"))
+    )
+
     # Edge thresholds for different order types (configurable via env)
     # These are realistic thresholds for actual trading
     edge_for_post_only: float = field(
