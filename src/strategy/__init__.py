@@ -3,7 +3,12 @@
 from .signals import SignalGenerator
 from .risk import RiskManager
 from .arbitrage import ArbitrageDetector
-from .ml_predictor import MLSignalPredictor, get_ml_predictor
+from .ml_predictor import (
+    MLSignalPredictor,
+    get_ml_predictor,
+    calculate_price_trend,
+    extract_ml_features_from_market,
+)
 
 __all__ = [
     "SignalGenerator",
@@ -11,4 +16,6 @@ __all__ = [
     "ArbitrageDetector",
     "MLSignalPredictor",
     "get_ml_predictor",
+    "calculate_price_trend",
+    "extract_ml_features_from_market",
 ]
