@@ -135,6 +135,29 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("ML_MIN_SAMPLES", "10"))
     )
 
+    # === Arbitrage Strategy Settings ===
+    # Based on successful bot patterns that made $5-10k daily
+
+    # Dump threshold - price drop % that triggers entry (15% default)
+    arb_dump_threshold: float = field(
+        default_factory=lambda: float(os.getenv("ARB_DUMP_THRESHOLD", "0.15"))
+    )
+
+    # Hedge sum threshold - execute hedge when leg1 + opposite <= this
+    arb_hedge_threshold: float = field(
+        default_factory=lambda: float(os.getenv("ARB_HEDGE_THRESHOLD", "0.95"))
+    )
+
+    # Entry window - focus on first N minutes of 15-minute period
+    arb_entry_window_minutes: float = field(
+        default_factory=lambda: float(os.getenv("ARB_ENTRY_WINDOW", "2.0"))
+    )
+
+    # Minimum spread profit after fees (2.5% default)
+    arb_min_spread: float = field(
+        default_factory=lambda: float(os.getenv("ARB_MIN_SPREAD", "0.025"))
+    )
+
     # Edge thresholds for different order types (configurable via env)
     # These are realistic thresholds for actual trading
     edge_for_post_only: float = field(
