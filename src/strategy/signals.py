@@ -3,6 +3,12 @@ Signal generation module for temporal arbitrage strategy.
 
 Generates trading signals by comparing calculated true probabilities
 (based on Chainlink prices) with market odds.
+
+ENHANCED: Now includes arbitrage detection based on successful bot patterns:
+- Binary mispricing (YES + NO < 1.0)
+- Asymmetric pricing (buy the cheap side)
+- Dump detection (15%+ drops in 3 seconds)
+- Hedge execution (lock in profits)
 """
 
 import logging
@@ -16,6 +22,7 @@ from ..probability import (
     estimate_volatility,
 )
 from ..config import BotConfig
+from .arbitrage import ArbitrageDetector, select_best_opportunity
 
 
 logger = logging.getLogger(__name__)
@@ -28,6 +35,12 @@ class SignalGenerator:
 
     Core strategy: Exploit temporal arbitrage between real-time
     Chainlink prices and lagging market odds.
+
+    ENHANCED: Now uses ArbitrageDetector for pattern-based opportunities:
+    - Binary mispricing (YES + NO < 1.0)
+    - Asymmetric pricing (buy the cheap side)
+    - Dump detection (15%+ drops in 3 seconds)
+    - Hedge execution (lock in profits)
     """
 
     config: BotConfig
@@ -38,6 +51,9 @@ class SignalGenerator:
 
     # Volatility estimates
     volatilities: dict[str, float] = None
+
+    # Arbitrage detector for pattern-based opportunities
+    arb_detector: ArbitrageDetector = None
 
     def __post_init__(self):
         """Initialize data structures."""
@@ -50,6 +66,8 @@ class SignalGenerator:
             # Initialize with default volatilities
             for asset in self.config.supported_assets:
                 self.volatilities[asset.lower()] = self.config.volatility.get(asset)
+        if self.arb_detector is None:
+            self.arb_detector = ArbitrageDetector(config=self.config)
 
     def update_price(self, symbol: str, price: float):
         """
@@ -98,8 +116,9 @@ class SignalGenerator:
         """
         Generate a trading signal for a market.
 
-        Calculates true probability based on Chainlink price
-        and compares with market odds to find edge.
+        ENHANCED: Now uses two-stage approach:
+        1. Check for arbitrage opportunities (pattern-based)
+        2. Fall back to probability-based edge calculation
 
         Args:
             market: Market state to analyze
@@ -121,6 +140,12 @@ class SignalGenerator:
             )
             return None
 
+        # STAGE 1: Check for arbitrage opportunities (pattern-based)
+        arb_signal = self._check_arbitrage_opportunities(market, current_price, time_remaining)
+        if arb_signal:
+            return arb_signal
+
+        # STAGE 2: Fall back to probability-based edge calculation
         # Get volatility
         volatility = self.get_volatility(market.asset)
 
@@ -342,3 +367,92 @@ class SignalGenerator:
             f"True prob {true_prob:.1%} vs market {market_prob:.1%}. "
             f"Edge {edge:.1%}, time {time_remaining:.0f}s, vol {volatility:.3%}"
         )
+
+    def _check_arbitrage_opportunities(
+        self,
+        market: MarketState,
+        current_price: float,
+        time_remaining: float,
+    ) -> Optional[Signal]:
+        """
+        Check for arbitrage opportunities using pattern detection.
+
+        This implements strategies from successful bots:
+        - Binary mispricing (YES + NO < 1.0)
+        - Asymmetric pricing (buy the cheap side)
+        - Dump detection (15%+ drops in 3 seconds)
+        - Hedge execution (lock in profits)
+
+        Returns:
+            Signal if opportunity found, None otherwise
+        """
+        # Detect all opportunities
+        opportunities = self.arb_detector.detect_opportunities(market, current_price)
+
+        if not opportunities:
+            return None
+
+        # Select the best opportunity
+        best = select_best_opportunity(opportunities)
+
+        if not best:
+            return None
+
+        # Log the opportunity
+        logger.info(
+            f"🎯 ARB [{market.asset}]: {best['type'].upper()} | "
+            f"Edge: {best['edge']:.1%} | {best['reasoning']}"
+        )
+
+        # Create signal from opportunity
+        side = best["side"]
+        edge = best["edge"]
+        price = best["price"]
+
+        # Determine action (usually LIMIT for arb)
+        action = OrderAction.LIMIT
+        if best["type"] == "hedge":
+            action = OrderAction.LIMIT  # Always LIMIT for hedges
+
+        # Calculate position size
+        size_usd, size_shares = self._calculate_position_size(edge, price)
+
+        # Record leg 1 for potential hedging (if not already a hedge)
+        if best["type"] != "hedge" and not best.get("is_leg2"):
+            self.arb_detector.record_leg1_entry(market, side, price)
+
+        # Clear leg if this is a hedge
+        if best.get("is_leg2"):
+            self.arb_detector.clear_leg(market.condition_id)
+
+        # Mark signal as arbitrage-based
+        signal = Signal(
+            market=market,
+            side=side,
+            edge=edge,
+            true_prob=0.5,  # Not probability-based
+            market_prob=price,
+            recommended_action=action,
+            recommended_price=price,
+            size_usd=size_usd,
+            size_shares=size_shares,
+            chainlink_price=current_price,
+            time_remaining=time_remaining,
+            reasoning=f"[ARB] {best['reasoning']}",
+        )
+
+        # Store arb type for tracking
+        signal._arb_type = best["type"]
+        signal._is_hedge = best.get("is_leg2", False)
+
+        return signal
+
+    def record_trade_result(self, market_id: str, won: bool):
+        """
+        Record trade result for arbitrage learning.
+
+        Called when a position settles.
+        """
+        # Clear any active leg for this market
+        self.arb_detector.clear_leg(market_id)
+        self.arb_detector.clear_market_history(market_id)

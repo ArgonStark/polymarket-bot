@@ -18,20 +18,21 @@ An autonomous trading bot for Polymarket's 15-minute cryptocurrency prediction m
 - **DOWN wins**: End price < Start price (per Chainlink)
 - Settlement is deterministic once the 15 minutes expire
 
-### Probability Model
+### NEW: Arbitrage Strategy (Based on Successful Bots)
 
-Uses log-normal price dynamics to calculate true probability:
+Research on top Polymarket traders revealed key patterns:
+- Bots earning **$5-10k daily** on 15-minute crypto markets
+- **98% win rate** achieved by exploiting price lag
+- **$313 → $414k** in one month using these strategies
 
-```python
-# Scale volatility to remaining time
-scaled_vol = volatility_15min * sqrt(time_remaining / 900)
+**Key insight: Don't predict direction - exploit mispricing.**
 
-# Calculate z-score
-z_score = log(current_price / target_price) / scaled_vol
-
-# True probability
-prob_up = norm.cdf(z_score)
-```
+| Strategy | How It Works |
+|----------|--------------|
+| **Binary Mispricing** | Buy both YES+NO when total < $1.00 for guaranteed profit |
+| **Asymmetric Pricing** | Buy whichever side is temporarily too cheap |
+| **Dump Detection** | Enter when price drops 15%+ in 3 seconds |
+| **Hedge Execution** | Lock in profit when leg1 + opposite <= 0.95 |
 
 ## Architecture
 
@@ -49,10 +50,14 @@ prob_up = norm.cdf(z_score)
 ┌─────────────────────────────────────────────────────────────┐
 │                     STRATEGY ENGINE                          │
 ├─────────────────────────────────────────────────────────────┤
-│  Signal Generator      │  Risk Manager         │            │
-│  - Probability calc    │  - Position limits    │            │
-│  - Edge detection      │  - Daily loss limit   │            │
-│  - Action decision     │  - Size adjustment    │            │
+│  Signal Generator      │  Arbitrage Detector  │ ML Predictor│
+│  - Probability calc    │  - Binary mispricing │ - Win prob  │
+│  - Edge detection      │  - Dump detection    │ - Learning  │
+│  - Action decision     │  - Hedge execution   │ - Filtering │
+├─────────────────────────────────────────────────────────────┤
+│                       RISK MANAGER                           │
+│  - Position limits     │  - Consecutive loss  │ - Drawdown  │
+│  - Daily loss limit    │  - Win rate check    │ - Cooloff   │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -104,41 +109,164 @@ cp .env.example .env
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MIN_EDGE` | 0.25 | Minimum edge to trade (25%) |
-| `MIN_TIME_REMAINING` | 45 | Min seconds before expiry |
-| `BASE_POSITION_SIZE` | 50 | Position size in USD |
-| `MAX_POSITION_PCT` | 0.10 | Max position % of bankroll |
-| `MAX_CONCURRENT_POSITIONS` | 5 | Max open positions |
-| `DAILY_LOSS_LIMIT` | 0.20 | Daily loss limit (20%) |
+| `MIN_EDGE` | 0.03 | Minimum edge to trade (3%) |
+| `MIN_TIME_REMAINING` | 30 | Min seconds before expiry |
+| `BASE_POSITION_SIZE` | 25 | Position size in USD |
+| `MAX_POSITION_PCT` | 0.15 | Max position % of bankroll |
+| `MAX_CONCURRENT_POSITIONS` | 2 | Max open positions |
+| `DAILY_LOSS_LIMIT` | 0.25 | Daily loss limit (25%) |
+
+### Loss Protection Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_CONSECUTIVE_LOSSES` | 3 | Stop after N consecutive losses |
+| `MAX_DRAWDOWN_PCT` | 0.15 | Stop if account drops 15% from peak |
+| `MIN_WIN_RATE` | 0.40 | Pause if win rate drops below 40% |
+| `MIN_TRADES_FOR_WINRATE` | 5 | Trades before win rate check kicks in |
+| `COOLOFF_PERIOD_MINUTES` | 30 | Pause duration after hitting limits |
+
+### Machine Learning Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ML_ENABLED` | true | Enable ML signal filtering |
+| `ML_MIN_CONFIDENCE` | 0.55 | Min predicted win probability (55%) |
+| `ML_MIN_SAMPLES` | 10 | Training samples before ML kicks in |
+
+### Arbitrage Strategy Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ARB_DUMP_THRESHOLD` | 0.15 | Price drop % that triggers entry (15%) |
+| `ARB_HEDGE_THRESHOLD` | 0.95 | Hedge when leg1 + opposite <= 0.95 |
+| `ARB_ENTRY_WINDOW` | 2.0 | Focus on first N minutes of period |
+| `ARB_MIN_SPREAD` | 0.025 | Minimum profit after fees (2.5%) |
 
 ### Edge and Time Thresholds
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `EDGE_FOR_POST_ONLY` | 0.30 | Min edge for maker orders |
-| `EDGE_FOR_LIMIT` | 0.40 | Min edge for limit orders |
-| `EDGE_FOR_MARKET` | 0.50 | Min edge for market orders |
+| `EDGE_FOR_POST_ONLY` | 0.03 | Min edge for maker orders |
+| `EDGE_FOR_LIMIT` | 0.08 | Min edge for limit orders |
+| `EDGE_FOR_MARKET` | 0.15 | Min edge for market orders |
 | `TIME_FOR_MARKET` | 60 | Seconds remaining for market orders |
 | `TIME_FOR_LIMIT` | 120 | Seconds remaining for limit orders |
-| `MAKER_ORDER_TIMEOUT` | 30 | Maker order timeout (seconds) |
 
-### WebSocket Settings
+## Machine Learning System
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WS_MAX_RETRIES` | 10 | Max reconnect attempts before circuit breaker |
-| `WS_RECONNECT_DELAY` | 1.0 | Initial reconnect delay (seconds) |
-| `WS_MAX_RECONNECT_DELAY` | 60.0 | Max reconnect delay (seconds) |
-| `WS_PING_INTERVAL` | 30 | Keepalive ping interval (seconds) |
-| `WS_PING_TIMEOUT` | 10 | Ping timeout (seconds) |
+The bot includes an online learning ML model that improves with each trade.
 
-### Optional Notifications
+### How It Works
 
-| Variable | Description |
-|----------|-------------|
-| `TELEGRAM_BOT_TOKEN` | Telegram bot token |
-| `TELEGRAM_CHAT_ID` | Telegram chat ID |
-| `DISCORD_WEBHOOK_URL` | Discord webhook URL |
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    TRAINING PHASE                            │
+│                                                              │
+│  Signal → Extract Features → Record with Outcome             │
+│                                                              │
+│  Features:                                                   │
+│  ├── edge (expected profit)        → normalized 0-1          │
+│  ├── time_remaining (seconds)      → normalized 0-1          │
+│  ├── volatility                    → normalized 0-1          │
+│  ├── price_momentum (-1 to +1)     → normalized 0-1          │
+│  ├── hour_of_day (0-23)           → normalized 0-1          │
+│  ├── day_of_week (0-6)            → normalized 0-1          │
+│  ├── asset (BTC/ETH/SOL/XRP)      → one-hot encoded         │
+│  └── side (UP/DOWN)               → binary                   │
+│                                                              │
+│  Outcome: WIN (1) or LOSS (0)                               │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    PREDICTION PHASE                          │
+│                                                              │
+│  New Signal → Extract Features → Predict Win Probability     │
+│                                                              │
+│  Model: Logistic Regression (online learning)                │
+│                                                              │
+│  prediction = sigmoid(bias + Σ(weight_i × feature_i))        │
+│                                                              │
+│  If prediction >= 55% → ALLOW trade                          │
+│  If prediction < 55%  → REJECT trade                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### The Algorithm
+
+**Logistic Regression with Online Learning:**
+
+```python
+# For each feature vector X and outcome y (1=win, 0=loss):
+
+# 1. Make prediction
+z = bias + sum(weight[i] * X[i] for i in range(n_features))
+prediction = 1 / (1 + exp(-z))  # sigmoid
+
+# 2. Calculate error
+error = y - prediction
+
+# 3. Update weights (gradient descent)
+for i in range(n_features):
+    weight[i] += learning_rate * error * X[i]
+bias += learning_rate * error
+```
+
+### Learning Phases
+
+| Phase | Trades | Behavior |
+|-------|--------|----------|
+| **Learning** | 0-9 | All trades allowed, collecting data |
+| **Active** | 10+ | Only trades with >55% predicted win |
+
+### Example Output
+
+```
+🤖 ML Model: 15 samples | Accuracy: 67% (10/15)
+[BTC] 🤖 ML rejected: 42% < 55%
+[ETH] 🤖 ML confidence: 68%
+    ✓ FILLED @ 0.52 (ML: 68%)
+```
+
+### Model Persistence
+
+The model saves to `ml_model.json` every 10 trades:
+- Weights and bias preserved
+- Training samples count
+- Accuracy statistics
+
+## Risk Management
+
+### Built-in Protections
+
+| Protection | Default | Trigger |
+|------------|---------|---------|
+| **Daily Loss Limit** | 25% | Halts trading for the day |
+| **Consecutive Losses** | 3 | Enters 30-minute cooloff |
+| **Max Drawdown** | 15% | Enters cooloff if account drops from peak |
+| **Win Rate Check** | 40% | Pauses if win rate too low (after 5+ trades) |
+| **Cooloff Period** | 30 min | Pause after any limit is hit |
+
+### How Cooloff Works
+
+```
+Loss #1 → Continue trading
+Loss #2 → Continue trading
+Loss #3 → 🛑 COOLOFF STARTED: consecutive losses
+          Trading paused for 30 minutes until 14:35:00 UTC
+
+... 30 minutes later ...
+
+✅ Cooloff period ended - resetting protection counters
+```
+
+### Connection Resilience
+
+- **Circuit Breaker**: WebSocket feeds automatically reconnect with exponential backoff
+- **Max Retries**: After 10 consecutive failures, circuit breaker opens
+- **Feed Monitoring**: Trading halts if both Chainlink and CLOB feeds fail
+- **Balance Sync**: Syncs with exchange every 30 seconds
 
 ## Usage
 
@@ -164,52 +292,17 @@ Options:
   --position-size USD Override position size
 ```
 
-## Order Execution Strategy
+## Log Output
 
-### Fee-Aware Strategy (Updated Jan 2025)
+The bot uses colorful logging for easy monitoring:
 
-**IMPORTANT**: Polymarket introduced dynamic taker fees up to **3.15%** near 50% odds.
-The bot now prioritizes **MAKER orders (POST_ONLY)** to earn rebates instead of paying fees.
-
-| Edge | Time Remaining | Action | Description |
-|------|----------------|--------|-------------|
-| ≥40% | <30s | MARKET (FOK) | Only when very urgent |
-| ≥20% | <45s | LIMIT (GTC) | Aggressive maker |
-| ≥8% | >60s | POST_ONLY | **Preferred** - earns rebates |
-| <8% | - | SKIP | Edge too low |
-
-### Fee Structure (Dynamic Fees)
-
-**Taker Fees (AVOID - fees are higher now):**
 ```
-fee_rate = 0.25 × (price × (1 - price))²
+💰 $85.55 │ 📊 BTC, ETH │ BTC: $87,000 | ETH: $3,200
+🎯 ARB [BTC]: ASYMMETRIC | Edge: 5% | Price below target, NO too cheap
+>>> BTC UP ▲ │ Edge: 35% │ $87,000 vs $86,500 │ $12.50
+    ✓ FILLED @ 0.52 (ML: 68%)
+🎉 POSITION CLOSED: BTC UP | WIN | Shares: 24.04 | P&L: +$11.54
 ```
-- At 50% odds: up to **3.15%** fee (dynamic)
-- At 30% odds: ~1.5% fee
-- At 10% odds: ~0.2% fee
-
-**Maker Rebates (PRIORITIZED):**
-- 100% of collected taker fees redistributed to makers
-- Daily USDC payments proportional to filled maker volume
-- **This is now the primary profit mechanism**
-
-### Aggressive Mode
-
-For high-risk/high-reward trading (inspired by @0x8dxd who turned $313 → $414K):
-
-```bash
-# Copy aggressive config
-cp .env.aggressive .env
-# Edit with your credentials, then:
-python main.py --dry-run  # Test first!
-```
-
-**Aggressive mode features:**
-- Lower edge threshold (8% vs 25%)
-- Compounding position sizing (scales with wins)
-- Kelly-inspired sizing (bigger edge = bigger bet)
-- Prioritizes POST_ONLY orders (earn rebates)
-- Higher daily loss tolerance (40%)
 
 ## Project Structure
 
@@ -218,10 +311,9 @@ polymarket-bot/
 ├── main.py                 # Entry point
 ├── requirements.txt        # Dependencies
 ├── .env.example           # Environment template
-├── .gitignore
-├── README.md
+├── ml_model.json          # Persisted ML model
+├── trades.jsonl           # Trade log
 └── src/
-    ├── __init__.py
     ├── config.py          # Configuration management
     ├── models.py          # Data models
     ├── probability.py     # Probability calculations
@@ -235,37 +327,12 @@ polymarket-bot/
     │   └── orders.py      # Order execution
     ├── strategy/
     │   ├── signals.py     # Signal generation
-    │   └── risk.py        # Risk management
+    │   ├── risk.py        # Risk management
+    │   ├── arbitrage.py   # Arbitrage detection
+    │   └── ml_predictor.py # ML signal filter
     └── utils/
         └── logging.py     # Logging utilities
 ```
-
-## Risk Management
-
-### Built-in Protections
-
-1. **Position Limits**: Max positions and max size per position
-2. **Daily Loss Limit**: Automatically halts trading at 20% daily loss
-3. **Minimum Time**: Won't trade with less than 45 seconds remaining
-4. **Edge Threshold**: Requires 25%+ edge to enter trades
-
-### Connection Resilience
-
-- **Circuit Breaker**: WebSocket feeds automatically reconnect with exponential backoff
-- **Max Retries**: After 10 consecutive failures, circuit breaker opens to prevent resource exhaustion
-- **Feed Monitoring**: Trading halts if both Chainlink and CLOB feeds fail
-- **Thread Safety**: Market operations use async locks to prevent race conditions
-- **Non-blocking Notifications**: Trade alerts sent via background thread pool
-
-### Key Principles
-
-- **Chainlink is truth** - Settlement uses Chainlink, trade based on Chainlink
-- **Speed wins** - Sub-second reaction to price movements
-- **Maker first** - Earn rebates when possible
-- **No prediction** - React to confirmed price data, don't guess direction
-- **Mechanical execution** - Same logic every trade
-- **Small edges compound** - Many 25% edge trades > few 50% edge trades
-- **Survive to trade** - Risk management prevents ruin
 
 ## Supported Assets
 
@@ -283,19 +350,16 @@ polymarket-bot/
 | SOL | 0.50% - 0.80% | 0.70% |
 | XRP | 0.40% - 0.70% | 0.60% |
 
-## Logging
+## Key Principles
 
-Trades are logged to `trades.jsonl` in JSON Lines format:
-
-```json
-{
-  "timestamp": "2024-01-15T14:30:00.000Z",
-  "signal_id": "sig_BTC_UP_20240115143000",
-  "market": {"asset": "BTC", "target_price": 97500},
-  "signal": {"side": "UP", "edge": 0.32, "true_prob": 0.72},
-  "result": {"success": true, "filled_size": 100}
-}
-```
+- **Chainlink is truth** - Settlement uses Chainlink, trade based on Chainlink
+- **Don't predict** - Exploit mispricing, not direction
+- **Speed wins** - Sub-second reaction to price movements
+- **Maker first** - Earn rebates when possible
+- **Mechanical execution** - Same logic every trade
+- **Small edges compound** - Many 3% edge trades > few 50% edge trades
+- **Survive to trade** - Risk management prevents ruin
+- **Learn from losses** - ML improves with every outcome
 
 ## Disclaimer
 
