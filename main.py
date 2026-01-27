@@ -19,6 +19,7 @@ import sys
 from src.config import BotConfig
 from src.bot import TradingBot
 from src.utils.logging import setup_logging, log_bot_start, log_bot_stop
+from src.utils.console import setup_colored_logging, print_banner
 
 
 # Global bot instance for signal handling
@@ -104,11 +105,20 @@ async def main():
     # Parse arguments
     args = parse_args()
 
-    # Set up logging
-    setup_logging(
-        level=args.log_level,
-        log_file=args.log_file,
-    )
+    # Print banner
+    print_banner()
+
+    # Set up colored logging
+    import logging
+    log_level = getattr(logging, args.log_level)
+    setup_colored_logging(level=log_level)
+
+    # Also set up file logging if specified
+    if args.log_file:
+        setup_logging(
+            level=args.log_level,
+            log_file=args.log_file,
+        )
 
     # Load configuration
     config = BotConfig.from_env()

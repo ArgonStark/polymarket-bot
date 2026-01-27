@@ -125,9 +125,10 @@ def get_account_balance(client: Optional[ClobClient]) -> Optional[float]:
         return None
 
     try:
-        # Create proper params with signature_type
-        # signature_type=-1 means "use client's default"
-        params = BalanceAllowanceParams(signature_type=-1)
+        # Use the client's configured signature type
+        # 0 = EOA wallet, 1 = proxy/browser wallet
+        sig_type = getattr(client, 'signature_type', 0)
+        params = BalanceAllowanceParams(signature_type=sig_type, asset_type="USDC")
         balance_info = client.get_balance_allowance(params)
 
         if balance_info:

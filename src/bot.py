@@ -16,7 +16,7 @@ from .data import ChainlinkFeed, CLOBFeed, GammaAPI
 from .execution import create_trading_client, OrderExecutor
 from .execution.client import get_account_balance
 from .strategy import SignalGenerator, RiskManager
-from .utils import log_trade, shutdown_notification_executor
+from .utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,9 @@ class TradingBot:
 
         # Token-to-market mapping for fast lookups
         self._token_to_market: dict[str, str] = {}  # token_id -> condition_id
+
+        # Track logged rejections to avoid spam
+        self._logged_rejections: set[str] = set()
 
         # Timing trackers
         self.last_market_refresh = None
@@ -143,51 +146,51 @@ class TradingBot:
         mode = "SIMULATION" if self.config.dry_run else "LIVE TRADING"
         trading_mode = self.config.trading.mode.upper()
 
-        logger.info("=" * 60)
-        logger.info("  POLYMARKET 15-MIN CRYPTO ARBITRAGE BOT")
-        logger.info(f"  Mode: {mode} ({trading_mode})")
-        logger.info("=" * 60)
+        balance = None
+        open_orders_count = 0
 
         # Try to fetch real account info if client is available and configured
         if self.client is not None:
             try:
                 # Fetch balance using SDK
                 balance = get_account_balance(self.client)
-                if balance is not None:
-                    logger.info(f"  Account Balance: ${balance:,.2f} USDC")
-                else:
-                    logger.info("  Account Balance: Unable to fetch (check API credentials)")
 
                 # Fetch open orders count using SDK
                 from .execution.client import get_open_orders
                 open_orders = get_open_orders(self.client)
-                logger.info(f"  Open Orders: {len(open_orders)}")
+                open_orders_count = len(open_orders)
 
             except Exception as e:
-                logger.warning(f"  Could not fetch account info: {e}")
-        else:
-            # No client available
-            simulated_balance = (
+                logger.warning(f"Could not fetch account info: {e}")
+
+        # If no balance fetched and in dry run, use simulated
+        if balance is None and self.config.dry_run:
+            balance = (
                 self.config.trading.base_position_size
                 * self.config.trading.max_concurrent_positions
                 * 5
             )
-            if self.config.dry_run:
-                logger.info(f"  Simulated Balance: ${simulated_balance:,.2f} USDC")
-                logger.info("  (Wallet not configured - simulation only)")
-            else:
-                logger.warning("  Account: Not connected (configure PK and FUNDER in .env)")
 
-        # Display key trading parameters
-        logger.info("-" * 60)
-        logger.info(f"  Min Edge: {self.config.trading.min_edge:.0%}")
-        logger.info(f"  Min Time Remaining: {self.config.trading.min_time_remaining}s")
-        logger.info(f"  Base Position Size: ${self.config.trading.base_position_size:.2f}")
-        logger.info(f"  Max Position %: {self.config.trading.max_position_pct:.0%}")
-        logger.info(f"  Max Concurrent Positions: {self.config.trading.max_concurrent_positions}")
-        logger.info(f"  Daily Loss Limit: {self.config.trading.daily_loss_limit:.0%}")
-        logger.info(f"  Supported Assets: {', '.join(self.config.supported_assets)}")
-        logger.info("=" * 60)
+        # Print colorful status box
+        print_status_box(
+            mode=f"{mode} ({trading_mode})",
+            balance=balance,
+            open_orders=open_orders_count,
+            positions=0,  # No positions at startup
+            daily_pnl=0.0,
+            win_rate=0.0,
+        )
+
+        # Print config box
+        print_config_box({
+            "Min Edge": self.config.trading.min_edge,
+            "Min Time Remaining": f"{self.config.trading.min_time_remaining}s",
+            "Base Position Size": self.config.trading.base_position_size,
+            "Max Position %": self.config.trading.max_position_pct,
+            "Max Concurrent": self.config.trading.max_concurrent_positions,
+            "Daily Loss Limit": self.config.trading.daily_loss_limit,
+            "Supported Assets": ", ".join(self.config.supported_assets),
+        })
 
     async def start(self):
         """Start the trading bot."""
@@ -413,6 +416,13 @@ class TradingBot:
                         self.markets[market_id].last_updated = now
 
             self.last_market_refresh = now
+
+            # Clear old rejection logs for settled markets
+            self._logged_rejections = {
+                k for k in self._logged_rejections
+                if k.split(":")[0] in self.markets or k.split(":")[0] in self.expiring_markets
+            }
+
             logger.debug(
                 f"Markets: {len(self.markets)} active, "
                 f"{len(self.expiring_markets)} expiring"
@@ -596,7 +606,11 @@ class TradingBot:
         # Validate signal against risk limits
         is_valid, reason = self.risk_manager.validate_signal(signal)
         if not is_valid:
-            logger.info(f"Signal rejected: {reason}")
+            # Only log each rejection reason once per market to avoid spam
+            rejection_key = f"{market.condition_id}:{reason}"
+            if rejection_key not in self._logged_rejections:
+                self._logged_rejections.add(rejection_key)
+                logger.debug(f"Signal rejected for {market.asset}: {reason}")
             return
 
         # Adjust size if needed
