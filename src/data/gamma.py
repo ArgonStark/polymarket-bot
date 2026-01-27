@@ -322,24 +322,29 @@ class GammaAPI:
                 # Try to get from market metadata
                 target_price = market.get("startPrice") or market.get("targetPrice")
 
-            # For 15-min markets, target price may not be in API response
-            # Use a placeholder that will be updated from Chainlink at runtime
+            # For 15-min markets, fetch the "price to beat" from Polymarket API
             if not target_price or target_price <= 0:
                 # Check if this is a 15-minute market (has updown-15m in slug)
                 if "-updown-15m-" in slug.lower():
-                    # Use a temporary placeholder - will be updated from Chainlink
-                    # The bot should fetch the actual price from Chainlink stream
-                    target_price = self._get_placeholder_price(asset)
-                    if target_price and target_price > 0:
-                        logger.debug(
-                            f"Using placeholder target price for {asset}: {target_price}"
-                        )
-                    else:
-                        logger.warning(
-                            f"Market missing valid target price: {condition_id} "
-                            f"(15-min market, will need Chainlink price)"
-                        )
-                        return None
+                    # Extract start timestamp from slug (e.g., btc-updown-15m-1769027400)
+                    start_ts = self._extract_timestamp_from_slug(slug)
+
+                    if start_ts:
+                        # Fetch price to beat from Polymarket API
+                        target_price = self.fetch_price_to_beat(asset, start_ts)
+
+                    # Fallback to placeholder if API fails
+                    if not target_price or target_price <= 0:
+                        target_price = self._get_placeholder_price(asset)
+                        if target_price and target_price > 0:
+                            logger.debug(
+                                f"Using placeholder for {asset}: ${target_price:,.2f}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Market missing valid target price: {condition_id}"
+                            )
+                            return None
                 else:
                     logger.warning(
                         f"Market missing valid target price: {condition_id} "
@@ -415,12 +420,32 @@ class GammaAPI:
         Returns:
             Start time as datetime or None
         """
+        timestamp = self._extract_timestamp_from_slug(slug)
+        if timestamp:
+            try:
+                return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            except (ValueError, OSError):
+                pass
+        return None
+
+    def _extract_timestamp_from_slug(self, slug: str) -> Optional[int]:
+        """
+        Extract unix timestamp from 15-minute market slug.
+
+        Slug format: {asset}-updown-15m-{unix_timestamp}
+        Example: btc-updown-15m-1769027400 -> 1769027400
+
+        Args:
+            slug: Market slug
+
+        Returns:
+            Unix timestamp (seconds) or None
+        """
         match = re.search(r"-(\d{10})$", slug)
         if match:
             try:
-                timestamp = int(match.group(1))
-                return datetime.fromtimestamp(timestamp, tz=timezone.utc)
-            except (ValueError, OSError):
+                return int(match.group(1))
+            except ValueError:
                 pass
         return None
 
@@ -438,7 +463,7 @@ class GammaAPI:
             Placeholder price or None
         """
         # Approximate prices as of 2025 - these are just placeholders
-        # The actual target price should come from Chainlink at market start
+        # The actual target price should come from the crypto-price API
         placeholders = {
             "BTC": 100000.0,
             "ETH": 3500.0,
@@ -446,6 +471,63 @@ class GammaAPI:
             "XRP": 2.5,
         }
         return placeholders.get(asset.upper())
+
+    def fetch_price_to_beat(self, asset: str, market_start_timestamp: int) -> Optional[float]:
+        """
+        Fetch the "price to beat" for a 15-minute market from Polymarket API.
+
+        The price to beat is the Chainlink price at the market's START time,
+        which equals the closePrice of the PREVIOUS 15-minute interval.
+
+        API: https://polymarket.com/api/crypto/crypto-price
+             ?symbol={BTC|ETH|SOL|XRP}
+             &eventStartTime={timestamp_ms}
+             &variant=fifteen
+
+        Args:
+            asset: Crypto symbol (BTC, ETH, SOL, XRP)
+            market_start_timestamp: Unix timestamp (seconds) of market START
+
+        Returns:
+            Price to beat (float) or None if unavailable
+        """
+        # The previous market's timestamp (15 minutes = 900 seconds earlier)
+        previous_market_timestamp = market_start_timestamp - 900
+
+        # Convert to milliseconds for API
+        timestamp_ms = previous_market_timestamp * 1000
+
+        url = "https://polymarket.com/api/crypto/crypto-price"
+        params = {
+            "symbol": asset.upper(),
+            "eventStartTime": timestamp_ms,
+            "variant": "fifteen"
+        }
+
+        try:
+            response = self._session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            # closePrice = price at END of previous interval = START of current interval
+            # This is the "price to beat"
+            price = data.get("closePrice")
+
+            if price and isinstance(price, (int, float)) and price > 0:
+                logger.debug(f"Fetched price to beat for {asset}: ${price:,.2f}")
+                return float(price)
+
+            # Fallback to openPrice if closePrice not available
+            price = data.get("openPrice")
+            if price and isinstance(price, (int, float)) and price > 0:
+                logger.debug(f"Using openPrice for {asset}: ${price:,.2f}")
+                return float(price)
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"Failed to fetch price to beat for {asset}: {e}")
+            return None
 
     def _parse_datetime(self, dt_str: str) -> Optional[datetime]:
         """Parse datetime string in various formats. Always returns UTC timezone-aware datetime."""

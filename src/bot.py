@@ -404,9 +404,7 @@ class TradingBot:
                         self.clob_feed.subscribe(market.up_token_id)
                         self.clob_feed.subscribe(market.down_token_id)
 
-                        # Update target price from Chainlink if available
-                        self._set_target_price_from_chainlink(market)
-
+                        # Target price is now fetched from Polymarket API in gamma.py
                         logger.info(
                             f"NEW MARKET: {market.asset} | "
                             f"Target: ${market.target_price:,.2f} | "
@@ -676,88 +674,8 @@ class TradingBot:
 
     def _on_chainlink_price(self, price: ChainlinkPrice):
         """Handle Chainlink price update."""
-        # Update signal generator with new price
+        # Update signal generator with new price (used for probability calculations)
         self.signal_generator.update_price(price.symbol, price.price)
-
-        # Update target prices for markets that need it
-        # For "Up or Down" markets, the target is the Chainlink price at market start
-        self._update_market_target_prices(price)
-
-    def _set_target_price_from_chainlink(self, market: MarketState):
-        """
-        Set market target price from current Chainlink price.
-
-        Called when a new market is discovered to immediately set
-        the correct target price instead of using placeholders.
-
-        Args:
-            market: Market to update
-        """
-        # Map asset to Chainlink symbol
-        symbol_map = {
-            "BTC": "btc/usd",
-            "ETH": "eth/usd",
-            "SOL": "sol/usd",
-            "XRP": "xrp/usd",
-        }
-        symbol = symbol_map.get(market.asset)
-        if not symbol:
-            return
-
-        # Get current Chainlink price from signal generator
-        current_price = self.signal_generator.chainlink_prices.get(symbol)
-        if current_price and current_price > 0:
-            market.target_price = current_price
-
-    def _update_market_target_prices(self, price: ChainlinkPrice):
-        """
-        Update target prices for markets using Chainlink data.
-
-        For "Up or Down" 15-minute markets, the target price is the
-        Chainlink price at the market's start time. If we don't have
-        the exact start price, we use the first Chainlink price we
-        receive after the market starts.
-
-        Args:
-            price: Latest Chainlink price update
-        """
-        # Map Chainlink symbol (btc/usd) to asset (BTC)
-        symbol_map = {
-            "btc/usd": "BTC",
-            "eth/usd": "ETH",
-            "sol/usd": "SOL",
-            "xrp/usd": "XRP",
-        }
-        asset = symbol_map.get(price.symbol.lower())
-        if not asset:
-            return
-
-        now = datetime.now(timezone.utc)
-
-        # Placeholder prices used initially
-        placeholder_prices = {
-            "BTC": 100000.0,
-            "ETH": 3500.0,
-            "SOL": 200.0,
-            "XRP": 2.5,
-        }
-
-        # Update target prices for matching markets
-        for market in list(self.markets.values()):
-            if market.asset != asset:
-                continue
-
-            # Check if this market needs its target price updated
-            # Condition: market has started AND target is still the placeholder
-            if now >= market.start_time:
-                expected_placeholder = placeholder_prices.get(asset, 0)
-
-                # Check if target is exactly the placeholder value
-                if market.target_price == expected_placeholder:
-                    market.target_price = price.price
-                    logger.info(
-                        f"TARGET SET: {asset} ${price.price:,.2f} (from Chainlink)"
-                    )
 
     def _on_orderbook_update(self, token_id: str, orderbook):
         """Handle order book update."""
