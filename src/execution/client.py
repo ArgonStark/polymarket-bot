@@ -217,6 +217,87 @@ def get_trades(client: Optional[ClobClient], limit: int = 100) -> list[dict]:
         return []
 
 
+def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
+    """
+    Get active positions from recent trades in 15-min crypto markets.
+
+    Scans recent trades to find positions in markets that haven't settled yet.
+
+    Args:
+        client: Configured ClobClient
+
+    Returns:
+        Dict of asset -> position info (side, size, market_slug)
+    """
+    if client is None:
+        return {}
+
+    import time
+
+    try:
+        trades = get_trades(client, limit=50)
+        if not trades:
+            return {}
+
+        current_time = int(time.time())
+        positions = {}
+
+        # Map token patterns to assets
+        asset_patterns = {
+            "btc": "BTC",
+            "eth": "ETH",
+            "sol": "SOL",
+            "xrp": "XRP",
+        }
+
+        for trade in trades:
+            # Get market/asset info from trade
+            market_slug = trade.get("market", "").lower()
+            asset_id = trade.get("asset_id", "").lower()
+
+            # Check if this is a 15-min crypto market
+            if "updown-15m" not in market_slug and "updown-15m" not in asset_id:
+                continue
+
+            # Extract timestamp from market slug (e.g., btc-updown-15m-1706123400)
+            try:
+                parts = market_slug.split("-")
+                if len(parts) >= 4:
+                    market_ts = int(parts[-1])
+                    # Check if market is still active (settles at market_ts + 900)
+                    if current_time > market_ts + 900:
+                        continue  # Market already settled
+            except (ValueError, IndexError):
+                continue
+
+            # Identify asset
+            asset = None
+            for pattern, asset_name in asset_patterns.items():
+                if pattern in market_slug or pattern in asset_id:
+                    asset = asset_name
+                    break
+
+            if asset and asset not in positions:
+                side = trade.get("side", "BUY")
+                size = float(trade.get("size", 0))
+                price = float(trade.get("price", 0))
+
+                positions[asset] = {
+                    "side": side,
+                    "size": size,
+                    "price": price,
+                    "market": market_slug,
+                    "cost": size * price,
+                }
+                logger.debug(f"Found active position: {asset} {side} {size} @ {price}")
+
+        return positions
+
+    except Exception as e:
+        logger.error(f"Failed to get active positions: {e}")
+        return {}
+
+
 def cancel_all_orders(client: Optional[ClobClient]) -> bool:
     """
     Cancel all open orders.
