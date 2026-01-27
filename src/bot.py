@@ -323,6 +323,16 @@ class TradingBot:
                     continue
 
                 # Generate and execute signals for each active market
+                active_count = len(self.markets)
+                if active_count > 0:
+                    # Periodically log status (roughly every 10s with 0.5s interval)
+                    import random
+                    if random.random() < 0.05:
+                        prices = self.chainlink_feed.get_all_prices()
+                        if prices:
+                            price_str = ", ".join(f"{k.split('/')[0].upper()}: ${v:,.2f}" for k, v in prices.items())
+                            logger.info(f"Chainlink prices: {price_str}")
+
                 for market in list(self.markets.values()):
                     await self._process_market(market)
 

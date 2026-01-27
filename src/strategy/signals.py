@@ -145,24 +145,46 @@ class SignalGenerator:
         # Choose best side if edge exceeds minimum
         min_edge = self.config.trading.min_edge
 
+        # Log edge calculation for debugging
+        logger.debug(
+            f"EDGE CALC {market.asset}: "
+            f"Chainlink=${current_price:,.2f}, Target=${market.target_price:,.2f}, "
+            f"true_prob_up={true_prob_up:.1%}, "
+            f"market_bid={market.best_bid:.2f}, market_ask={market.best_ask:.2f}, "
+            f"edge_up={edge_up:.1%}, edge_down={edge_down:.1%}, min_edge={min_edge:.1%}"
+        )
+
         if edge_up > edge_down and edge_up >= min_edge:
             side = Side.UP
             edge = edge_up
             true_prob = true_prob_up
             market_prob = market_prob_up
             entry_price = market.best_ask
+            logger.info(
+                f"SIGNAL: {market.asset} UP | Edge={edge:.1%} | "
+                f"Chainlink=${current_price:,.2f} > Target=${market.target_price:,.2f}"
+            )
         elif edge_down >= min_edge:
             side = Side.DOWN
             edge = edge_down
             true_prob = 1 - true_prob_up
             market_prob = market_prob_down
             entry_price = 1 - market.best_bid
+            logger.info(
+                f"SIGNAL: {market.asset} DOWN | Edge={edge:.1%} | "
+                f"Chainlink=${current_price:,.2f} < Target=${market.target_price:,.2f}"
+            )
         else:
             # No sufficient edge - return skip signal
+            best_edge = max(edge_up, edge_down)
+            if best_edge > 0.01:  # Only log if edge is somewhat close
+                logger.debug(
+                    f"SKIP {market.asset}: best edge {best_edge:.1%} < min {min_edge:.1%}"
+                )
             return Signal(
                 market=market,
                 side=Side.NONE,
-                edge=max(edge_up, edge_down),
+                edge=best_edge,
                 true_prob=true_prob_up,
                 market_prob=market_prob_up,
                 recommended_action=OrderAction.SKIP,
@@ -229,32 +251,37 @@ class SignalGenerator:
         to earn rebates instead of paying fees.
 
         Decision matrix (fee-aware):
-        - edge >= 50% AND time < 30s -> MARKET (only when very urgent)
-        - edge >= 30% AND time < 60s -> LIMIT (aggressive maker)
-        - edge >= min_edge -> POST_ONLY (earn rebates, preferred)
+        - edge >= 15% AND time < 45s -> MARKET (urgent, high edge)
+        - edge >= 8% AND time < 90s -> LIMIT (good edge, moderate urgency)
+        - edge >= 3% -> POST_ONLY (earn rebates, preferred)
         - Otherwise -> SKIP
         """
         trading = self.config.trading
 
-        # Only use MARKET orders when absolutely necessary (time critical)
-        # Fees are too high otherwise
-        if edge >= trading.edge_for_market and time_remaining < 30:
+        # MARKET orders: Use only when we have high edge AND limited time
+        # This pays taker fees but guarantees execution
+        if edge >= trading.edge_for_market and time_remaining < 45:
+            logger.debug(f"Action: MARKET (edge={edge:.1%}, time={time_remaining:.0f}s)")
             return OrderAction.MARKET
 
-        # LIMIT when edge is good and time is moderate
-        # But prefer POST_ONLY when possible
-        elif edge >= trading.edge_for_limit and time_remaining < trading.time_for_market:
+        # LIMIT orders: Good edge with moderate time pressure
+        # May cross spread but still reasonable
+        elif edge >= trading.edge_for_limit and time_remaining < 90:
+            logger.debug(f"Action: LIMIT (edge={edge:.1%}, time={time_remaining:.0f}s)")
             return OrderAction.LIMIT
 
-        # POST_ONLY is the preferred action - earns rebates, avoids fees
+        # POST_ONLY: Preferred for most situations - earns maker rebates
         elif edge >= trading.edge_for_post_only:
+            logger.debug(f"Action: POST_ONLY (edge={edge:.1%})")
             return OrderAction.POST_ONLY
 
-        # Even with lower edge, try POST_ONLY if we have time
+        # Minimum edge but plenty of time - try POST_ONLY
         elif edge >= trading.min_edge and time_remaining > 60:
+            logger.debug(f"Action: POST_ONLY (min edge={edge:.1%}, time={time_remaining:.0f}s)")
             return OrderAction.POST_ONLY
 
         else:
+            logger.debug(f"Action: SKIP (edge={edge:.1%} < min={trading.min_edge:.1%})")
             return OrderAction.SKIP
 
     def _calculate_entry_price(
