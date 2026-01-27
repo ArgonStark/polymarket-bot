@@ -797,6 +797,14 @@ class TradingBot:
                 logger.debug(f"[{asset}] Cooldown: {remaining:.0f}s remaining")
                 return
 
+        # Check if we have enough balance before attempting
+        available = self.risk_manager.current_bankroll * 0.90  # 10% buffer
+        if signal.size_usd > available:
+            logger.debug(f"[{asset}] Insufficient balance: need ${signal.size_usd:.2f}, have ${available:.2f}")
+            # Set a short cooldown to prevent spam
+            self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
+            return
+
         # Get current price for logging
         current_price = self.signal_generator.get_price(signal.market.asset)
         target = signal.market.target_price
@@ -814,7 +822,7 @@ class TradingBot:
         result = self.executor.execute_signal(signal)
 
         if result.success:
-            # Set cooldown for this asset
+            # Set full cooldown for successful orders
             self._last_order_time[asset] = now
 
             # Record position with risk manager
@@ -825,6 +833,8 @@ class TradingBot:
             )
             logger.info(f"    FILLED @ {signal.recommended_price:.2f}")
         else:
+            # Set shorter cooldown (30s) on failures to prevent spam
+            self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
             logger.warning(f"    FAILED: {result.error_message}")
 
     def _on_chainlink_price(self, price: ChainlinkPrice):
