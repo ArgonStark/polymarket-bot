@@ -150,12 +150,6 @@ class RiskManager:
             f"({trading.max_position_pct:.0%} of ${self.current_bankroll:.2f})"
         )
 
-        logger.debug(
-            f"Size calc for {signal.market.asset}: bankroll=${self.current_bankroll:.2f}, "
-            f"base_from_bankroll=${base_from_bankroll:.2f}, target=${target_size:.2f}, "
-            f"max=${max_size:.2f}, available=${available:.2f}, final=${position_size:.2f}"
-        )
-
         # Ensure minimum viable trade size ($3)
         if position_size < 3.0:
             logger.debug(f"[{signal.market.asset}] Size ${position_size:.2f} below $3 min, skipping")
