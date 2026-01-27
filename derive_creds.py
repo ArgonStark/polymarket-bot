@@ -11,11 +11,11 @@ from py_clob_client.client import ClobClient
 load_dotenv()
 
 def main():
-    private_key = os.getenv("PRIVATE_KEY")
+    private_key = os.getenv("PK")
 
     if not private_key:
-        print("ERROR: PRIVATE_KEY not found in .env file")
-        print("Make sure your .env file contains: PRIVATE_KEY=0x...")
+        print("ERROR: PK not found in .env file")
+        print("Make sure your .env file contains: PK=0x...")
         return
 
     # Ensure private key has 0x prefix
