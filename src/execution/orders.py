@@ -121,12 +121,11 @@ class OrderExecutor:
             # Sign the order
             signed_order = self.client.create_order(order_args)
 
-            # Post with post_only flag
-            options = {"post_only": post_only} if post_only else {}
+            # Post with post_only flag (pass directly to API, not as options dict)
             response = self.client.post_order(
                 signed_order,
                 OrderType.GTC,
-                options=options,
+                post_only=post_only,
             )
 
             # Validate response
