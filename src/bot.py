@@ -403,6 +403,10 @@ class TradingBot:
 
                         self.clob_feed.subscribe(market.up_token_id)
                         self.clob_feed.subscribe(market.down_token_id)
+
+                        # Update target price from Chainlink if available
+                        self._set_target_price_from_chainlink(market)
+
                         logger.info(
                             f"NEW MARKET: {market.asset} | "
                             f"Target: ${market.target_price:,.2f} | "
@@ -678,6 +682,32 @@ class TradingBot:
         # Update target prices for markets that need it
         # For "Up or Down" markets, the target is the Chainlink price at market start
         self._update_market_target_prices(price)
+
+    def _set_target_price_from_chainlink(self, market: MarketState):
+        """
+        Set market target price from current Chainlink price.
+
+        Called when a new market is discovered to immediately set
+        the correct target price instead of using placeholders.
+
+        Args:
+            market: Market to update
+        """
+        # Map asset to Chainlink symbol
+        symbol_map = {
+            "BTC": "btc/usd",
+            "ETH": "eth/usd",
+            "SOL": "sol/usd",
+            "XRP": "xrp/usd",
+        }
+        symbol = symbol_map.get(market.asset)
+        if not symbol:
+            return
+
+        # Get current Chainlink price from signal generator
+        current_price = self.signal_generator.chainlink_prices.get(symbol)
+        if current_price and current_price > 0:
+            market.target_price = current_price
 
     def _update_market_target_prices(self, price: ChainlinkPrice):
         """
