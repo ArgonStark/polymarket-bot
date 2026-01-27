@@ -119,10 +119,16 @@ class GammaAPI:
             "XRP": "xrp-updown-15m-",
         }
 
-        for asset, slug_prefix in asset_slugs.items():
+        import time as time_module
+
+        for idx, (asset, slug_prefix) in enumerate(asset_slugs.items()):
             # Only fetch supported assets
             if asset not in self.config.supported_assets:
                 continue
+
+            # Small delay between assets to avoid rate limiting on price API
+            if idx > 0:
+                time_module.sleep(0.2)
 
             for ts in timestamps:
                 slug = f"{slug_prefix}{ts}"
@@ -328,23 +334,22 @@ class GammaAPI:
                 if "-updown-15m-" in slug.lower():
                     # Extract start timestamp from slug (e.g., btc-updown-15m-1769027400)
                     start_ts = self._extract_timestamp_from_slug(slug)
+                    logger.debug(f"Extracted start_ts={start_ts} from slug={slug}")
 
                     if start_ts:
                         # Fetch price to beat from Polymarket API
                         target_price = self.fetch_price_to_beat(asset, start_ts)
+                        if target_price:
+                            logger.debug(f"Got target price for {asset} from API: ${target_price:,.2f}")
 
-                    # Fallback to placeholder if API fails
+                    # If API fails, skip this market instead of using placeholder
+                    # This typically happens for future markets where price data isn't available yet
                     if not target_price or target_price <= 0:
-                        target_price = self._get_placeholder_price(asset)
-                        if target_price and target_price > 0:
-                            logger.debug(
-                                f"Using placeholder for {asset}: ${target_price:,.2f}"
-                            )
-                        else:
-                            logger.warning(
-                                f"Market missing valid target price: {condition_id}"
-                            )
-                            return None
+                        logger.debug(
+                            f"Skipping {asset} market (no price data available yet): "
+                            f"slug={slug}, start_ts={start_ts}"
+                        )
+                        return None
                 else:
                     logger.warning(
                         f"Market missing valid target price: {condition_id} "
@@ -491,6 +496,8 @@ class GammaAPI:
         Returns:
             Price to beat (float) or None if unavailable
         """
+        import time
+
         # The previous market's timestamp (15 minutes = 900 seconds earlier)
         previous_market_timestamp = market_start_timestamp - 900
 
@@ -504,30 +511,73 @@ class GammaAPI:
             "variant": "fifteen"
         }
 
-        try:
-            response = self._session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+        logger.debug(
+            f"Fetching price to beat for {asset}: "
+            f"market_start={market_start_timestamp}, prev_ts={previous_market_timestamp}, "
+            f"timestamp_ms={timestamp_ms}"
+        )
 
-            # closePrice = price at END of previous interval = START of current interval
-            # This is the "price to beat"
-            price = data.get("closePrice")
+        # Retry up to 3 times with small delays (handles rate limiting/timing issues)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self._session.get(url, params=params, timeout=10)
+                response.raise_for_status()
 
-            if price and isinstance(price, (int, float)) and price > 0:
-                logger.debug(f"Fetched price to beat for {asset}: ${price:,.2f}")
-                return float(price)
+                # Check for empty response
+                if not response.text or not response.text.strip():
+                    if attempt < max_retries - 1:
+                        logger.debug(f"Empty response for {asset}, retrying ({attempt + 1}/{max_retries})")
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    logger.warning(f"Empty response from crypto-price API for {asset}")
+                    return None
 
-            # Fallback to openPrice if closePrice not available
-            price = data.get("openPrice")
-            if price and isinstance(price, (int, float)) and price > 0:
-                logger.debug(f"Using openPrice for {asset}: ${price:,.2f}")
-                return float(price)
+                data = response.json()
 
-            return None
+                logger.debug(f"Crypto-price API response for {asset}: {data}")
 
-        except Exception as e:
-            logger.debug(f"Failed to fetch price to beat for {asset}: {e}")
-            return None
+                # closePrice = price at END of previous interval = START of current interval
+                # This is the "price to beat"
+                price = data.get("closePrice")
+
+                if price and isinstance(price, (int, float)) and price > 0:
+                    logger.info(f"Fetched price to beat for {asset}: ${price:,.2f}")
+                    return float(price)
+
+                # Fallback to openPrice if closePrice not available
+                price = data.get("openPrice")
+                if price and isinstance(price, (int, float)) and price > 0:
+                    logger.info(f"Using openPrice for {asset}: ${price:,.2f}")
+                    return float(price)
+
+                # If this interval has no data, it might be too far in past/future
+                # Don't log warning for expected "not available" cases
+                if data.get("completed") is None:
+                    logger.debug(f"No price data available for {asset} at timestamp {timestamp_ms}")
+                else:
+                    logger.warning(f"No valid price in API response for {asset}: {data}")
+                return None
+
+            except requests.RequestException as e:
+                if attempt < max_retries - 1:
+                    logger.debug(f"Request error for {asset}, retrying ({attempt + 1}/{max_retries}): {e}")
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                logger.warning(f"Failed to fetch price to beat for {asset}: {e}")
+                return None
+            except json.JSONDecodeError as e:
+                if attempt < max_retries - 1:
+                    logger.debug(f"JSON decode error for {asset}, retrying ({attempt + 1}/{max_retries})")
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                logger.warning(f"Invalid JSON response for {asset}: {e}")
+                return None
+            except Exception as e:
+                logger.warning(f"Error parsing price to beat for {asset}: {e}")
+                return None
+
+        return None
 
     def _parse_datetime(self, dt_str: str) -> Optional[datetime]:
         """Parse datetime string in various formats. Always returns UTC timezone-aware datetime."""
