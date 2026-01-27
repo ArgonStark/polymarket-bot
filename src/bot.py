@@ -704,30 +704,29 @@ class TradingBot:
 
         now = datetime.now(timezone.utc)
 
+        # Placeholder prices used initially
+        placeholder_prices = {
+            "BTC": 100000.0,
+            "ETH": 3500.0,
+            "SOL": 200.0,
+            "XRP": 2.5,
+        }
+
         # Update target prices for matching markets
         for market in list(self.markets.values()):
             if market.asset != asset:
                 continue
 
             # Check if this market needs its target price updated
-            # Condition: market has started (now >= start_time) and target is placeholder
+            # Condition: market has started AND target is still the placeholder
             if now >= market.start_time:
-                # Check if current target is a placeholder (approximate values)
-                placeholder_prices = {
-                    "BTC": 100000.0,
-                    "ETH": 3500.0,
-                    "SOL": 200.0,
-                    "XRP": 2.5,
-                }
                 expected_placeholder = placeholder_prices.get(asset, 0)
 
-                # If target is still the placeholder, update it with Chainlink price
-                if abs(market.target_price - expected_placeholder) < 1:
-                    old_target = market.target_price
+                # Check if target is exactly the placeholder value
+                if market.target_price == expected_placeholder:
                     market.target_price = price.price
                     logger.info(
-                        f"Updated {asset} target price: "
-                        f"${old_target:,.2f} -> ${price.price:,.2f} (from Chainlink)"
+                        f"TARGET SET: {asset} ${price.price:,.2f} (from Chainlink)"
                     )
 
     def _on_orderbook_update(self, token_id: str, orderbook):
