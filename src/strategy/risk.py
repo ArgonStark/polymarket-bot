@@ -103,6 +103,12 @@ class RiskManager:
         if market_key in self.positions:
             return (False, "Already have position in this market")
 
+        # Check if we already have a position in this ASSET (any market)
+        # This prevents opening positions in both current and future markets
+        for pos in self.positions.values():
+            if pos.market.asset == signal.market.asset:
+                return (False, f"Already have {signal.market.asset} position")
+
         # Check position count limit
         trading = self.config.trading
         if len(self.positions) >= trading.max_concurrent_positions:
@@ -126,30 +132,23 @@ class RiskManager:
         """
         Adjust signal size to fit within risk limits.
 
-        Uses compounding: position size scales with current bankroll.
-        As you win, positions get bigger. As you lose, they get smaller.
-
-        Args:
-            signal: Signal to adjust
-
-        Returns:
-            Adjusted signal (may have reduced size)
+        Uses ONLY bankroll percentage - no fixed base size.
+        Position size = bankroll × max_position_pct
         """
         trading = self.config.trading
 
-        # Compounding: use percentage of CURRENT bankroll, not fixed size
-        # This means positions grow as you win and shrink as you lose
-        base_from_bankroll = self.current_bankroll * trading.max_position_pct
+        # Simple: position size is percentage of current bankroll
+        # Keep 10% buffer for fees
+        available = self.current_bankroll * 0.90
+        position_size = min(
+            self.current_bankroll * trading.max_position_pct,
+            available
+        )
 
-        # Also respect the configured base position size as a minimum guide
-        target_size = max(base_from_bankroll, trading.base_position_size)
-
-        # Cap at max allowed per position
-        max_size = self.current_bankroll * trading.max_position_pct
-        available = self.current_bankroll * 0.90  # Keep 10% buffer for fees
-
-        # Final position size
-        position_size = min(target_size, max_size, available)
+        logger.info(
+            f"[{signal.market.asset}] Size: ${position_size:.2f} "
+            f"({trading.max_position_pct:.0%} of ${self.current_bankroll:.2f})"
+        )
 
         logger.debug(
             f"Size calc for {signal.market.asset}: bankroll=${self.current_bankroll:.2f}, "

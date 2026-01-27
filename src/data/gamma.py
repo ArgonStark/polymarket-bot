@@ -163,9 +163,13 @@ class GammaAPI:
 
                 # Only include if not already in list and has time remaining
                 time_remaining = (market_state.end_time - now).total_seconds()
-                logger.debug(f"Market {slug}: time_remaining={time_remaining:.0f}s")
+                time_since_start = (now - market_state.start_time).total_seconds()
 
-                if time_remaining > 0:
+                logger.debug(f"Market {slug}: time_remaining={time_remaining:.0f}s, started={time_since_start:.0f}s ago")
+
+                # IMPORTANT: Only trade markets that have STARTED (not future markets)
+                # AND still have time remaining (not expired)
+                if time_remaining > 0 and time_since_start >= 0:
                     # Avoid duplicates
                     if not any(m.condition_id == market_state.condition_id for m in filtered):
                         filtered.append(market_state)
