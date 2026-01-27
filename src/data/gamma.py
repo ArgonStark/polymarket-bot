@@ -168,7 +168,9 @@ class GammaAPI:
         # Sort by end time (soonest first)
         filtered.sort(key=lambda m: m.end_time)
 
-        logger.info(f"Found {len(filtered)} active 15-minute crypto markets")
+        # Only log if we found markets (avoid spam when no markets)
+        if filtered:
+            logger.debug(f"Found {len(filtered)} active 15-minute crypto markets")
         return filtered
 
     def _fetch_market_by_slug(self, slug: str) -> Optional[dict]:
