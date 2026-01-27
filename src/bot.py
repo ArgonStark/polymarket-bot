@@ -111,6 +111,11 @@ class TradingBot:
         self._running = False
         self._shutdown_event = asyncio.Event()
 
+        # Warm-up / observation tracking
+        self._startup_time: Optional[datetime] = None  # When bot started
+        self._market_first_seen: dict[str, datetime] = {}  # market_id -> first observation time
+        self._warmup_complete = False  # True after warm-up period ends
+
     async def initialize(self) -> bool:
         """
         Initialize bot components.
@@ -425,11 +430,47 @@ class TradingBot:
         """Main trading loop - handles market discovery and signal execution."""
         logger.info("Starting trading loop...")
 
+        # Record startup time for warm-up period
+        self._startup_time = datetime.now(timezone.utc)
+        warmup_seconds = self.config.trading.warmup_period_seconds
+
+        logger.info(
+            f"👀 OBSERVATION MODE: Watching prices for {warmup_seconds}s before trading..."
+        )
+
         # Wait for data feeds to connect
         await asyncio.sleep(2.0)
 
         while self._running:
             try:
+                # Check warm-up period
+                if not self._warmup_complete:
+                    elapsed = (datetime.now(timezone.utc) - self._startup_time).total_seconds()
+                    if elapsed < warmup_seconds:
+                        remaining = warmup_seconds - elapsed
+                        # Log progress every 10 seconds
+                        if int(elapsed) % 10 == 0 and int(elapsed) > 0:
+                            prices = self.chainlink_feed.get_all_prices()
+                            price_count = len(prices)
+                            logger.info(
+                                f"👀 OBSERVING: {remaining:.0f}s remaining | "
+                                f"Prices tracked: {price_count} | "
+                                f"Markets found: {len(self.markets)}"
+                            )
+                        # Still discover markets and collect data, but don't trade
+                        await self._refresh_markets()
+                        await self._sync_balance()
+                        await asyncio.sleep(self.config.loop_interval)
+                        continue
+                    else:
+                        # Warm-up complete!
+                        self._warmup_complete = True
+                        prices = self.chainlink_feed.get_all_prices()
+                        logger.info(
+                            f"✅ WARM-UP COMPLETE: Now trading! | "
+                            f"Prices: {len(prices)} | Markets: {len(self.markets)}"
+                        )
+
                 # Check if data feeds are healthy (circuit breakers)
                 if self.chainlink_feed._circuit_open and self.clob_feed._circuit_open:
                     logger.critical(
@@ -811,6 +852,35 @@ class TradingBot:
         """
         # Skip if market is about to expire (should be in expiring_markets)
         if market.time_remaining < self.config.trading.min_time_remaining:
+            return
+
+        # Track when we first saw this market
+        market_id = market.condition_id
+        now = datetime.now(timezone.utc)
+        if market_id not in self._market_first_seen:
+            self._market_first_seen[market_id] = now
+            logger.debug(f"[{market.asset}] First observation - collecting data...")
+
+        # Check minimum observation time for this market
+        observation_time = (now - self._market_first_seen[market_id]).total_seconds()
+        min_observation = self.config.trading.min_observation_time
+        if observation_time < min_observation:
+            logger.debug(
+                f"[{market.asset}] Observing: {observation_time:.0f}s / {min_observation:.0f}s"
+            )
+            # Still update orderbook data, just don't trade yet
+            self._update_market_from_orderbook(market)
+            return
+
+        # Check minimum price samples for this asset
+        asset_symbol = f"{market.asset.lower()}/usd"
+        price_history = self.signal_generator.price_histories.get(asset_symbol, [])
+        min_samples = self.config.trading.min_price_samples
+        if len(price_history) < min_samples:
+            logger.debug(
+                f"[{market.asset}] Need more price data: {len(price_history)}/{min_samples} samples"
+            )
+            self._update_market_from_orderbook(market)
             return
 
         # Update market state from order book
