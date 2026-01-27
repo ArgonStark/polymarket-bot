@@ -138,11 +138,9 @@ class OrderExecutor:
             # Validate response
             is_valid, error_msg = _validate_order_response(response)
             if not is_valid:
-                logger.error(f"Maker order rejected: {error_msg}")
                 return TradeResult(success=False, error_message=error_msg)
 
             order_id = response.get("orderID") or response.get("order_id", "")
-            logger.info(f"ORDER PLACED (maker) | ID: {order_id[:12]}...")
 
             return TradeResult(
                 success=True,
@@ -209,12 +207,9 @@ class OrderExecutor:
             # Validate response
             is_valid, error_msg = _validate_order_response(response)
             if not is_valid:
-                logger.error(f"Limit order rejected: {error_msg}")
                 return TradeResult(success=False, error_message=error_msg)
 
             order_id = response.get("orderID") or response.get("order_id", "")
-            logger.info(f"ORDER PLACED (limit) | ID: {order_id[:12]}...")
-
             return TradeResult(
                 success=True,
                 order_id=order_id,
@@ -352,14 +347,7 @@ class OrderExecutor:
 
         # Check that client exists for live trading
         if not self.config.dry_run and self.client is None:
-            logger.error("Cannot execute trade: client not initialized")
             return TradeResult(success=False, error_message="Client not initialized")
-
-        order_type = signal.recommended_action.value
-        logger.info(
-            f"[{signal.market.asset}] {order_type} BUY {signal.side.value} | "
-            f"{signal.size_shares:.1f} shares @ {signal.recommended_price:.2f} (${signal.size_usd:.2f})"
-        )
 
         if signal.recommended_action == OrderAction.POST_ONLY:
             return self.place_maker_order(
