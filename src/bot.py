@@ -628,6 +628,11 @@ class TradingBot:
         # Adjust size if needed
         signal = self.risk_manager.adjust_signal_size(signal)
 
+        # Check if signal was rejected due to size
+        if signal.size_usd <= 0 or signal.size_shares <= 0:
+            logger.debug(f"Signal for {market.asset} rejected: size too small")
+            return
+
         # Execute the signal
         await self._execute_signal(signal)
 

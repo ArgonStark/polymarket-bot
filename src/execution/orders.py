@@ -336,6 +336,14 @@ class OrderExecutor:
             logger.debug(f"SKIP: {signal.reasoning}")
             return TradeResult(success=False, error_message="Signal skipped")
 
+        # Check for valid size
+        if signal.size_shares <= 0 or signal.size_usd <= 0:
+            logger.warning(
+                f"Invalid signal size for {signal.market.asset}: "
+                f"size_usd=${signal.size_usd:.2f}, size_shares={signal.size_shares:.2f}"
+            )
+            return TradeResult(success=False, error_message="Invalid signal size")
+
         # Determine token to trade
         if signal.side.value == "UP":
             token_id = signal.market.up_token_id
@@ -344,10 +352,19 @@ class OrderExecutor:
 
         logger.info(
             f"Executing {signal.recommended_action.value} signal: "
-            f"{signal.side.value} {signal.market.asset} - {signal.reasoning}"
+            f"{signal.side.value} {signal.market.asset} | "
+            f"Price: {signal.recommended_price:.4f} | "
+            f"Size: {signal.size_shares:.2f} shares (${signal.size_usd:.2f}) | "
+            f"Token: {token_id[:16]}..."
         )
 
+        # Check that client exists for live trading
+        if not self.config.dry_run and self.client is None:
+            logger.error("Cannot execute trade: client not initialized")
+            return TradeResult(success=False, error_message="Client not initialized")
+
         if signal.recommended_action == OrderAction.POST_ONLY:
+            logger.info(f"Placing POST_ONLY order: BUY {signal.size_shares:.2f} @ {signal.recommended_price:.4f}")
             return self.place_maker_order(
                 token_id=token_id,
                 side="BUY",
@@ -357,6 +374,7 @@ class OrderExecutor:
             )
 
         elif signal.recommended_action == OrderAction.LIMIT:
+            logger.info(f"Placing LIMIT order: BUY {signal.size_shares:.2f} @ {signal.recommended_price:.4f}")
             return self.place_limit_order(
                 token_id=token_id,
                 side="BUY",
@@ -365,6 +383,7 @@ class OrderExecutor:
             )
 
         elif signal.recommended_action == OrderAction.MARKET:
+            logger.info(f"Placing MARKET order: BUY ${signal.size_usd:.2f}")
             return self.place_market_order(
                 token_id=token_id,
                 side="BUY",
