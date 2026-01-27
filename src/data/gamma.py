@@ -101,12 +101,11 @@ class GammaAPI:
         # Round down to nearest 15 minutes (900 seconds)
         base_ts = (current_ts // 900) * 900
 
-        # Generate timestamps for current and next few periods
-        # Check current, previous (may still be active), and next period
+        # Only check current and previous period - NOT future periods
+        # Previous period may still be active in its final minutes
         timestamps = [
-            base_ts - 900,   # Previous period (may still be in final minutes)
+            base_ts - 900,   # Previous period (may still be active)
             base_ts,         # Current period
-            base_ts + 900,   # Next period (for upcoming)
         ]
 
         logger.debug(f"Checking market timestamps: {timestamps} (base: {base_ts})")
@@ -165,15 +164,21 @@ class GammaAPI:
                 time_remaining = (market_state.end_time - now).total_seconds()
                 time_since_start = (now - market_state.start_time).total_seconds()
 
-                logger.debug(f"Market {slug}: time_remaining={time_remaining:.0f}s, started={time_since_start:.0f}s ago")
+                # Only trade markets that have STARTED and have time remaining
+                if time_since_start < 0:
+                    logger.debug(f"SKIP {slug}: hasn't started yet (starts in {-time_since_start:.0f}s)")
+                    continue
 
-                # IMPORTANT: Only trade markets that have STARTED (not future markets)
-                # AND still have time remaining (not expired)
-                if time_remaining > 0 and time_since_start >= 0:
-                    # Avoid duplicates
-                    if not any(m.condition_id == market_state.condition_id for m in filtered):
-                        filtered.append(market_state)
-                        logger.debug(f"Added market: {asset} ending at {market_state.end_time}")
+                if time_remaining <= 0:
+                    logger.debug(f"SKIP {slug}: already expired")
+                    continue
+
+                # Avoid duplicates
+                if any(m.condition_id == market_state.condition_id for m in filtered):
+                    continue
+
+                filtered.append(market_state)
+                logger.info(f"[{asset}] Market active | {time_remaining:.0f}s remaining | Target: ${market_state.target_price:,.0f}")
 
         # Sort by end time (soonest first)
         filtered.sort(key=lambda m: m.end_time)
