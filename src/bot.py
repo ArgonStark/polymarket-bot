@@ -86,6 +86,9 @@ class TradingBot:
         self._last_order_time: dict[str, datetime] = {}  # asset -> last order time
         self._order_cooldown_seconds = 120  # 2 minutes cooldown per asset
 
+        # Cached API positions (updated by _sync_existing_orders)
+        self._api_positions: dict[str, dict] = {}  # asset -> position info
+
         # Timing trackers
         self.last_market_refresh = None
         self.last_settlement_check = None
@@ -162,7 +165,14 @@ class TradingBot:
         return True
 
     async def _sync_existing_orders(self, force: bool = False):
-        """Sync existing orders and positions from Polymarket."""
+        """
+        Sync existing orders and positions from Polymarket.
+
+        This is critical to:
+        1. Prevent duplicate orders when bot restarts
+        2. Track real positions from the exchange
+        3. Accurately reflect bankroll
+        """
         now = datetime.now(timezone.utc)
 
         # Check if sync is needed (unless forced)
@@ -179,10 +189,11 @@ class TradingBot:
 
             self.last_orders_sync = now
             synced_assets = set()
-
-            # 1. Sync open orders (unfilled)
-            open_orders = get_open_orders(self.client)
             token_to_asset = {"btc": "BTC", "eth": "ETH", "sol": "SOL", "xrp": "XRP"}
+
+            # 1. Sync open orders (unfilled limit orders)
+            open_orders = get_open_orders(self.client)
+            open_order_count = len(open_orders)
 
             for order in open_orders:
                 asset_id = order.get("asset_id", "").lower()
@@ -194,20 +205,41 @@ class TradingBot:
                         self._last_order_time[asset] = now
                         break
 
-            # 2. Sync active positions (filled trades in active markets)
+            # 2. Sync active positions (filled trades in active 15-min markets)
             positions = get_active_positions(self.client)
+            position_count = len(positions)
+
+            # Cache positions for duplicate checking
+            self._update_cached_positions(positions)
+
             for asset, pos_info in positions.items():
                 synced_assets.add(asset)
+                # Set cooldown so we don't try to trade this asset again
                 self._last_order_time[asset] = now
-                # Update bankroll to reflect held positions
-                if asset not in [p.market.asset for p in self.risk_manager.positions.values()]:
-                    cost = pos_info.get("cost", 0)
-                    if cost > 0:
-                        self.risk_manager.current_bankroll -= cost
-                        logger.info(f"Found position: {asset} ${cost:.2f}")
 
-            if synced_assets:
-                logger.info(f"Active: {', '.join(synced_assets)} | Bankroll: ${self.risk_manager.current_bankroll:.2f}")
+                # Track this as an external position
+                cost = pos_info.get("cost", 0)
+                size = pos_info.get("size", 0)
+                market_slug = pos_info.get("market", "unknown")
+
+                # Check if we already know about this position
+                known_positions = [p.market.asset for p in self.risk_manager.positions.values()]
+                if asset not in known_positions and cost > 0:
+                    logger.info(
+                        f"📊 POSITION FOUND: {asset} | "
+                        f"{size:.2f} shares @ ${pos_info.get('price', 0):.2f} | "
+                        f"Cost: ${cost:.2f} | Market: {market_slug}"
+                    )
+
+            # 3. Log summary
+            if force or synced_assets:
+                bankroll = self.risk_manager.current_bankroll
+                logger.info(
+                    f"📋 SYNC: {open_order_count} open orders | "
+                    f"{position_count} positions | "
+                    f"Assets: {', '.join(synced_assets) if synced_assets else 'none'} | "
+                    f"Bankroll: ${bankroll:.2f}"
+                )
 
         except Exception as e:
             logger.warning(f"Could not sync orders/positions: {e}")
@@ -896,6 +928,35 @@ class TradingBot:
 
         logger.info(" │ ".join(status_parts))
 
+    def _has_active_position(self, asset: str) -> bool:
+        """
+        Check if we already have an active position for this asset.
+
+        Checks:
+        1. Internal position tracking (risk_manager.positions)
+        2. Cached API positions (updated by _sync_existing_orders)
+
+        Args:
+            asset: Asset symbol (BTC, ETH, SOL, XRP)
+
+        Returns:
+            True if position exists, False otherwise
+        """
+        # Check internal tracking
+        for pos in self.risk_manager.positions.values():
+            if pos.market.asset == asset:
+                return True
+
+        # Check cached API positions (stored during sync)
+        if hasattr(self, '_api_positions') and asset in self._api_positions:
+            return True
+
+        return False
+
+    def _update_cached_positions(self, positions: dict):
+        """Update cached API positions."""
+        self._api_positions = positions
+
     async def _execute_signal(self, signal: Signal):
         """Execute a trading signal."""
         asset = signal.market.asset
@@ -909,6 +970,11 @@ class TradingBot:
                 logger.debug(f"[{asset}] Cooldown: {remaining:.0f}s remaining")
                 return
 
+        # Check for existing positions from API (prevents duplicate trades)
+        if self._has_active_position(asset):
+            logger.debug(f"[{asset}] Already has active position - skipping")
+            return
+
         # Check if we have enough balance before attempting
         available = self.risk_manager.current_bankroll * 0.90  # 10% buffer
         if signal.size_usd > available:
@@ -920,6 +986,14 @@ class TradingBot:
         # Get current price for logging
         current_price = self.signal_generator.get_price(signal.market.asset)
         target = signal.market.target_price
+
+        # Log positions BEFORE trade
+        api_pos_count = len(self._api_positions) if hasattr(self, '_api_positions') else 0
+        risk_pos_count = len(self.risk_manager.positions)
+        logger.info(
+            f"📋 PRE-TRADE CHECK [{asset}]: API positions={api_pos_count} | "
+            f"Tracked positions={risk_pos_count} | Bankroll=${self.risk_manager.current_bankroll:.2f}"
+        )
 
         # Log the trade attempt with colors
         direction = "▲" if signal.side == Side.UP else "▼"
@@ -954,6 +1028,12 @@ class TradingBot:
             )
             conf_str = f" (ML: {ml_confidence:.0%})" if ml_confidence else ""
             logger.info(f"    {Colors.BRIGHT_GREEN}✓ FILLED @ {signal.recommended_price:.2f}{conf_str}{Colors.RESET}")
+
+            # Log positions AFTER trade
+            logger.info(
+                f"📋 POST-TRADE [{asset}]: Tracked positions={len(self.risk_manager.positions)} | "
+                f"Bankroll=${self.risk_manager.current_bankroll:.2f}"
+            )
         else:
             # Set shorter cooldown (30s) on failures to prevent spam
             self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
