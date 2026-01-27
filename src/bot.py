@@ -425,10 +425,37 @@ class TradingBot:
                         del self._last_order_time[asset]
 
                 elif order_info.status.value == "OPEN":
-                    # Still open - check if we should cancel (market expiring soon)
-                    if signal and signal.market.time_remaining < 30:
+                    # Still open - check if we should cancel
+                    should_cancel = False
+                    cancel_reason = ""
+
+                    if signal:
+                        market_id = signal.market.condition_id
+
+                        # Cancel if market is expiring soon
+                        if signal.market.time_remaining < 30:
+                            should_cancel = True
+                            cancel_reason = "market expiring"
+
+                        # Cancel if market is in expiring/settled queue (already expired)
+                        elif market_id in self.expiring_markets or market_id in self.settled_markets:
+                            should_cancel = True
+                            cancel_reason = "market already expired"
+
+                        # Cancel if market is no longer in active markets (period transitioned)
+                        elif market_id not in self.markets:
+                            should_cancel = True
+                            cancel_reason = "market no longer active"
+
+                    # Also cancel if order is too old (over 2 minutes)
+                    placed_time = order_data.get("placed_time")
+                    if placed_time and (now - placed_time).total_seconds() > 120:
+                        should_cancel = True
+                        cancel_reason = "order timeout (2min)"
+
+                    if should_cancel:
                         logger.warning(
-                            f"⚠️ Cancelling unfilled order for {asset} - market expiring"
+                            f"⚠️ Cancelling unfilled order for {asset} - {cancel_reason}"
                         )
                         self.executor.cancel_order(order_id)
                         orders_to_remove.append(order_id)
@@ -860,6 +887,7 @@ class TradingBot:
 
         Markets are moved when time_remaining < min_time_remaining,
         which prevents new trades but keeps them for settlement tracking.
+        Also cancels any pending orders for expiring markets.
         """
         min_time = self.config.trading.min_time_remaining
 
@@ -874,11 +902,54 @@ class TradingBot:
             for market_id in markets_to_expire:
                 market = self.markets.pop(market_id)
                 self.expiring_markets[market_id] = market
+
+                # Cancel any pending orders for this market's asset
+                asset = market.asset
+                await self._cancel_pending_orders_for_asset(asset)
+
+                # Clear cooldown so new market can trade
+                if asset in self._last_order_time:
+                    del self._last_order_time[asset]
+                    logger.debug(f"Cleared cooldown for {asset} (market expiring)")
+
+                # Clear from cached API positions
+                if hasattr(self, '_api_positions') and asset in self._api_positions:
+                    del self._api_positions[asset]
+
                 logger.info(
                     f"EXPIRING: {market.asset} | "
                     f"Time remaining: {market.time_remaining:.0f}s | "
                     f"Target: ${market.target_price:,.2f}"
                 )
+
+    async def _cancel_pending_orders_for_asset(self, asset: str):
+        """
+        Cancel all pending orders for a specific asset.
+
+        Called when a market expires to ensure we can trade
+        the new market for that asset.
+
+        Args:
+            asset: Asset symbol (BTC, ETH, SOL, XRP)
+        """
+        if not self._pending_orders:
+            return
+
+        orders_to_cancel = []
+        for order_id, order_data in self._pending_orders.items():
+            if order_data.get("asset") == asset:
+                orders_to_cancel.append(order_id)
+
+        for order_id in orders_to_cancel:
+            try:
+                if self.executor:
+                    logger.info(f"Cancelling pending order for {asset} (market expiring)")
+                    self.executor.cancel_order(order_id)
+            except Exception as e:
+                logger.warning(f"Failed to cancel order {order_id[:16]}...: {e}")
+            finally:
+                # Remove from pending regardless of cancel success
+                self._pending_orders.pop(order_id, None)
 
     async def _check_settlements(self):
         """
