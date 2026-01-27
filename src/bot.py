@@ -12,7 +12,13 @@ from typing import Optional
 
 from .config import BotConfig
 from .models import MarketState, ChainlinkPrice, Signal, OrderAction, Side
-from .data import ChainlinkFeed, CLOBFeed, GammaAPI
+from .data import (
+    ChainlinkFeed,
+    CLOBFeed,
+    GammaAPI,
+    fetch_all_historical_prices,
+    prepopulate_price_histories,
+)
 from .execution import create_trading_client, OrderExecutor
 from .execution.client import get_account_balance
 from .strategy import SignalGenerator, RiskManager
@@ -166,6 +172,10 @@ class TradingBot:
         # Sync existing orders to prevent duplicates
         await self._sync_existing_orders(force=True)
 
+        # Fetch historical price data to pre-populate price histories
+        # This allows the bot to make better decisions immediately
+        await self._fetch_historical_prices()
+
         logger.info("Trading bot initialized successfully")
         return True
 
@@ -248,6 +258,44 @@ class TradingBot:
 
         except Exception as e:
             logger.warning(f"Could not sync orders/positions: {e}")
+
+    async def _fetch_historical_prices(self):
+        """
+        Fetch historical price data at startup to pre-populate price histories.
+
+        This allows the bot to:
+        1. Have immediate context about recent price movements
+        2. Calculate volatility estimates without waiting
+        3. Make better trading decisions from the start
+        """
+        try:
+            # Fetch last 1 hour of price data for all supported assets
+            historical_data = await fetch_all_historical_prices(
+                assets=self.config.supported_assets,
+                hours=1,
+            )
+
+            # Pre-populate the signal generator's price histories
+            prepopulate_price_histories(
+                signal_generator=self.signal_generator,
+                historical_data=historical_data,
+            )
+
+            # Log summary
+            total_samples = sum(len(p) for p in historical_data.values())
+            if total_samples > 0:
+                logger.info(
+                    f"📊 Historical data loaded: {total_samples} price points | "
+                    f"Assets: {', '.join(self.config.supported_assets)}"
+                )
+            else:
+                logger.warning(
+                    "Could not fetch historical prices - will collect during observation"
+                )
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch historical prices: {e}")
+            # Non-fatal - bot will collect data during observation period
 
     async def _sync_balance(self):
         """Periodically sync bankroll with actual Polymarket balance."""
