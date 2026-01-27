@@ -103,7 +103,7 @@ class CLOBFeed:
         }
         try:
             ws.send(json.dumps(subscribe_msg))
-            logger.info(f"Subscribed to token: {token_id[:16]}...")
+            logger.debug(f"Subscribed to token: {token_id[:16]}...")
         except Exception as e:
             logger.error(f"Failed to subscribe to {token_id[:16]}: {e}")
 
