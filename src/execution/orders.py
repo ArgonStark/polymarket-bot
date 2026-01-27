@@ -36,12 +36,20 @@ def _validate_order_response(response: dict) -> tuple[bool, str]:
     if not isinstance(response, dict):
         return False, f"Invalid response type: {type(response)}"
 
-    # Check for error indicators
+    # Check for error indicators (handle empty strings and nested dicts)
     if "error" in response:
-        return False, f"API error: {response['error']}"
+        error = response["error"]
+        if isinstance(error, dict):
+            error_msg = error.get("message") or error.get("error") or str(error)
+        else:
+            error_msg = str(error) if error else "Unknown error"
+        return False, f"API error: {error_msg}"
 
     if "errorMsg" in response:
-        return False, f"API error: {response['errorMsg']}"
+        error_msg = response["errorMsg"]
+        if not error_msg:
+            error_msg = "Unknown error"
+        return False, f"API error: {error_msg}"
 
     if response.get("status") == "error":
         return False, f"Order rejected: {response.get('message', 'Unknown error')}"
@@ -49,7 +57,9 @@ def _validate_order_response(response: dict) -> tuple[bool, str]:
     # Check for required fields
     order_id = response.get("orderID") or response.get("order_id")
     if not order_id:
-        return False, "Response missing order ID"
+        # Log the full response to help debug
+        logger.debug(f"Order response missing ID: {response}")
+        return False, f"Response missing order ID (response: {response})"
 
     return True, ""
 

@@ -304,11 +304,26 @@ class SignalGenerator:
                 return max(0.01, (1 - market.best_bid) + 0.02)
 
         elif action == OrderAction.POST_ONLY:
-            # Price at or better than current bid to sit on book
+            # POST_ONLY orders MUST NOT cross the book (price < best_ask for buys)
+            # Use conservative pricing: at or slightly below best_bid to ensure we're a maker
             if side == Side.UP:
-                return min(0.99, market.best_bid + 0.01)
+                # For UP token: stay at or below best_bid, never cross best_ask
+                # Use best_bid directly (don't add 0.01 which could cross a tight spread)
+                price = market.best_bid
+                # Ensure we're strictly below best_ask
+                if price >= market.best_ask:
+                    price = market.best_ask - 0.01
+                return max(0.01, min(0.99, price))
             else:
-                return max(0.01, (1 - market.best_ask) + 0.01)
+                # For DOWN token: price derived from UP token orderbook
+                # DOWN best_bid ≈ (1 - UP best_ask), DOWN best_ask ≈ (1 - UP best_bid)
+                down_best_bid = 1 - market.best_ask
+                down_best_ask = 1 - market.best_bid
+                price = down_best_bid
+                # Ensure we're strictly below DOWN's best_ask
+                if price >= down_best_ask:
+                    price = down_best_ask - 0.01
+                return max(0.01, min(0.99, price))
 
         return market.best_ask if side == Side.UP else (1 - market.best_bid)
 
