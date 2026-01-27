@@ -211,6 +211,12 @@ class RiskManager:
         ml_volatility: Optional[float] = None,
         ml_momentum: Optional[float] = None,
         ml_confidence: Optional[float] = None,
+        ml_arb_type: Optional[str] = None,
+        ml_spread: Optional[float] = None,
+        ml_bid_depth: Optional[float] = None,
+        ml_ask_depth: Optional[float] = None,
+        ml_price_trend: Optional[float] = None,
+        ml_distance_from_target: Optional[float] = None,
     ):
         """
         Record a new position being opened.
@@ -222,6 +228,12 @@ class RiskManager:
             ml_volatility: ML feature - asset volatility at entry
             ml_momentum: ML feature - price momentum at entry
             ml_confidence: ML predicted win probability
+            ml_arb_type: ML feature - arbitrage type (none, binary_arb, etc.)
+            ml_spread: ML feature - market spread at entry
+            ml_bid_depth: ML feature - bid depth at entry
+            ml_ask_depth: ML feature - ask depth at entry
+            ml_price_trend: ML feature - price trend at entry
+            ml_distance_from_target: ML feature - distance from target at entry
         """
         market_key = signal.market.condition_id
 
@@ -239,6 +251,12 @@ class RiskManager:
             ml_volatility=ml_volatility,
             ml_momentum=ml_momentum,
             ml_confidence=ml_confidence,
+            ml_arb_type=ml_arb_type,
+            ml_spread=ml_spread,
+            ml_bid_depth=ml_bid_depth,
+            ml_ask_depth=ml_ask_depth,
+            ml_price_trend=ml_price_trend,
+            ml_distance_from_target=ml_distance_from_target,
         )
 
         self.positions[market_key] = position
@@ -248,9 +266,10 @@ class RiskManager:
         self.current_bankroll -= cost
 
         confidence_str = f" | ML: {ml_confidence:.0%}" if ml_confidence else ""
+        arb_str = f" | ARB: {ml_arb_type}" if ml_arb_type and ml_arb_type != "none" else ""
         logger.info(
             f"Position opened: {signal.side.value} {signal.market.asset} "
-            f"{shares:.2f} shares @ {entry_price:.4f} (${cost:.2f}){confidence_str}"
+            f"{shares:.2f} shares @ {entry_price:.4f} (${cost:.2f}){confidence_str}{arb_str}"
         )
 
     def record_position_close(

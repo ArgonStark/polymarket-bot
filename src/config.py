@@ -158,6 +158,23 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("ARB_MIN_SPREAD", "0.025"))
     )
 
+    # === Observation/Warm-up Settings ===
+
+    # Warm-up period at startup - observe before trading (seconds)
+    warmup_period_seconds: int = field(
+        default_factory=lambda: int(os.getenv("WARMUP_PERIOD", "60"))
+    )
+
+    # Minimum price samples needed before trading an asset
+    min_price_samples: int = field(
+        default_factory=lambda: int(os.getenv("MIN_PRICE_SAMPLES", "10"))
+    )
+
+    # Minimum observation time per market before trading (seconds)
+    min_observation_time: float = field(
+        default_factory=lambda: float(os.getenv("MIN_OBSERVATION_TIME", "30"))
+    )
+
     # Edge thresholds for different order types (configurable via env)
     # These are realistic thresholds for actual trading
     edge_for_post_only: float = field(

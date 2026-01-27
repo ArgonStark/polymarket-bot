@@ -204,6 +204,12 @@ class Position:
     ml_volatility: Optional[float] = None
     ml_momentum: Optional[float] = None
     ml_confidence: Optional[float] = None
+    ml_arb_type: Optional[str] = None
+    ml_spread: Optional[float] = None
+    ml_bid_depth: Optional[float] = None
+    ml_ask_depth: Optional[float] = None
+    ml_price_trend: Optional[float] = None
+    ml_distance_from_target: Optional[float] = None
 
     @property
     def cost_basis(self) -> float:

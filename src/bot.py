@@ -12,11 +12,22 @@ from typing import Optional
 
 from .config import BotConfig
 from .models import MarketState, ChainlinkPrice, Signal, OrderAction, Side
-from .data import ChainlinkFeed, CLOBFeed, GammaAPI
+from .data import (
+    ChainlinkFeed,
+    CLOBFeed,
+    GammaAPI,
+    fetch_all_historical_prices,
+    prepopulate_price_histories,
+)
 from .execution import create_trading_client, OrderExecutor
 from .execution.client import get_account_balance
 from .strategy import SignalGenerator, RiskManager
-from .strategy.ml_predictor import get_ml_predictor, MLSignalPredictor
+from .strategy.ml_predictor import (
+    get_ml_predictor,
+    MLSignalPredictor,
+    extract_ml_features_from_market,
+    calculate_price_trend,
+)
 from .utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
 
 
@@ -111,6 +122,11 @@ class TradingBot:
         self._running = False
         self._shutdown_event = asyncio.Event()
 
+        # Warm-up / observation tracking
+        self._startup_time: Optional[datetime] = None  # When bot started
+        self._market_first_seen: dict[str, datetime] = {}  # market_id -> first observation time
+        self._warmup_complete = False  # True after warm-up period ends
+
     async def initialize(self) -> bool:
         """
         Initialize bot components.
@@ -160,6 +176,10 @@ class TradingBot:
 
         # Sync existing orders to prevent duplicates
         await self._sync_existing_orders(force=True)
+
+        # Fetch historical price data to pre-populate price histories
+        # This allows the bot to make better decisions immediately
+        await self._fetch_historical_prices()
 
         logger.info("Trading bot initialized successfully")
         return True
@@ -243,6 +263,44 @@ class TradingBot:
 
         except Exception as e:
             logger.warning(f"Could not sync orders/positions: {e}")
+
+    async def _fetch_historical_prices(self):
+        """
+        Fetch historical price data at startup to pre-populate price histories.
+
+        This allows the bot to:
+        1. Have immediate context about recent price movements
+        2. Calculate volatility estimates without waiting
+        3. Make better trading decisions from the start
+        """
+        try:
+            # Fetch last 1 hour of price data for all supported assets
+            historical_data = await fetch_all_historical_prices(
+                assets=self.config.supported_assets,
+                hours=1,
+            )
+
+            # Pre-populate the signal generator's price histories
+            prepopulate_price_histories(
+                signal_generator=self.signal_generator,
+                historical_data=historical_data,
+            )
+
+            # Log summary
+            total_samples = sum(len(p) for p in historical_data.values())
+            if total_samples > 0:
+                logger.info(
+                    f"📊 Historical data loaded: {total_samples} price points | "
+                    f"Assets: {', '.join(self.config.supported_assets)}"
+                )
+            else:
+                logger.warning(
+                    "Could not fetch historical prices - will collect during observation"
+                )
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch historical prices: {e}")
+            # Non-fatal - bot will collect data during observation period
 
     async def _sync_balance(self):
         """Periodically sync bankroll with actual Polymarket balance."""
@@ -425,11 +483,47 @@ class TradingBot:
         """Main trading loop - handles market discovery and signal execution."""
         logger.info("Starting trading loop...")
 
+        # Record startup time for warm-up period
+        self._startup_time = datetime.now(timezone.utc)
+        warmup_seconds = self.config.trading.warmup_period_seconds
+
+        logger.info(
+            f"👀 OBSERVATION MODE: Watching prices for {warmup_seconds}s before trading..."
+        )
+
         # Wait for data feeds to connect
         await asyncio.sleep(2.0)
 
         while self._running:
             try:
+                # Check warm-up period
+                if not self._warmup_complete:
+                    elapsed = (datetime.now(timezone.utc) - self._startup_time).total_seconds()
+                    if elapsed < warmup_seconds:
+                        remaining = warmup_seconds - elapsed
+                        # Log progress every 10 seconds
+                        if int(elapsed) % 10 == 0 and int(elapsed) > 0:
+                            prices = self.chainlink_feed.get_all_prices()
+                            price_count = len(prices)
+                            logger.info(
+                                f"👀 OBSERVING: {remaining:.0f}s remaining | "
+                                f"Prices tracked: {price_count} | "
+                                f"Markets found: {len(self.markets)}"
+                            )
+                        # Still discover markets and collect data, but don't trade
+                        await self._refresh_markets()
+                        await self._sync_balance()
+                        await asyncio.sleep(self.config.loop_interval)
+                        continue
+                    else:
+                        # Warm-up complete!
+                        self._warmup_complete = True
+                        prices = self.chainlink_feed.get_all_prices()
+                        logger.info(
+                            f"✅ WARM-UP COMPLETE: Now trading! | "
+                            f"Prices: {len(prices)} | Markets: {len(self.markets)}"
+                        )
+
                 # Check if data feeds are healthy (circuit breakers)
                 if self.chainlink_feed._circuit_open and self.clob_feed._circuit_open:
                     logger.critical(
@@ -794,12 +888,19 @@ class TradingBot:
                 edge=0.0,  # Not needed for outcome
                 market=market,
                 side=position.side,
+                _arb_type=position.ml_arb_type,  # Pass arb type to extract_features
             )
             self.ml_predictor.record_outcome(
                 signal=fake_signal,
                 volatility=position.ml_volatility,
                 price_momentum=position.ml_momentum or 0.0,
                 won=won,
+                arb_type=position.ml_arb_type or "none",
+                spread=position.ml_spread or 0.0,
+                bid_depth=position.ml_bid_depth or 0.0,
+                ask_depth=position.ml_ask_depth or 0.0,
+                price_trend=position.ml_price_trend or 0.0,
+                distance_from_target=position.ml_distance_from_target or 0.0,
             )
 
     async def _process_market(self, market: MarketState):
@@ -811,6 +912,35 @@ class TradingBot:
         """
         # Skip if market is about to expire (should be in expiring_markets)
         if market.time_remaining < self.config.trading.min_time_remaining:
+            return
+
+        # Track when we first saw this market
+        market_id = market.condition_id
+        now = datetime.now(timezone.utc)
+        if market_id not in self._market_first_seen:
+            self._market_first_seen[market_id] = now
+            logger.debug(f"[{market.asset}] First observation - collecting data...")
+
+        # Check minimum observation time for this market
+        observation_time = (now - self._market_first_seen[market_id]).total_seconds()
+        min_observation = self.config.trading.min_observation_time
+        if observation_time < min_observation:
+            logger.debug(
+                f"[{market.asset}] Observing: {observation_time:.0f}s / {min_observation:.0f}s"
+            )
+            # Still update orderbook data, just don't trade yet
+            self._update_market_from_orderbook(market)
+            return
+
+        # Check minimum price samples for this asset
+        asset_symbol = f"{market.asset.lower()}/usd"
+        price_history = self.signal_generator.price_histories.get(asset_symbol, [])
+        min_samples = self.config.trading.min_price_samples
+        if len(price_history) < min_samples:
+            logger.debug(
+                f"[{market.asset}] Need more price data: {len(price_history)}/{min_samples} samples"
+            )
+            self._update_market_from_orderbook(market)
             return
 
         # Update market state from order book
@@ -846,17 +976,16 @@ class TradingBot:
 
         # ML filter - check predicted win probability
         if self.ml_predictor:
-            volatility = self.config.volatility.get(market.asset)
-            # Calculate simple momentum from Chainlink price
-            price_momentum = 0.0
-            current_price = self.signal_generator.get_price(market.asset)
-            if current_price and market.target_price:
-                # Positive if price > target, negative if below
-                price_momentum = (current_price - market.target_price) / market.target_price
-                price_momentum = max(-1, min(1, price_momentum * 10))  # Scale and clamp
+            # Extract all ML features using the helper function
+            ml_features = extract_ml_features_from_market(
+                signal=signal,
+                signal_generator=self.signal_generator,
+                market=market,
+            )
 
             should_trade, confidence, ml_reason = self.ml_predictor.should_trade(
-                signal, volatility, price_momentum
+                signal=signal,
+                **ml_features,
             )
             if not should_trade:
                 rejection_key = f"{market.condition_id}:ml"
@@ -865,10 +994,16 @@ class TradingBot:
                     logger.info(f"[{market.asset}] 🤖 {ml_reason}")
                 return
 
-            # Store ML data with signal for outcome recording
-            signal._ml_volatility = volatility
-            signal._ml_momentum = price_momentum
+            # Store all ML data with signal for outcome recording
+            signal._ml_volatility = ml_features["volatility"]
+            signal._ml_momentum = ml_features["price_momentum"]
             signal._ml_confidence = confidence
+            signal._ml_arb_type = ml_features["arb_type"]
+            signal._ml_spread = ml_features["spread"]
+            signal._ml_bid_depth = ml_features["bid_depth"]
+            signal._ml_ask_depth = ml_features["ask_depth"]
+            signal._ml_price_trend = ml_features["price_trend"]
+            signal._ml_distance_from_target = ml_features["distance_from_target"]
 
         # Execute the signal
         await self._execute_signal(signal)
@@ -1016,6 +1151,12 @@ class TradingBot:
             ml_volatility = getattr(signal, '_ml_volatility', None)
             ml_momentum = getattr(signal, '_ml_momentum', None)
             ml_confidence = getattr(signal, '_ml_confidence', None)
+            ml_arb_type = getattr(signal, '_ml_arb_type', None)
+            ml_spread = getattr(signal, '_ml_spread', None)
+            ml_bid_depth = getattr(signal, '_ml_bid_depth', None)
+            ml_ask_depth = getattr(signal, '_ml_ask_depth', None)
+            ml_price_trend = getattr(signal, '_ml_price_trend', None)
+            ml_distance_from_target = getattr(signal, '_ml_distance_from_target', None)
 
             # Record position with risk manager (including ML data for outcome tracking)
             self.risk_manager.record_position_open(
@@ -1025,9 +1166,16 @@ class TradingBot:
                 ml_volatility=ml_volatility,
                 ml_momentum=ml_momentum,
                 ml_confidence=ml_confidence,
+                ml_arb_type=ml_arb_type,
+                ml_spread=ml_spread,
+                ml_bid_depth=ml_bid_depth,
+                ml_ask_depth=ml_ask_depth,
+                ml_price_trend=ml_price_trend,
+                ml_distance_from_target=ml_distance_from_target,
             )
             conf_str = f" (ML: {ml_confidence:.0%})" if ml_confidence else ""
-            logger.info(f"    {Colors.BRIGHT_GREEN}✓ FILLED @ {signal.recommended_price:.2f}{conf_str}{Colors.RESET}")
+            arb_str = f" [{ml_arb_type}]" if ml_arb_type and ml_arb_type != "none" else ""
+            logger.info(f"    {Colors.BRIGHT_GREEN}✓ FILLED @ {signal.recommended_price:.2f}{conf_str}{arb_str}{Colors.RESET}")
 
             # Log positions AFTER trade
             logger.info(
