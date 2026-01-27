@@ -219,24 +219,39 @@ def get_trades(client: Optional[ClobClient], limit: int = 100) -> list[dict]:
 
 def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
     """
-    Get active positions from recent trades in 15-min crypto markets.
+    Get active positions from Polymarket Data API.
 
-    Scans recent trades to find positions in markets that haven't settled yet.
+    Fetches real positions for 15-min crypto markets that haven't settled.
 
     Args:
-        client: Configured ClobClient
+        client: Configured ClobClient (used to get wallet address)
 
     Returns:
-        Dict of asset -> position info (side, size, market_slug)
+        Dict of asset -> position info (size, price, cost, market)
     """
     if client is None:
         return {}
 
     import time
+    import requests
 
     try:
-        trades = get_trades(client, limit=50)
-        if not trades:
+        # Get wallet address from client
+        wallet_address = client.get_address()
+        if not wallet_address:
+            logger.warning("No wallet address available")
+            return {}
+
+        # Fetch positions from Data API
+        url = f"https://data-api.polymarket.com/positions?user={wallet_address}"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code != 200:
+            logger.warning(f"Failed to fetch positions: {response.status_code}")
+            return {}
+
+        all_positions = response.json()
+        if not all_positions:
             return {}
 
         current_time = int(time.time())
@@ -250,51 +265,52 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
             "xrp": "XRP",
         }
 
-        for trade in trades:
-            # Get market/asset info from trade
-            market_slug = trade.get("market", "").lower()
-            asset_id = trade.get("asset_id", "").lower()
+        for pos in all_positions:
+            slug = pos.get("slug", "").lower() or pos.get("eventSlug", "").lower()
+            title = pos.get("title", "").lower()
 
             # Check if this is a 15-min crypto market
-            if "updown-15m" not in market_slug and "updown-15m" not in asset_id:
+            if "updown-15m" not in slug and "15m" not in title:
                 continue
 
-            # Extract timestamp from market slug (e.g., btc-updown-15m-1706123400)
+            # Extract timestamp from slug (e.g., btc-updown-15m-1706123400)
             try:
-                parts = market_slug.split("-")
+                parts = slug.split("-")
                 if len(parts) >= 4:
                     market_ts = int(parts[-1])
                     # Check if market is still active (settles at market_ts + 900)
                     if current_time > market_ts + 900:
                         continue  # Market already settled
             except (ValueError, IndexError):
-                continue
+                pass  # Continue anyway if we can't parse timestamp
 
             # Identify asset
             asset = None
             for pattern, asset_name in asset_patterns.items():
-                if pattern in market_slug or pattern in asset_id:
+                if pattern in slug or pattern in title:
                     asset = asset_name
                     break
 
             if asset and asset not in positions:
-                side = trade.get("side", "BUY")
-                size = float(trade.get("size", 0))
-                price = float(trade.get("price", 0))
+                size = float(pos.get("size", 0))
+                avg_price = float(pos.get("avgPrice", 0))
+                current_value = float(pos.get("currentValue", 0))
 
-                positions[asset] = {
-                    "side": side,
-                    "size": size,
-                    "price": price,
-                    "market": market_slug,
-                    "cost": size * price,
-                }
-                logger.debug(f"Found active position: {asset} {side} {size} @ {price}")
+                if size > 0:
+                    positions[asset] = {
+                        "size": size,
+                        "price": avg_price,
+                        "cost": size * avg_price,
+                        "current_value": current_value,
+                        "market": slug,
+                        "title": pos.get("title", ""),
+                    }
+                    logger.info(f"Position: {asset} | {size:.2f} shares @ {avg_price:.2f} | Value: ${current_value:.2f}")
 
         return positions
 
     except Exception as e:
-        logger.error(f"Failed to get active positions: {e}")
+        logger.error(f"Failed to get positions from API: {e}")
         return {}
 
 
