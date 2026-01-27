@@ -898,66 +898,140 @@ class TradingBot:
 
             for market_id in markets_to_settle:
                 market = self.expiring_markets[market_id]
-                await self._settle_market(market)
+                settled = await self._settle_market(market)
 
-                # Move to settled set and cleanup
-                self.expiring_markets.pop(market_id, None)
-                self.settled_markets.add(market_id)
+                # Only remove from expiring if actually settled
+                if settled:
+                    # Move to settled set and cleanup
+                    self.expiring_markets.pop(market_id, None)
+                    self.settled_markets.add(market_id)
 
-                # Clean up token-to-market mapping
-                self._token_to_market.pop(market.up_token_id, None)
-                self._token_to_market.pop(market.down_token_id, None)
+                    # Clean up token-to-market mapping
+                    self._token_to_market.pop(market.up_token_id, None)
+                    self._token_to_market.pop(market.down_token_id, None)
 
-                # Unsubscribe from order book
-                self.clob_feed.unsubscribe(market.up_token_id)
-                self.clob_feed.unsubscribe(market.down_token_id)
+                    # Unsubscribe from order book
+                    self.clob_feed.unsubscribe(market.up_token_id)
+                    self.clob_feed.unsubscribe(market.down_token_id)
 
-                # Cleanup old settled markets (keep last 100)
-                if len(self.settled_markets) > 100:
-                    self.settled_markets = set(list(self.settled_markets)[-100:])
+                    # Cleanup old settled markets (keep last 100)
+                    if len(self.settled_markets) > 100:
+                        self.settled_markets = set(list(self.settled_markets)[-100:])
 
-    async def _settle_market(self, market: MarketState):
+    async def _settle_market(self, market: MarketState) -> bool:
         """
         Process settlement for a single market.
 
         Args:
             market: Market to settle
-        """
-        logger.info(f"SETTLING: {market.asset} | {market.question[:50]}...")
 
+        Returns:
+            True if settlement was successful, False if should retry
+        """
         # Check if we have a position in this market
         position = self.risk_manager.positions.get(market.condition_id)
+        has_position = position is not None
+
+        # Log that we're attempting settlement
+        pos_str = f" (HAVE POSITION: {position.side.value})" if has_position else ""
+        logger.info(f"SETTLING: {market.asset}{pos_str} | {market.question[:50]}...")
+
+        time_since_expiry = abs(market.time_remaining)
 
         # Fetch resolution from API
         resolution = self.gamma_api.get_market_resolution(market.condition_id)
 
-        if not resolution:
-            logger.warning(f"Could not fetch resolution for {market.condition_id}")
-            # Retry later - don't remove from expiring yet
-            return
+        winning_outcome = None
+        resolution_price = None
 
-        if not resolution.get("resolved"):
-            logger.debug(f"Market {market.asset} not yet resolved, will retry...")
-            return
+        if resolution and resolution.get("resolved"):
+            # API has resolution
+            winning_outcome = resolution.get("winning_outcome")
+            resolution_price = resolution.get("resolution_price")
+            logger.info(
+                f"✅ RESOLVED (API): {market.asset} | "
+                f"Winner: {winning_outcome} | "
+                f"Settlement Price: ${resolution_price:,.2f if resolution_price else 0}"
+            )
+        else:
+            # API doesn't have resolution yet - try local determination
+            # For 15-minute crypto markets: price >= target = UP wins
+            local_outcome, local_price = self._determine_outcome_locally(market)
 
-        winning_outcome = resolution.get("winning_outcome")
-        resolution_price = resolution.get("resolution_price")
-
-        logger.info(
-            f"RESOLVED: {market.asset} | "
-            f"Winner: {winning_outcome} | "
-            f"Settlement Price: ${resolution_price:,.2f if resolution_price else 0}"
-        )
+            if local_outcome:
+                # Wait at least 30 seconds after expiry before using local resolution
+                # This gives the API time to update
+                if time_since_expiry >= 30:
+                    winning_outcome = local_outcome
+                    resolution_price = local_price
+                    logger.info(
+                        f"✅ RESOLVED (LOCAL): {market.asset} | "
+                        f"Winner: {winning_outcome} | "
+                        f"Price: ${resolution_price:,.2f} vs Target: ${market.target_price:,.2f}"
+                    )
+                else:
+                    logger.info(
+                        f"Market {market.asset} waiting for API resolution... "
+                        f"(local: {local_outcome}, waited {time_since_expiry:.0f}s)"
+                    )
+                    return False  # Wait for API first
+            else:
+                # Couldn't determine locally either
+                logger.warning(
+                    f"Could not determine outcome for {market.asset} "
+                    f"(waiting {time_since_expiry:.0f}s since expiry)"
+                )
+                # If we've waited more than 5 minutes, give up
+                if time_since_expiry > 300:
+                    logger.error(
+                        f"SETTLEMENT TIMEOUT: {market.asset} - no resolution after 5 minutes"
+                    )
+                    return True  # Force remove to prevent infinite retry
+                return False  # Retry later
 
         # Process position if we had one
-        if position:
+        if position and winning_outcome:
             await self._close_position_on_settlement(
                 market=market,
                 position=position,
                 winning_outcome=winning_outcome,
             )
+        elif position:
+            logger.warning(f"Have position in {market.asset} but no winning outcome!")
         else:
             logger.debug(f"No position in {market.asset}, nothing to settle")
+
+        return True  # Settlement successful
+
+    def _determine_outcome_locally(self, market: MarketState) -> tuple[Optional[str], Optional[float]]:
+        """
+        Determine market outcome locally using Chainlink price.
+
+        For 15-minute crypto markets:
+        - If current price >= target price: UP wins
+        - If current price < target price: DOWN wins
+
+        Args:
+            market: Market to determine outcome for
+
+        Returns:
+            Tuple of (winning_outcome, current_price) or (None, None) if can't determine
+        """
+        # Get current Chainlink price for this asset
+        current_price = self.signal_generator.get_price(market.asset)
+
+        if current_price is None or current_price <= 0:
+            return (None, None)
+
+        target_price = market.target_price
+        if target_price is None or target_price <= 0:
+            return (None, None)
+
+        # Determine winner based on price vs target
+        if current_price >= target_price:
+            return ("UP", current_price)
+        else:
+            return ("DOWN", current_price)
 
     async def _close_position_on_settlement(
         self,
