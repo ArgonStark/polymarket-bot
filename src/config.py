@@ -83,7 +83,7 @@ class TradingConfig:
 
     # Maximum concurrent positions
     max_concurrent_positions: int = field(
-        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "8"))
+        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "2"))
     )
 
     # Daily loss limit as percentage of starting bankroll

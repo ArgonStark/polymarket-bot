@@ -81,6 +81,7 @@ class TradingBot:
         # Timing trackers
         self.last_market_refresh = None
         self.last_settlement_check = None
+        self.last_balance_sync = None
 
         # Period tracking for 15-minute market transitions
         # When a period boundary is crossed, we need to refresh markets with new target prices
@@ -90,6 +91,7 @@ class TradingBot:
         # Intervals (seconds)
         self.settlement_check_interval = 5.0  # Check settlements frequently
         self.market_discovery_interval = 15.0  # Discover new markets every 15s
+        self.balance_sync_interval = 30.0  # Sync balance every 30s
         self.period_transition_delay = 5.0  # Seconds to wait after period boundary for price data
 
         # Control flags
@@ -185,6 +187,27 @@ class TradingBot:
 
         except Exception as e:
             logger.warning(f"Could not sync existing orders: {e}")
+
+    async def _sync_balance(self):
+        """Periodically sync bankroll with actual Polymarket balance."""
+        now = datetime.now(timezone.utc)
+
+        # Check if sync is needed
+        if self.last_balance_sync:
+            elapsed = (now - self.last_balance_sync).total_seconds()
+            if elapsed < self.balance_sync_interval:
+                return
+
+        if self.client is None:
+            return
+
+        try:
+            balance = get_account_balance(self.client)
+            if balance is not None:
+                self.risk_manager.sync_bankroll(balance)
+                self.last_balance_sync = now
+        except Exception as e:
+            logger.debug(f"Balance sync failed: {e}")
 
     async def _display_startup_info(self):
         """
@@ -361,6 +384,9 @@ class TradingBot:
 
                 # Discover and refresh markets
                 await self._refresh_markets()
+
+                # Sync balance periodically
+                await self._sync_balance()
 
                 # Move expiring markets out of active trading
                 await self._check_expiring_markets()
@@ -771,6 +797,14 @@ class TradingBot:
                 logger.debug(f"[{asset}] Cooldown: {remaining:.0f}s remaining")
                 return
 
+        # Check if we have enough balance before attempting
+        available = self.risk_manager.current_bankroll * 0.90  # 10% buffer
+        if signal.size_usd > available:
+            logger.debug(f"[{asset}] Insufficient balance: need ${signal.size_usd:.2f}, have ${available:.2f}")
+            # Set a short cooldown to prevent spam
+            self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
+            return
+
         # Get current price for logging
         current_price = self.signal_generator.get_price(signal.market.asset)
         target = signal.market.target_price
@@ -788,7 +822,7 @@ class TradingBot:
         result = self.executor.execute_signal(signal)
 
         if result.success:
-            # Set cooldown for this asset
+            # Set full cooldown for successful orders
             self._last_order_time[asset] = now
 
             # Record position with risk manager
@@ -799,6 +833,8 @@ class TradingBot:
             )
             logger.info(f"    FILLED @ {signal.recommended_price:.2f}")
         else:
+            # Set shorter cooldown (30s) on failures to prevent spam
+            self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
             logger.warning(f"    FAILED: {result.error_message}")
 
     def _on_chainlink_price(self, price: ChainlinkPrice):

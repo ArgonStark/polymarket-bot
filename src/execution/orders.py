@@ -41,8 +41,12 @@ def _validate_order_response(response: dict) -> tuple[bool, str]:
         error = response["error"]
         if isinstance(error, dict):
             error_msg = error.get("message") or error.get("error") or str(error)
+        elif error:
+            error_msg = str(error)
         else:
-            error_msg = str(error) if error else "Unknown API error"
+            # Empty error string - log full response for debugging
+            logger.debug(f"API returned empty error. Full response: {response}")
+            error_msg = f"API error (response: {response})"
         return False, error_msg
 
     if "errorMsg" in response:

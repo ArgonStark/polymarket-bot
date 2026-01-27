@@ -191,9 +191,14 @@ class RiskManager:
         )
 
         self.positions[market_key] = position
+
+        # Deduct cost from available bankroll immediately
+        cost = shares * entry_price
+        self.current_bankroll -= cost
+
         logger.info(
             f"Position opened: {signal.side.value} {signal.market.asset} "
-            f"{shares:.2f} shares @ {entry_price:.4f}"
+            f"{shares:.2f} shares @ {entry_price:.4f} (${cost:.2f})"
         )
 
     def record_position_close(
@@ -225,8 +230,9 @@ class RiskManager:
             else:
                 self.daily_stats.losses += 1
 
-        # Update bankroll
-        self.current_bankroll += pnl
+        # Add back the proceeds (original cost + pnl)
+        proceeds = position.cost_basis + pnl
+        self.current_bankroll += proceeds
         if self.daily_stats:
             self.daily_stats.current_bankroll = self.current_bankroll
 
@@ -323,6 +329,21 @@ class RiskManager:
             self.halt_reason = None
 
         logger.info(f"Daily stats reset for {today}")
+
+    def sync_bankroll(self, actual_balance: float):
+        """
+        Sync bankroll with actual balance from exchange.
+
+        Args:
+            actual_balance: Current USDC balance from Polymarket
+        """
+        old_bankroll = self.current_bankroll
+        self.current_bankroll = actual_balance
+        if self.daily_stats:
+            self.daily_stats.current_bankroll = actual_balance
+
+        if abs(old_bankroll - actual_balance) > 0.01:
+            logger.debug(f"Bankroll synced: ${old_bankroll:.2f} -> ${actual_balance:.2f}")
 
     def get_status_summary(self) -> dict:
         """Get summary of current risk status."""
