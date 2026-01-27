@@ -82,6 +82,7 @@ class TradingBot:
         self.last_market_refresh = None
         self.last_settlement_check = None
         self.last_balance_sync = None
+        self.last_orders_sync = None
 
         # Period tracking for 15-minute market transitions
         # When a period boundary is crossed, we need to refresh markets with new target prices
@@ -92,6 +93,7 @@ class TradingBot:
         self.settlement_check_interval = 5.0  # Check settlements frequently
         self.market_discovery_interval = 15.0  # Discover new markets every 15s
         self.balance_sync_interval = 30.0  # Sync balance every 30s
+        self.orders_sync_interval = 60.0  # Sync open orders every 60s
         self.period_transition_delay = 5.0  # Seconds to wait after period boundary for price data
 
         # Control flags
@@ -146,23 +148,28 @@ class TradingBot:
         self.risk_manager.initialize(initial_bankroll)
 
         # Sync existing orders to prevent duplicates
-        await self._sync_existing_orders()
+        await self._sync_existing_orders(force=True)
 
         logger.info("Trading bot initialized successfully")
         return True
 
-    async def _sync_existing_orders(self):
+    async def _sync_existing_orders(self, force: bool = False):
         """Sync existing open orders from Polymarket to prevent duplicates."""
+        now = datetime.now(timezone.utc)
+
+        # Check if sync is needed (unless forced)
+        if not force and self.last_orders_sync:
+            elapsed = (now - self.last_orders_sync).total_seconds()
+            if elapsed < self.orders_sync_interval:
+                return
+
         if self.client is None:
             return
 
         try:
             from .execution.client import get_open_orders
             open_orders = get_open_orders(self.client)
-
-            if not open_orders:
-                logger.info("No existing open orders found")
-                return
+            self.last_orders_sync = now
 
             # Map token IDs to assets
             token_to_asset = {
@@ -183,7 +190,7 @@ class TradingBot:
                         break
 
             if synced_assets:
-                logger.info(f"Synced existing orders for: {', '.join(synced_assets)}")
+                logger.info(f"Synced open orders: {', '.join(synced_assets)}")
 
         except Exception as e:
             logger.warning(f"Could not sync existing orders: {e}")
@@ -385,8 +392,9 @@ class TradingBot:
                 # Discover and refresh markets
                 await self._refresh_markets()
 
-                # Sync balance periodically
+                # Sync balance and open orders periodically
                 await self._sync_balance()
+                await self._sync_existing_orders()
 
                 # Move expiring markets out of active trading
                 await self._check_expiring_markets()
@@ -754,7 +762,7 @@ class TradingBot:
             rejection_key = f"{market.condition_id}:{reason}"
             if rejection_key not in self._logged_rejections:
                 self._logged_rejections.add(rejection_key)
-                logger.debug(f"Signal rejected for {market.asset}: {reason}")
+                logger.info(f"[{market.asset}] Blocked: {reason}")
             return
 
         # Adjust size if needed
