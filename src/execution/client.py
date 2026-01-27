@@ -8,7 +8,7 @@ import logging
 from typing import Optional
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams
+from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
 from py_clob_client.constants import POLYGON
 
 from ..config import BotConfig
@@ -128,7 +128,11 @@ def get_account_balance(client: Optional[ClobClient]) -> Optional[float]:
         # Use the client's configured signature type
         # 0 = EOA wallet, 1 = proxy/browser wallet
         sig_type = getattr(client, 'signature_type', 0)
-        params = BalanceAllowanceParams(signature_type=sig_type, asset_type="USDC")
+        # AssetType.COLLATERAL = USDC collateral balance
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=sig_type,
+        )
         balance_info = client.get_balance_allowance(params)
 
         if balance_info:
