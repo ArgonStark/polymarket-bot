@@ -178,7 +178,7 @@ class GammaAPI:
                     continue
 
                 filtered.append(market_state)
-                logger.info(f"[{asset}] Market active | {time_remaining:.0f}s remaining | Target: ${market_state.target_price:,.0f}")
+                logger.debug(f"[{asset}] Market active | {time_remaining:.0f}s remaining | Target: ${market_state.target_price:,.0f}")
 
         # Sort by end time (soonest first)
         filtered.sort(key=lambda m: m.end_time)
@@ -579,13 +579,13 @@ class GammaAPI:
                 price = data.get("closePrice")
 
                 if price and isinstance(price, (int, float)) and price > 0:
-                    logger.info(f"Fetched price to beat for {asset}: ${price:,.2f}")
+                    logger.debug(f"Fetched price to beat for {asset}: ${price:,.2f}")
                     return float(price)
 
                 # Fallback to openPrice if closePrice not available
                 price = data.get("openPrice")
                 if price and isinstance(price, (int, float)) and price > 0:
-                    logger.info(f"Using openPrice for {asset}: ${price:,.2f}")
+                    logger.debug(f"Using openPrice for {asset}: ${price:,.2f}")
                     return float(price)
 
                 # At period boundaries, the API might not have data yet - keep retrying

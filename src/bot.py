@@ -423,13 +423,10 @@ class TradingBot:
                 # Generate and execute signals for each active market
                 active_count = len(self.markets)
                 if active_count > 0:
-                    # Periodically log status (roughly every 10s with 0.5s interval)
+                    # Periodically log colorful status (roughly every 30s)
                     import random
-                    if random.random() < 0.05:
-                        prices = self.chainlink_feed.get_all_prices()
-                        if prices:
-                            price_str = ", ".join(f"{k.split('/')[0].upper()}: ${v:,.2f}" for k, v in prices.items())
-                            logger.info(f"Chainlink prices: {price_str}")
+                    if random.random() < 0.02:
+                        self._log_status_line()
 
                 for market in list(self.markets.values()):
                     await self._process_market(market)
@@ -806,6 +803,45 @@ class TradingBot:
 
         market.last_updated = datetime.now(timezone.utc)
 
+    def _log_status_line(self):
+        """Log a colorful status line with positions and bankroll."""
+        # Get current prices
+        prices = self.chainlink_feed.get_all_prices()
+
+        # Build price string
+        price_parts = []
+        for k, v in prices.items():
+            asset = k.split('/')[0].upper()
+            price_parts.append(f"{asset}: ${v:,.0f}")
+        price_str = " | ".join(price_parts)
+
+        # Get positions from cooldown (assets we're blocking)
+        now = datetime.now(timezone.utc)
+        active_positions = []
+        for asset in ["BTC", "ETH", "SOL", "XRP"]:
+            if asset in self._last_order_time:
+                elapsed = (now - self._last_order_time[asset]).total_seconds()
+                if elapsed < self._order_cooldown_seconds:
+                    active_positions.append(asset)
+
+        # Build status line
+        bankroll = self.risk_manager.current_bankroll
+        pos_count = len(self.risk_manager.positions)
+
+        # Colorful output
+        status_parts = [
+            f"{Colors.BRIGHT_CYAN}💰 ${bankroll:.2f}{Colors.RESET}",
+        ]
+
+        if active_positions:
+            pos_str = ", ".join(active_positions)
+            status_parts.append(f"{Colors.BRIGHT_YELLOW}📊 {pos_str}{Colors.RESET}")
+
+        if price_str:
+            status_parts.append(f"{Colors.DIM}{price_str}{Colors.RESET}")
+
+        logger.info(" │ ".join(status_parts))
+
     async def _execute_signal(self, signal: Signal):
         """Execute a trading signal."""
         asset = signal.market.asset
@@ -831,13 +867,14 @@ class TradingBot:
         current_price = self.signal_generator.get_price(signal.market.asset)
         target = signal.market.target_price
 
-        # Log the trade attempt
-        direction = ">" if signal.side == Side.UP else "<"
+        # Log the trade attempt with colors
+        direction = "▲" if signal.side == Side.UP else "▼"
+        side_color = Colors.BRIGHT_GREEN if signal.side == Side.UP else Colors.BRIGHT_RED
         logger.info(
-            f">>> {asset} {signal.side.value} | "
-            f"Edge: {signal.edge:.0%} | "
-            f"${current_price:,.0f} {direction} ${target:,.0f} | "
-            f"Size: ${signal.size_usd:.2f}"
+            f"{side_color}>>> {asset} {signal.side.value} {direction}{Colors.RESET} │ "
+            f"Edge: {Colors.BRIGHT_YELLOW}{signal.edge:.0%}{Colors.RESET} │ "
+            f"${current_price:,.0f} vs ${target:,.0f} │ "
+            f"${signal.size_usd:.2f}"
         )
 
         # Execute through order executor
@@ -853,11 +890,11 @@ class TradingBot:
                 entry_price=result.filled_price or signal.recommended_price,
                 shares=result.filled_size or signal.size_shares,
             )
-            logger.info(f"    FILLED @ {signal.recommended_price:.2f}")
+            logger.info(f"    {Colors.BRIGHT_GREEN}✓ FILLED @ {signal.recommended_price:.2f}{Colors.RESET}")
         else:
             # Set shorter cooldown (30s) on failures to prevent spam
             self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
-            logger.warning(f"    FAILED: {result.error_message}")
+            logger.warning(f"    {Colors.BRIGHT_RED}✗ {result.error_message}{Colors.RESET}")
 
     def _on_chainlink_price(self, price: ChainlinkPrice):
         """Handle Chainlink price update."""
