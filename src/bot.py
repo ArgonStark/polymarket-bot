@@ -721,14 +721,6 @@ class TradingBot:
         Args:
             signal: Signal to execute
         """
-        logger.info(
-            f"EXECUTING {signal.recommended_action.value}: "
-            f"{signal.side.value} {signal.market.asset} | "
-            f"Edge: {signal.edge:.1%} | "
-            f"Size: ${signal.size_usd:.2f} | "
-            f"Time: {signal.time_remaining:.0f}s"
-        )
-
         # Execute through order executor
         result = self.executor.execute_signal(signal)
 
@@ -739,15 +731,12 @@ class TradingBot:
                 entry_price=result.filled_price or signal.recommended_price,
                 shares=result.filled_size or signal.size_shares,
             )
-
-            # Log trade
-            log_trade(
-                signal=signal,
-                result=result,
-                config=self.config,
+            logger.info(
+                f"[{signal.market.asset}] POSITION OPENED | "
+                f"{signal.side.value} {signal.size_shares:.1f} shares @ {signal.recommended_price:.2f}"
             )
         else:
-            logger.warning(f"Trade failed: {result.error_message}")
+            logger.warning(f"[{signal.market.asset}] ORDER FAILED: {result.error_message}")
 
     def _on_chainlink_price(self, price: ChainlinkPrice):
         """Handle Chainlink price update."""

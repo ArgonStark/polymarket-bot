@@ -159,10 +159,7 @@ class RiskManager:
 
         # Ensure minimum viable trade size ($3)
         if position_size < 3.0:
-            logger.warning(
-                f"Position size ${position_size:.2f} below $3 minimum for {signal.market.asset}, "
-                f"skipping (bankroll=${self.current_bankroll:.2f})"
-            )
+            logger.debug(f"[{signal.market.asset}] Size ${position_size:.2f} below $3 min, skipping")
             signal.size_usd = 0
             signal.size_shares = 0
             return signal
@@ -173,10 +170,6 @@ class RiskManager:
                 ratio = position_size / signal.size_usd
                 signal.size_shares = signal.size_shares * ratio
             signal.size_usd = position_size
-            logger.info(
-                f"Position size for {signal.market.asset}: ${position_size:.2f} "
-                f"({trading.max_position_pct:.0%} of ${self.current_bankroll:.2f} bankroll)"
-            )
 
         return signal
 
