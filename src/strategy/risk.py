@@ -27,6 +27,9 @@ class RiskManager:
     - Enforce position limits
     - Monitor daily P&L
     - Stop trading if limits hit
+    - Track consecutive losses
+    - Monitor drawdown from peak
+    - Check win rate
     """
 
     config: BotConfig
@@ -41,6 +44,12 @@ class RiskManager:
     is_trading_enabled: bool = True
     halt_reason: Optional[str] = None
 
+    # Advanced protection state
+    consecutive_losses: int = 0
+    peak_bankroll: float = 0.0  # Highest bankroll achieved (for drawdown)
+    cooloff_until: Optional[datetime] = None  # When cooloff ends
+    trade_history: list = field(default_factory=list)  # Recent trade results
+
     def initialize(self, bankroll: float):
         """
         Initialize risk manager with starting bankroll.
@@ -50,6 +59,10 @@ class RiskManager:
         """
         self.starting_bankroll = bankroll
         self.current_bankroll = bankroll
+        self.peak_bankroll = bankroll  # Track peak for drawdown
+        self.consecutive_losses = 0
+        self.trade_history = []
+        self.cooloff_until = None
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self.daily_stats = DailyStats(
@@ -70,8 +83,37 @@ class RiskManager:
         if not self.is_trading_enabled:
             return (False, self.halt_reason or "Trading halted")
 
+        # Check cooloff period
+        if self.cooloff_until:
+            now = datetime.now(timezone.utc)
+            if now < self.cooloff_until:
+                remaining = (self.cooloff_until - now).total_seconds() / 60
+                return (False, f"Cooling off ({remaining:.0f}m remaining)")
+            else:
+                # Cooloff expired, reset
+                self.cooloff_until = None
+                self._reset_after_cooloff()
+
         if self.daily_stats and self.daily_stats.hit_loss_limit:
             return (False, "Daily loss limit hit")
+
+        # Check consecutive losses
+        trading = self.config.trading
+        if self.consecutive_losses >= trading.max_consecutive_losses:
+            return (False, f"Hit {self.consecutive_losses} consecutive losses")
+
+        # Check drawdown from peak
+        if self.peak_bankroll > 0:
+            drawdown = (self.peak_bankroll - self.current_bankroll) / self.peak_bankroll
+            if drawdown >= trading.max_drawdown_pct:
+                return (False, f"Drawdown {drawdown:.1%} exceeds {trading.max_drawdown_pct:.0%} limit")
+
+        # Check win rate (only after minimum trades)
+        if len(self.trade_history) >= trading.min_trades_for_winrate:
+            wins = sum(1 for t in self.trade_history if t > 0)
+            win_rate = wins / len(self.trade_history)
+            if win_rate < trading.min_win_rate:
+                return (False, f"Win rate {win_rate:.0%} below {trading.min_win_rate:.0%} minimum")
 
         return (True, "")
 
@@ -166,6 +208,9 @@ class RiskManager:
         signal: Signal,
         entry_price: float,
         shares: float,
+        ml_volatility: Optional[float] = None,
+        ml_momentum: Optional[float] = None,
+        ml_confidence: Optional[float] = None,
     ):
         """
         Record a new position being opened.
@@ -174,6 +219,9 @@ class RiskManager:
             signal: Signal that generated the position
             entry_price: Actual entry price
             shares: Number of shares acquired
+            ml_volatility: ML feature - asset volatility at entry
+            ml_momentum: ML feature - price momentum at entry
+            ml_confidence: ML predicted win probability
         """
         market_key = signal.market.condition_id
 
@@ -188,6 +236,9 @@ class RiskManager:
             entry_price=entry_price,
             shares=shares,
             entry_time=datetime.now(timezone.utc),
+            ml_volatility=ml_volatility,
+            ml_momentum=ml_momentum,
+            ml_confidence=ml_confidence,
         )
 
         self.positions[market_key] = position
@@ -196,9 +247,10 @@ class RiskManager:
         cost = shares * entry_price
         self.current_bankroll -= cost
 
+        confidence_str = f" | ML: {ml_confidence:.0%}" if ml_confidence else ""
         logger.info(
             f"Position opened: {signal.side.value} {signal.market.asset} "
-            f"{shares:.2f} shares @ {entry_price:.4f} (${cost:.2f})"
+            f"{shares:.2f} shares @ {entry_price:.4f} (${cost:.2f}){confidence_str}"
         )
 
     def record_position_close(
@@ -236,13 +288,34 @@ class RiskManager:
         if self.daily_stats:
             self.daily_stats.current_bankroll = self.current_bankroll
 
+        # Track consecutive losses and wins
+        self.trade_history.append(pnl)
+        if len(self.trade_history) > 20:  # Keep last 20 trades
+            self.trade_history.pop(0)
+
+        if pnl > 0:
+            # Win - reset consecutive losses, update peak
+            self.consecutive_losses = 0
+            if self.current_bankroll > self.peak_bankroll:
+                self.peak_bankroll = self.current_bankroll
+                logger.info(f"New peak bankroll: ${self.peak_bankroll:.2f}")
+        else:
+            # Loss - increment counter
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= self.config.trading.max_consecutive_losses:
+                logger.warning(
+                    f"⚠️ Hit {self.consecutive_losses} consecutive losses - "
+                    f"entering {self.config.trading.cooloff_period_minutes}m cooloff"
+                )
+                self._start_cooloff("consecutive losses")
+
         logger.info(
             f"Position closed: {position.side.value} {position.market.asset} "
-            f"P&L: ${pnl:+.2f}"
+            f"P&L: ${pnl:+.2f} | Streak: {self.consecutive_losses} losses"
         )
 
-        # Check if we've hit loss limit
-        self._check_loss_limit()
+        # Check if we've hit any limits
+        self._check_all_limits()
 
     def record_fee(self, fee: float):
         """Record a trading fee."""
@@ -271,6 +344,51 @@ class RiskManager:
                 f"(limit: {loss_limit:.1%})"
             )
             logger.warning(self.halt_reason)
+
+    def _check_all_limits(self):
+        """Check all protection limits after a trade closes."""
+        trading = self.config.trading
+
+        # Check daily loss limit
+        self._check_loss_limit()
+
+        # Check drawdown
+        if self.peak_bankroll > 0:
+            drawdown = (self.peak_bankroll - self.current_bankroll) / self.peak_bankroll
+            if drawdown >= trading.max_drawdown_pct:
+                logger.warning(
+                    f"⚠️ Drawdown {drawdown:.1%} exceeds {trading.max_drawdown_pct:.0%} limit - "
+                    f"entering cooloff"
+                )
+                self._start_cooloff("max drawdown")
+
+        # Check win rate
+        if len(self.trade_history) >= trading.min_trades_for_winrate:
+            wins = sum(1 for t in self.trade_history if t > 0)
+            win_rate = wins / len(self.trade_history)
+            if win_rate < trading.min_win_rate:
+                logger.warning(
+                    f"⚠️ Win rate {win_rate:.0%} below {trading.min_win_rate:.0%} - "
+                    f"entering cooloff"
+                )
+                self._start_cooloff("low win rate")
+
+    def _start_cooloff(self, reason: str):
+        """Start a cooling off period."""
+        from datetime import timedelta
+        cooloff_minutes = self.config.trading.cooloff_period_minutes
+        self.cooloff_until = datetime.now(timezone.utc) + timedelta(minutes=cooloff_minutes)
+        logger.warning(
+            f"🛑 COOLOFF STARTED: {reason} | "
+            f"Trading paused for {cooloff_minutes} minutes until {self.cooloff_until.strftime('%H:%M:%S')} UTC"
+        )
+
+    def _reset_after_cooloff(self):
+        """Reset state after cooloff period ends."""
+        logger.info("✅ Cooloff period ended - resetting protection counters")
+        self.consecutive_losses = 0
+        # Don't reset trade_history - win rate should still be monitored
+        # Don't reset peak_bankroll - drawdown is still relevant
 
     def halt_trading(self, reason: str):
         """
@@ -347,13 +465,34 @@ class RiskManager:
 
     def get_status_summary(self) -> dict:
         """Get summary of current risk status."""
+        # Calculate current drawdown
+        drawdown = 0.0
+        if self.peak_bankroll > 0:
+            drawdown = (self.peak_bankroll - self.current_bankroll) / self.peak_bankroll
+
+        # Calculate recent win rate
+        recent_win_rate = 0.0
+        if self.trade_history:
+            wins = sum(1 for t in self.trade_history if t > 0)
+            recent_win_rate = wins / len(self.trade_history)
+
         return {
             "trading_enabled": self.is_trading_enabled,
             "halt_reason": self.halt_reason,
             "starting_bankroll": self.starting_bankroll,
             "current_bankroll": self.current_bankroll,
+            "peak_bankroll": self.peak_bankroll,
             "open_positions": self.get_position_count(),
             "total_exposure": self.get_total_exposure(),
+            "protection": {
+                "consecutive_losses": self.consecutive_losses,
+                "max_consecutive_losses": self.config.trading.max_consecutive_losses,
+                "drawdown": drawdown,
+                "max_drawdown": self.config.trading.max_drawdown_pct,
+                "recent_win_rate": recent_win_rate,
+                "min_win_rate": self.config.trading.min_win_rate,
+                "cooloff_until": self.cooloff_until.isoformat() if self.cooloff_until else None,
+            },
             "daily_stats": {
                 "trades": self.daily_stats.trades_count if self.daily_stats else 0,
                 "win_rate": self.daily_stats.win_rate if self.daily_stats else 0,
@@ -362,3 +501,31 @@ class RiskManager:
                 "daily_return": self.daily_stats.daily_return if self.daily_stats else 0,
             },
         }
+
+    def get_protection_status(self) -> str:
+        """Get a human-readable protection status."""
+        trading = self.config.trading
+        lines = []
+
+        # Consecutive losses
+        lines.append(f"Consecutive losses: {self.consecutive_losses}/{trading.max_consecutive_losses}")
+
+        # Drawdown
+        if self.peak_bankroll > 0:
+            drawdown = (self.peak_bankroll - self.current_bankroll) / self.peak_bankroll
+            lines.append(f"Drawdown: {drawdown:.1%}/{trading.max_drawdown_pct:.0%}")
+
+        # Win rate
+        if self.trade_history:
+            wins = sum(1 for t in self.trade_history if t > 0)
+            win_rate = wins / len(self.trade_history)
+            lines.append(f"Win rate: {win_rate:.0%}/{trading.min_win_rate:.0%} ({len(self.trade_history)} trades)")
+
+        # Cooloff
+        if self.cooloff_until:
+            now = datetime.now(timezone.utc)
+            if now < self.cooloff_until:
+                remaining = (self.cooloff_until - now).total_seconds() / 60
+                lines.append(f"COOLOFF: {remaining:.0f}m remaining")
+
+        return " | ".join(lines)

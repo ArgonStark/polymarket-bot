@@ -200,6 +200,11 @@ class Position:
     entry_time: datetime        # When position was opened
     unrealized_pnl: float = 0.0 # Current unrealized P&L
 
+    # ML data (stored at entry for outcome recording)
+    ml_volatility: Optional[float] = None
+    ml_momentum: Optional[float] = None
+    ml_confidence: Optional[float] = None
+
     @property
     def cost_basis(self) -> float:
         """Get total cost basis."""
