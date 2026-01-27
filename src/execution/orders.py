@@ -36,24 +36,35 @@ def _validate_order_response(response: dict) -> tuple[bool, str]:
     if not isinstance(response, dict):
         return False, f"Invalid response type: {type(response)}"
 
+    # Check for success first - if success=True, order went through
+    if response.get("success") is True:
+        order_id = response.get("orderID") or response.get("order_id")
+        if order_id:
+            return True, ""
+
     # Check for error indicators - handle empty strings and nested errors
     if "error" in response:
         error = response["error"]
         if isinstance(error, dict):
             error_msg = error.get("message") or error.get("error") or str(error)
-        elif error:
+        elif error:  # Non-empty error string
             error_msg = str(error)
         else:
-            # Empty error string - log full response for debugging
-            logger.debug(f"API returned empty error. Full response: {response}")
-            error_msg = f"API error (response: {response})"
+            # Empty error string with no success flag - check for order ID
+            order_id = response.get("orderID") or response.get("order_id")
+            if order_id:
+                return True, ""
+            return False, f"API error (response: {response})"
         return False, error_msg
 
     if "errorMsg" in response:
         error_msg = response["errorMsg"]
-        if not error_msg:
-            error_msg = f"API error (response: {response})"
-        return False, error_msg
+        if error_msg:  # Only fail if errorMsg is non-empty
+            return False, error_msg
+        # Empty errorMsg - check if order was placed successfully
+        order_id = response.get("orderID") or response.get("order_id")
+        if order_id:
+            return True, ""
 
     if response.get("status") == "error":
         return False, response.get("message", "Unknown error")
