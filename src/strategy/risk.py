@@ -111,8 +111,8 @@ class RiskManager:
                 f"Max positions ({trading.max_concurrent_positions}) reached",
             )
 
-        # Basic capital check - need at least $5 available to trade
-        min_trade_size = 5.0
+        # Basic capital check - need at least $3 available to trade
+        min_trade_size = 3.0
         available = self.current_bankroll * 0.90  # Keep 10% buffer
         if available < min_trade_size:
             return (
@@ -157,10 +157,10 @@ class RiskManager:
             f"max=${max_size:.2f}, available=${available:.2f}, final=${position_size:.2f}"
         )
 
-        # Ensure minimum viable trade size ($5)
-        if position_size < 5.0:
+        # Ensure minimum viable trade size ($3)
+        if position_size < 3.0:
             logger.warning(
-                f"Position size ${position_size:.2f} below $5 minimum for {signal.market.asset}, "
+                f"Position size ${position_size:.2f} below $3 minimum for {signal.market.asset}, "
                 f"skipping (bankroll=${self.current_bankroll:.2f})"
             )
             signal.size_usd = 0

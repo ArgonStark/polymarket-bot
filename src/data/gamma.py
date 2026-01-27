@@ -477,7 +477,12 @@ class GammaAPI:
         }
         return placeholders.get(asset.upper())
 
-    def fetch_price_to_beat(self, asset: str, market_start_timestamp: int) -> Optional[float]:
+    def fetch_price_to_beat(
+        self,
+        asset: str,
+        market_start_timestamp: int,
+        extended_retry: bool = False,
+    ) -> Optional[float]:
         """
         Fetch the "price to beat" for a 15-minute market from Polymarket API.
 
@@ -492,11 +497,13 @@ class GammaAPI:
         Args:
             asset: Crypto symbol (BTC, ETH, SOL, XRP)
             market_start_timestamp: Unix timestamp (seconds) of market START
+            extended_retry: If True, use longer retry logic for period boundaries
 
         Returns:
             Price to beat (float) or None if unavailable
         """
         import time
+        from datetime import datetime, timezone
 
         # The previous market's timestamp (15 minutes = 900 seconds earlier)
         previous_market_timestamp = market_start_timestamp - 900
@@ -511,14 +518,31 @@ class GammaAPI:
             "variant": "fifteen"
         }
 
+        # Check if we're close to a period boundary (within 30 seconds of a new period)
+        now = datetime.now(timezone.utc)
+        current_ts = int(now.timestamp())
+        current_period_start = (current_ts // 900) * 900
+        seconds_into_period = current_ts - current_period_start
+        is_period_start = seconds_into_period < 30
+
+        # Use extended retry for period boundaries or when explicitly requested
+        if extended_retry or is_period_start:
+            max_retries = 6  # More retries at period boundary
+            base_delay = 1.0  # Longer initial delay
+            logger.debug(
+                f"Using extended retry for {asset} (period_start={is_period_start}, "
+                f"seconds_into_period={seconds_into_period})"
+            )
+        else:
+            max_retries = 3
+            base_delay = 0.5
+
         logger.debug(
             f"Fetching price to beat for {asset}: "
             f"market_start={market_start_timestamp}, prev_ts={previous_market_timestamp}, "
             f"timestamp_ms={timestamp_ms}"
         )
 
-        # Retry up to 3 times with small delays (handles rate limiting/timing issues)
-        max_retries = 3
         for attempt in range(max_retries):
             try:
                 response = self._session.get(url, params=params, timeout=10)
@@ -527,8 +551,12 @@ class GammaAPI:
                 # Check for empty response
                 if not response.text or not response.text.strip():
                     if attempt < max_retries - 1:
-                        logger.debug(f"Empty response for {asset}, retrying ({attempt + 1}/{max_retries})")
-                        time.sleep(0.5 * (attempt + 1))
+                        delay = base_delay * (attempt + 1)
+                        logger.debug(
+                            f"Empty response for {asset}, retrying in {delay:.1f}s "
+                            f"({attempt + 1}/{max_retries})"
+                        )
+                        time.sleep(delay)
                         continue
                     logger.warning(f"Empty response from crypto-price API for {asset}")
                     return None
@@ -551,6 +579,16 @@ class GammaAPI:
                     logger.info(f"Using openPrice for {asset}: ${price:,.2f}")
                     return float(price)
 
+                # At period boundaries, the API might not have data yet - keep retrying
+                if is_period_start and attempt < max_retries - 1:
+                    delay = base_delay * (attempt + 1)
+                    logger.debug(
+                        f"No price data yet for {asset} at period start, retrying in {delay:.1f}s "
+                        f"({attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(delay)
+                    continue
+
                 # If this interval has no data, it might be too far in past/future
                 # Don't log warning for expected "not available" cases
                 if data.get("completed") is None:
@@ -561,15 +599,23 @@ class GammaAPI:
 
             except requests.RequestException as e:
                 if attempt < max_retries - 1:
-                    logger.debug(f"Request error for {asset}, retrying ({attempt + 1}/{max_retries}): {e}")
-                    time.sleep(0.5 * (attempt + 1))
+                    delay = base_delay * (attempt + 1)
+                    logger.debug(
+                        f"Request error for {asset}, retrying in {delay:.1f}s "
+                        f"({attempt + 1}/{max_retries}): {e}"
+                    )
+                    time.sleep(delay)
                     continue
                 logger.warning(f"Failed to fetch price to beat for {asset}: {e}")
                 return None
             except json.JSONDecodeError as e:
                 if attempt < max_retries - 1:
-                    logger.debug(f"JSON decode error for {asset}, retrying ({attempt + 1}/{max_retries})")
-                    time.sleep(0.5 * (attempt + 1))
+                    delay = base_delay * (attempt + 1)
+                    logger.debug(
+                        f"JSON decode error for {asset}, retrying in {delay:.1f}s "
+                        f"({attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(delay)
                     continue
                 logger.warning(f"Invalid JSON response for {asset}: {e}")
                 return None
