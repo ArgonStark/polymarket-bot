@@ -74,6 +74,10 @@ class TradingBot:
         # Track logged rejections to avoid spam
         self._logged_rejections: set[str] = set()
 
+        # Cooldown tracking - prevent duplicate orders per asset
+        self._last_order_time: dict[str, datetime] = {}  # asset -> last order time
+        self._order_cooldown_seconds = 120  # 2 minutes cooldown per asset
+
         # Timing trackers
         self.last_market_refresh = None
         self.last_settlement_check = None
@@ -139,8 +143,48 @@ class TradingBot:
             return False
         self.risk_manager.initialize(initial_bankroll)
 
+        # Sync existing orders to prevent duplicates
+        await self._sync_existing_orders()
+
         logger.info("Trading bot initialized successfully")
         return True
+
+    async def _sync_existing_orders(self):
+        """Sync existing open orders from Polymarket to prevent duplicates."""
+        if self.client is None:
+            return
+
+        try:
+            from .execution.client import get_open_orders
+            open_orders = get_open_orders(self.client)
+
+            if not open_orders:
+                logger.info("No existing open orders found")
+                return
+
+            # Map token IDs to assets
+            token_to_asset = {
+                "btc": "BTC", "eth": "ETH", "sol": "SOL", "xrp": "XRP"
+            }
+
+            synced_assets = set()
+            for order in open_orders:
+                # Try to identify asset from order data
+                asset_id = order.get("asset_id", "").lower()
+                market = order.get("market", "").lower()
+
+                for key, asset in token_to_asset.items():
+                    if key in asset_id or key in market:
+                        synced_assets.add(asset)
+                        # Set cooldown so we don't trade this asset
+                        self._last_order_time[asset] = datetime.now(timezone.utc)
+                        break
+
+            if synced_assets:
+                logger.info(f"Synced existing orders for: {', '.join(synced_assets)}")
+
+        except Exception as e:
+            logger.warning(f"Could not sync existing orders: {e}")
 
     async def _display_startup_info(self):
         """
@@ -716,14 +760,25 @@ class TradingBot:
 
     async def _execute_signal(self, signal: Signal):
         """Execute a trading signal."""
+        asset = signal.market.asset
+        now = datetime.now(timezone.utc)
+
+        # Check cooldown - prevent rapid duplicate orders
+        if asset in self._last_order_time:
+            elapsed = (now - self._last_order_time[asset]).total_seconds()
+            if elapsed < self._order_cooldown_seconds:
+                remaining = self._order_cooldown_seconds - elapsed
+                logger.debug(f"[{asset}] Cooldown: {remaining:.0f}s remaining")
+                return
+
         # Get current price for logging
         current_price = self.signal_generator.get_price(signal.market.asset)
         target = signal.market.target_price
 
-        # Log the trade attempt with all relevant info
+        # Log the trade attempt
         direction = ">" if signal.side == Side.UP else "<"
         logger.info(
-            f">>> {signal.market.asset} {signal.side.value} | "
+            f">>> {asset} {signal.side.value} | "
             f"Edge: {signal.edge:.0%} | "
             f"${current_price:,.0f} {direction} ${target:,.0f} | "
             f"Size: ${signal.size_usd:.2f}"
@@ -733,6 +788,9 @@ class TradingBot:
         result = self.executor.execute_signal(signal)
 
         if result.success:
+            # Set cooldown for this asset
+            self._last_order_time[asset] = now
+
             # Record position with risk manager
             self.risk_manager.record_position_open(
                 signal=signal,
