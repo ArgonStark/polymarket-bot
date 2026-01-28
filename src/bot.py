@@ -1444,6 +1444,22 @@ class TradingBot:
                     self.clob_feed.unsubscribe(market.up_token_id)
                     self.clob_feed.unsubscribe(market.down_token_id)
 
+                    # IMPORTANT: Clear all tracking for this asset so new market can trade
+                    asset = market.asset
+
+                    # Clear cached API positions
+                    if hasattr(self, '_api_positions') and asset in self._api_positions:
+                        del self._api_positions[asset]
+                        logger.info(f"✅ Cleared cached position for {asset} after settlement")
+
+                    # Clear cooldown
+                    if asset in self._last_order_time:
+                        del self._last_order_time[asset]
+                        logger.debug(f"Cleared cooldown for {asset} after settlement")
+
+                    # Cancel any pending orders for this asset
+                    await self._cancel_pending_orders_for_asset(asset)
+
                     # Cleanup old settled markets (keep last 100)
                     if len(self.settled_markets) > 100:
                         self.settled_markets = set(list(self.settled_markets)[-100:])
