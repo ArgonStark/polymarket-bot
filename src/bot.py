@@ -1780,7 +1780,10 @@ class TradingBot:
 
         # Check if signal was rejected due to size
         if signal.size_usd <= 0 or signal.size_shares <= 0:
-            logger.debug(f"Signal for {market.asset} rejected: size too small")
+            size_key = f"{market.condition_id}:size_too_small"
+            if size_key not in self._logged_rejections:
+                self._logged_rejections.add(size_key)
+                logger.info(f"[{market.asset}] 📏 Size too small after adjustment - check bankroll")
             return
 
         # Trade history filter - check past performance for this asset/side
@@ -2048,18 +2051,30 @@ class TradingBot:
             elapsed = (now - self._last_order_time[asset]).total_seconds()
             if elapsed < self._order_cooldown_seconds:
                 remaining = self._order_cooldown_seconds - elapsed
-                logger.debug(f"[{asset}] Cooldown: {remaining:.0f}s remaining")
+                # Log once per cooldown period at INFO level so user knows why trades aren't executing
+                cooldown_key = f"{signal.market.condition_id}:cooldown"
+                if cooldown_key not in self._logged_rejections:
+                    self._logged_rejections.add(cooldown_key)
+                    logger.info(f"[{asset}] ⏳ Cooldown active: {remaining:.0f}s remaining")
                 return
 
         # Check for existing positions from API (prevents duplicate trades)
         if self._has_active_position(asset):
-            logger.debug(f"[{asset}] Already has active position - skipping")
+            # Log at INFO level - this is an important reason trades aren't executing
+            position_key = f"{signal.market.condition_id}:active_position"
+            if position_key not in self._logged_rejections:
+                self._logged_rejections.add(position_key)
+                logger.info(f"[{asset}] 📊 Already has active position - skipping signal")
             return
 
         # Check if we have enough balance before attempting
         available = self.risk_manager.current_bankroll * 0.90  # 10% buffer
         if signal.size_usd > available:
-            logger.debug(f"[{asset}] Insufficient balance: need ${signal.size_usd:.2f}, have ${available:.2f}")
+            # Log at INFO level - insufficient balance is critical info
+            balance_key = f"{signal.market.condition_id}:balance"
+            if balance_key not in self._logged_rejections:
+                self._logged_rejections.add(balance_key)
+                logger.info(f"[{asset}] 💰 Insufficient balance: need ${signal.size_usd:.2f}, have ${available:.2f}")
             # Set a short cooldown to prevent spam
             self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
             return
