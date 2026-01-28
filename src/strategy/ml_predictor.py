@@ -46,6 +46,7 @@ class TradeFeatures:
     - distance_from_target: How far current price is from target
     - binance_lead_pct: Binance price lead over Chainlink (faster indicator)
     - binance_confirmation: Confirmation signal type (STRONG, MEDIUM, WEAK, NONE)
+    - trend_1h/4h/1d: Multi-timeframe trend context for better decision making
     """
     # Core features
     edge: float  # Expected edge/profit margin
@@ -69,8 +70,14 @@ class TradeFeatures:
     binance_lead_pct: float = 0.0  # (Binance - Chainlink) / Chainlink
     binance_confirmation: str = "NONE"  # STRONG, MEDIUM, WEAK, NONE
 
+    # Multi-timeframe trends (context for ML decision making)
+    # These help the model understand broader market direction
+    trend_1h: float = 0.0   # 1-hour trend (-1 to +1)
+    trend_4h: float = 0.0   # 4-hour trend (-1 to +1)
+    trend_1d: float = 0.0   # 1-day trend (-1 to +1)
+
     def to_vector(self) -> list[float]:
-        """Convert to feature vector for model (26 features total)."""
+        """Convert to feature vector for model (29 features total)."""
         # Normalize features to roughly 0-1 range
         vector = [
             # Core features (6)
@@ -108,6 +115,10 @@ class TradeFeatures:
             1.0 if self.binance_confirmation == "WEAK" else 0.0,
             1.0 if self.binance_confirmation == "MEDIUM" else 0.0,
             1.0 if self.binance_confirmation == "STRONG" else 0.0,
+            # Multi-timeframe trends (3) - normalized from -1,1 to 0,1
+            (self.trend_1h + 1) / 2,
+            (self.trend_4h + 1) / 2,
+            (self.trend_1d + 1) / 2,
         ]
         return vector
 
@@ -130,6 +141,9 @@ class TradeFeatures:
             "distance_from_target": self.distance_from_target,
             "binance_lead_pct": self.binance_lead_pct,
             "binance_confirmation": self.binance_confirmation,
+            "trend_1h": self.trend_1h,
+            "trend_4h": self.trend_4h,
+            "trend_1d": self.trend_1d,
         }
 
     @classmethod
@@ -152,6 +166,9 @@ class TradeFeatures:
             distance_from_target=data.get("distance_from_target", 0.0),
             binance_lead_pct=data.get("binance_lead_pct", 0.0),
             binance_confirmation=data.get("binance_confirmation", "NONE"),
+            trend_1h=data.get("trend_1h", 0.0),
+            trend_4h=data.get("trend_4h", 0.0),
+            trend_1d=data.get("trend_1d", 0.0),
         )
 
 
@@ -161,12 +178,12 @@ class SimpleLogisticRegression:
     A simple logistic regression model that doesn't require sklearn.
     Uses online learning to update weights incrementally.
 
-    UPDATED: Now supports 26 features for enhanced ML integration including Binance data.
+    UPDATED: Now supports 29 features including multi-timeframe trends (1h, 4h, 1d).
     """
     weights: list[float] = field(default_factory=list)
     bias: float = 0.0
     learning_rate: float = 0.1
-    n_features: int = 26  # Number of features in TradeFeatures.to_vector()
+    n_features: int = 29  # Number of features in TradeFeatures.to_vector()
 
     def __post_init__(self):
         if not self.weights:
@@ -274,6 +291,9 @@ class MLSignalPredictor:
         distance_from_target: float = 0.0,
         binance_lead_pct: float = 0.0,
         binance_confirmation: str = "NONE",
+        trend_1h: float = 0.0,
+        trend_4h: float = 0.0,
+        trend_1d: float = 0.0,
     ) -> TradeFeatures:
         """
         Extract features from a trading signal.
@@ -290,6 +310,9 @@ class MLSignalPredictor:
             distance_from_target: How far current price is from target
             binance_lead_pct: Binance price lead over Chainlink (as decimal)
             binance_confirmation: Confirmation type (STRONG, MEDIUM, WEAK, NONE)
+            trend_1h: 1-hour price trend (-1 to +1)
+            trend_4h: 4-hour price trend (-1 to +1)
+            trend_1d: 1-day price trend (-1 to +1)
         """
         now = datetime.now(timezone.utc)
 
@@ -314,7 +337,35 @@ class MLSignalPredictor:
             distance_from_target=distance_from_target,
             binance_lead_pct=binance_lead_pct,
             binance_confirmation=binance_confirmation,
+            trend_1h=trend_1h,
+            trend_4h=trend_4h,
+            trend_1d=trend_1d,
         )
+
+    def _get_gradual_threshold(self) -> float:
+        """
+        Get the ML confidence threshold based on training samples.
+
+        Uses a gradual ramp-up to collect more diverse training data
+        before applying strict filtering:
+        - 0-10 samples: Learning mode (allow all)
+        - 10-20 samples: 50% threshold
+        - 20-30 samples: 55% threshold
+        - 30+ samples: 60% threshold
+
+        Returns:
+            Current confidence threshold (0.0 to 1.0)
+        """
+        samples = self.training_samples
+
+        if samples < 10:
+            return 0.0  # Learning mode - allow all
+        elif samples < 20:
+            return 0.50  # Early filtering - 50%
+        elif samples < 30:
+            return 0.55  # Medium filtering - 55%
+        else:
+            return 0.60  # Full filtering - 60%
 
     def should_trade(
         self,
@@ -329,9 +380,18 @@ class MLSignalPredictor:
         distance_from_target: float = 0.0,
         binance_lead_pct: float = 0.0,
         binance_confirmation: str = "NONE",
+        trend_1h: float = 0.0,
+        trend_4h: float = 0.0,
+        trend_1d: float = 0.0,
     ) -> tuple[bool, float, str]:
         """
         Decide if we should take this trade based on ML prediction.
+
+        Uses gradual threshold ramp-up:
+        - 0-10 samples: Learning mode (allow all)
+        - 10-20 samples: 50% threshold
+        - 20-30 samples: 55% threshold
+        - 30+ samples: 60% threshold
 
         Args:
             signal: Trading signal
@@ -345,19 +405,26 @@ class MLSignalPredictor:
             distance_from_target: Distance from target price
             binance_lead_pct: Binance price lead over Chainlink
             binance_confirmation: Confirmation type (STRONG, MEDIUM, WEAK, NONE)
+            trend_1h: 1-hour price trend (-1 to +1)
+            trend_4h: 4-hour price trend (-1 to +1)
+            trend_1d: 1-day price trend (-1 to +1)
 
         Returns:
             Tuple of (should_trade, confidence, reason)
         """
-        # Not enough training data yet - allow trades to collect data
-        if self.training_samples < self.min_training_samples:
-            return (True, 0.5, f"Learning mode ({self.training_samples}/{self.min_training_samples} samples)")
+        # Get current threshold based on training samples
+        threshold = self._get_gradual_threshold()
+
+        # Learning mode - allow all trades to collect training data
+        if threshold == 0.0:
+            return (True, 0.5, f"Learning mode ({self.training_samples}/10 samples)")
 
         # Extract features and predict
         features = self.extract_features(
             signal, volatility, price_momentum, arb_type,
             spread, bid_depth, ask_depth, price_trend, distance_from_target,
-            binance_lead_pct, binance_confirmation
+            binance_lead_pct, binance_confirmation,
+            trend_1h, trend_4h, trend_1d
         )
         feature_vector = features.to_vector()
         confidence = self.model.predict_proba(feature_vector)
@@ -365,10 +432,11 @@ class MLSignalPredictor:
         # Log feature importance info for debugging
         arb_info = f" [ARB: {arb_type}]" if arb_type != "none" else ""
         bn_info = f" [BN: {binance_confirmation}]" if binance_confirmation != "NONE" else ""
-        if confidence < self.min_confidence:
-            return (False, confidence, f"ML rejected: {confidence:.0%} < {self.min_confidence:.0%}{arb_info}{bn_info}")
+
+        if confidence < threshold:
+            return (False, confidence, f"ML rejected: {confidence:.0%} < {threshold:.0%}{arb_info}{bn_info}")
         else:
-            return (True, confidence, f"ML confidence: {confidence:.0%}{arb_info}{bn_info}")
+            return (True, confidence, f"ML confidence: {confidence:.0%} (threshold: {threshold:.0%}){arb_info}{bn_info}")
 
     def record_outcome(
         self,
@@ -384,6 +452,9 @@ class MLSignalPredictor:
         distance_from_target: float = 0.0,
         binance_lead_pct: float = 0.0,
         binance_confirmation: str = "NONE",
+        trend_1h: float = 0.0,
+        trend_4h: float = 0.0,
+        trend_1d: float = 0.0,
     ):
         """
         Record a trade outcome and update the model.
@@ -401,11 +472,15 @@ class MLSignalPredictor:
             distance_from_target: Distance from target at trade time
             binance_lead_pct: Binance price lead over Chainlink at trade time
             binance_confirmation: Confirmation type at trade time
+            trend_1h: 1-hour price trend (-1 to +1)
+            trend_4h: 4-hour price trend (-1 to +1)
+            trend_1d: 1-day price trend (-1 to +1)
         """
         features = self.extract_features(
             signal, volatility, price_momentum, arb_type,
             spread, bid_depth, ask_depth, price_trend, distance_from_target,
-            binance_lead_pct, binance_confirmation
+            binance_lead_pct, binance_confirmation,
+            trend_1h, trend_4h, trend_1d
         )
         feature_vector = features.to_vector()
 
@@ -497,16 +572,17 @@ class MLSignalPredictor:
                 # Check if we need to migrate feature counts
                 # 11 -> 21: Added arb type and market features
                 # 21 -> 26: Added Binance confirmation features
-                expected_features = 26
+                # 26 -> 29: Added multi-timeframe trends (1h, 4h, 1d)
+                expected_features = 29
                 import random
                 random.seed(42)
 
                 if len(old_weights) == 11:
                     logger.info(
-                        f"🤖 Migrating ML model from 11 to 26 features (adding arb + Binance)..."
+                        f"🤖 Migrating ML model from 11 to 29 features (adding arb + Binance + trends)..."
                     )
                     # Extend weights with small random values for new features
-                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(15)]
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(18)]
                     model_data["weights"] = new_weights
                     # Reset training samples since feature set changed significantly
                     self.training_samples = max(0, data.get("training_samples", 0) // 2)
@@ -517,17 +593,31 @@ class MLSignalPredictor:
                     )
                 elif len(old_weights) == 21:
                     logger.info(
-                        f"🤖 Migrating ML model from 21 to 26 features (adding Binance)..."
+                        f"🤖 Migrating ML model from 21 to 29 features (adding Binance + trends)..."
                     )
-                    # Extend weights for Binance features only
-                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(5)]
+                    # Extend weights for Binance + trend features
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(8)]
                     model_data["weights"] = new_weights
                     # Keep most training data, slight reset since new features added
                     self.training_samples = max(0, int(data.get("training_samples", 0) * 0.75))
                     self.predictions_made = int(data.get("predictions_made", 0) * 0.75)
                     self.correct_predictions = int(data.get("correct_predictions", 0) * 0.75)
                     logger.info(
-                        f"🤖 Migration complete - model will retrain with Binance features"
+                        f"🤖 Migration complete - model will retrain with Binance + trend features"
+                    )
+                elif len(old_weights) == 26:
+                    logger.info(
+                        f"🤖 Migrating ML model from 26 to 29 features (adding multi-timeframe trends)..."
+                    )
+                    # Extend weights for trend features only (3 new: trend_1h, trend_4h, trend_1d)
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(3)]
+                    model_data["weights"] = new_weights
+                    # Keep most training data since this is a minor addition
+                    self.training_samples = max(0, int(data.get("training_samples", 0) * 0.9))
+                    self.predictions_made = int(data.get("predictions_made", 0) * 0.9)
+                    self.correct_predictions = int(data.get("correct_predictions", 0) * 0.9)
+                    logger.info(
+                        f"🤖 Migration complete - model will retrain with multi-timeframe trend features"
                     )
                 else:
                     self.training_samples = data.get("training_samples", 0)
@@ -656,6 +746,21 @@ def extract_ml_features_from_market(
         binance_lead_pct = binance_conf.get("lead_pct", 0.0) or 0.0
         binance_confirmation = binance_conf.get("confirmation_type", "NONE")
 
+    # Multi-timeframe trends from Binance (1h, 4h, 1d)
+    # These provide broader market context for better ML decision making
+    trend_1h = 0.0
+    trend_4h = 0.0
+    trend_1d = 0.0
+
+    try:
+        from ..data.binance import get_multi_timeframe_trends
+        trends = get_multi_timeframe_trends(market.asset)
+        trend_1h = trends.get("trend_1h", 0.0)
+        trend_4h = trends.get("trend_4h", 0.0)
+        trend_1d = trends.get("trend_1d", 0.0)
+    except Exception as e:
+        logger.debug(f"Could not fetch multi-timeframe trends: {e}")
+
     return {
         "volatility": volatility,
         "price_momentum": price_momentum,
@@ -667,4 +772,7 @@ def extract_ml_features_from_market(
         "distance_from_target": distance_from_target,
         "binance_lead_pct": binance_lead_pct,
         "binance_confirmation": binance_confirmation,
+        "trend_1h": trend_1h,
+        "trend_4h": trend_4h,
+        "trend_1d": trend_1d,
     }

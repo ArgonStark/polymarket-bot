@@ -224,6 +224,11 @@ class RiskManager:
         ml_ask_depth: Optional[float] = None,
         ml_price_trend: Optional[float] = None,
         ml_distance_from_target: Optional[float] = None,
+        ml_binance_lead_pct: Optional[float] = None,
+        ml_binance_confirmation: Optional[str] = None,
+        ml_trend_1h: Optional[float] = None,
+        ml_trend_4h: Optional[float] = None,
+        ml_trend_1d: Optional[float] = None,
     ):
         """
         Record a new position being opened.
@@ -241,6 +246,11 @@ class RiskManager:
             ml_ask_depth: ML feature - ask depth at entry
             ml_price_trend: ML feature - price trend at entry
             ml_distance_from_target: ML feature - distance from target at entry
+            ml_binance_lead_pct: ML feature - Binance price lead percentage
+            ml_binance_confirmation: ML feature - Binance confirmation type
+            ml_trend_1h: ML feature - 1-hour trend
+            ml_trend_4h: ML feature - 4-hour trend
+            ml_trend_1d: ML feature - 1-day trend
         """
         market_key = signal.market.condition_id
 
@@ -264,6 +274,11 @@ class RiskManager:
             ml_ask_depth=ml_ask_depth,
             ml_price_trend=ml_price_trend,
             ml_distance_from_target=ml_distance_from_target,
+            ml_binance_lead_pct=ml_binance_lead_pct,
+            ml_binance_confirmation=ml_binance_confirmation,
+            ml_trend_1h=ml_trend_1h,
+            ml_trend_4h=ml_trend_4h,
+            ml_trend_1d=ml_trend_1d,
         )
 
         self.positions[market_key] = position
