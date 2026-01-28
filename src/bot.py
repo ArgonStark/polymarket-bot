@@ -28,6 +28,7 @@ from .strategy.ml_predictor import (
     extract_ml_features_from_market,
     calculate_price_trend,
 )
+from .strategy.trade_history import get_trade_history
 from .utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
 
 
@@ -533,6 +534,74 @@ class TradingBot:
             "Daily Loss Limit": self.config.trading.daily_loss_limit,
             "Supported Assets": ", ".join(self.config.supported_assets),
         })
+
+        # Display trade history summary
+        await self._display_trade_history_summary()
+
+    async def _display_trade_history_summary(self):
+        """Display trade history performance summary at startup."""
+        trade_history = get_trade_history()
+        summary = trade_history.get_performance_summary()
+
+        if not summary.get("has_data"):
+            logger.info(
+                f"{Colors.DIM}📊 No trade history yet - will learn from your trades{Colors.RESET}"
+            )
+            return
+
+        # Build summary display
+        completed = summary["completed_trades"]
+        win_rate = summary["win_rate"]
+        total_pnl = summary["total_pnl"]
+        pred_accuracy = summary["prediction_accuracy"]
+
+        # Color based on performance
+        win_color = Colors.BRIGHT_GREEN if win_rate >= 0.5 else Colors.BRIGHT_YELLOW if win_rate >= 0.4 else Colors.BRIGHT_RED
+        pnl_color = Colors.BRIGHT_GREEN if total_pnl > 0 else Colors.BRIGHT_RED
+
+        logger.info(
+            f"{Colors.BRIGHT_CYAN}📊 TRADE HISTORY REVIEW{Colors.RESET}"
+        )
+        logger.info(
+            f"   Completed: {completed} trades | "
+            f"{win_color}Win Rate: {win_rate:.0%}{Colors.RESET} | "
+            f"{pnl_color}P&L: ${total_pnl:+.2f}{Colors.RESET}"
+        )
+
+        # Show recent performance
+        recent_rate = summary.get("recent_win_rate", 0)
+        recent_pnl = summary.get("recent_pnl", 0)
+        recent_count = summary.get("recent_trades", 0)
+        if recent_count > 0:
+            recent_color = Colors.BRIGHT_GREEN if recent_rate >= 0.5 else Colors.BRIGHT_YELLOW if recent_rate >= 0.4 else Colors.BRIGHT_RED
+            logger.info(
+                f"   Recent ({recent_count}): {recent_color}{recent_rate:.0%} win{Colors.RESET} | "
+                f"${recent_pnl:+.2f}"
+            )
+
+        # Show ML prediction accuracy if available
+        if summary.get("predictions_made", 0) > 0:
+            pred_color = Colors.BRIGHT_GREEN if pred_accuracy >= 0.5 else Colors.BRIGHT_YELLOW if pred_accuracy >= 0.45 else Colors.BRIGHT_RED
+            logger.info(
+                f"   ML Predictions: {pred_color}{pred_accuracy:.0%} accurate{Colors.RESET} "
+                f"({summary['predictions_made']} predictions)"
+            )
+
+        # Show blocked assets/sides based on history
+        blocked = []
+        for asset in self.config.supported_assets:
+            should_trade, reason = trade_history.should_trade_asset(
+                asset,
+                min_trades=self.config.trading.history_min_trades,
+                min_win_rate=self.config.trading.history_min_win_rate,
+            )
+            if not should_trade:
+                blocked.append(f"{asset} ({reason.split()[3]})")  # Extract win rate
+
+        if blocked:
+            logger.warning(
+                f"   {Colors.BRIGHT_RED}⚠️ Blocked assets: {', '.join(blocked)}{Colors.RESET}"
+            )
 
     async def start(self):
         """Start the trading bot."""
@@ -1150,28 +1219,67 @@ class TradingBot:
             pnl=pnl,
         )
 
+        # Record with trade history
+        trade_history = get_trade_history()
+        trade_history.record_close(
+            market_id=market.condition_id,
+            won=won,
+            pnl=pnl,
+            exit_price=1.0 if won else 0.0,
+        )
+
         # Record ML outcome for model learning
-        if self.ml_predictor and position.ml_volatility is not None:
-            # We need to recreate the signal to record the outcome
-            # Create a minimal signal-like object for ML recording
+        # Always try to record if ML is enabled - extract features if not stored
+        if self.ml_predictor:
             from types import SimpleNamespace
+
+            # Get ML features - either from stored position data or extract now
+            if position.ml_volatility is not None:
+                # Use stored ML data
+                volatility = position.ml_volatility
+                momentum = position.ml_momentum or 0.0
+                arb_type = position.ml_arb_type or "none"
+                spread = position.ml_spread or 0.0
+                bid_depth = position.ml_bid_depth or 0.0
+                ask_depth = position.ml_ask_depth or 0.0
+                price_trend = position.ml_price_trend or 0.0
+                distance_from_target = position.ml_distance_from_target or 0.0
+            else:
+                # Extract features now (for positions without stored ML data)
+                volatility = self.signal_generator.get_volatility(market.asset)
+                current_price = self.signal_generator.get_price(market.asset)
+                momentum = 0.0
+                if current_price and market.target_price:
+                    momentum = (current_price - market.target_price) / market.target_price
+                    momentum = max(-1, min(1, momentum * 10))
+                arb_type = "none"
+                spread = market.best_ask - market.best_bid if market.best_ask and market.best_bid else 0.0
+                bid_depth = market.bid_depth
+                ask_depth = market.ask_depth
+                price_trend = 0.0
+                distance_from_target = 0.0
+                if current_price and market.target_price:
+                    distance_from_target = abs(current_price - market.target_price) / market.target_price
+
+                logger.debug(f"Extracted ML features at settlement for {market.asset}")
+
             fake_signal = SimpleNamespace(
-                edge=0.0,  # Not needed for outcome
+                edge=0.0,
                 market=market,
                 side=position.side,
-                _arb_type=position.ml_arb_type,  # Pass arb type to extract_features
+                _arb_type=arb_type,
             )
             self.ml_predictor.record_outcome(
                 signal=fake_signal,
-                volatility=position.ml_volatility,
-                price_momentum=position.ml_momentum or 0.0,
+                volatility=volatility,
+                price_momentum=momentum,
                 won=won,
-                arb_type=position.ml_arb_type or "none",
-                spread=position.ml_spread or 0.0,
-                bid_depth=position.ml_bid_depth or 0.0,
-                ask_depth=position.ml_ask_depth or 0.0,
-                price_trend=position.ml_price_trend or 0.0,
-                distance_from_target=position.ml_distance_from_target or 0.0,
+                arb_type=arb_type,
+                spread=spread,
+                bid_depth=bid_depth,
+                ask_depth=ask_depth,
+                price_trend=price_trend,
+                distance_from_target=distance_from_target,
             )
 
     async def _process_market(self, market: MarketState):
@@ -1243,6 +1351,23 @@ class TradingBot:
         # Check if signal was rejected due to size
         if signal.size_usd <= 0 or signal.size_shares <= 0:
             logger.debug(f"Signal for {market.asset} rejected: size too small")
+            return
+
+        # Trade history filter - check past performance for this asset/side
+        trade_history = get_trade_history()
+        should_proceed, history_reason = trade_history.evaluate_trade(
+            asset=market.asset,
+            side=signal.side.value,
+            min_trades=self.config.trading.history_min_trades,
+            min_win_rate=self.config.trading.history_min_win_rate,
+            check_prediction_accuracy=True,
+            min_prediction_accuracy=self.config.trading.history_min_prediction_accuracy,
+        )
+        if not should_proceed:
+            rejection_key = f"{market.condition_id}:history:{signal.side.value}"
+            if rejection_key not in self._logged_rejections:
+                self._logged_rejections.add(rejection_key)
+                logger.info(f"[{market.asset}] 📊 History block: {history_reason}")
             return
 
         # ML filter - check predicted win probability
@@ -1461,6 +1586,22 @@ class TradingBot:
                     ml_price_trend=ml_price_trend,
                     ml_distance_from_target=ml_distance_from_target,
                 )
+
+                # Record in trade history
+                trade_history = get_trade_history()
+                trade_history.record_open(
+                    asset=asset,
+                    side=signal.side.value,
+                    entry_price=result.filled_price or signal.recommended_price,
+                    shares=result.filled_size,
+                    target_price=signal.market.target_price,
+                    chainlink_price=current_price,
+                    market_id=signal.market.condition_id,
+                    predicted_prob=ml_confidence,
+                    arb_type=ml_arb_type or "none",
+                    edge=signal.edge,
+                )
+
                 logger.info(f"    {Colors.BRIGHT_GREEN}✓ FILLED @ {result.filled_price:.2f}{conf_str}{arb_str}{Colors.RESET}")
 
                 # Log positions AFTER trade
