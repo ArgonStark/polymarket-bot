@@ -108,7 +108,7 @@ class TradingBot:
 
         # Cooldown tracking - prevent duplicate orders per asset
         self._last_order_time: dict[str, datetime] = {}  # asset -> last order time
-        self._order_cooldown_seconds = 120  # 2 minutes cooldown per asset
+        self._order_cooldown_seconds = config.trading.order_cooldown_seconds  # Configurable (default 15s)
 
         # Cached API positions (updated by _sync_existing_orders)
         self._api_positions: dict[str, dict] = {}  # asset -> position info
@@ -964,8 +964,24 @@ class TradingBot:
                     if random.random() < 0.02:
                         self._log_status_line()
 
-                for market in list(self.markets.values()):
-                    await self._process_market(market)
+                # Sort markets by asset priority (BTC/ETH first for better liquidity)
+                priority = self.config.trading.asset_priority
+                sorted_markets = sorted(
+                    self.markets.values(),
+                    key=lambda m: priority.index(m.asset) if m.asset in priority else 99
+                )
+
+                # Process markets - parallel or sequential based on config
+                if self.config.trading.parallel_execution:
+                    # Parallel execution - process all markets simultaneously
+                    await asyncio.gather(
+                        *[self._process_market(m) for m in sorted_markets],
+                        return_exceptions=True
+                    )
+                else:
+                    # Sequential execution
+                    for market in sorted_markets:
+                        await self._process_market(market)
 
                 # Wait before next iteration
                 await asyncio.sleep(self.config.loop_interval)
