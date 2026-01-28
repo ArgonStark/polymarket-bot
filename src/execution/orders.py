@@ -402,6 +402,104 @@ class OrderExecutor:
                 error_message=f"Unknown action: {signal.recommended_action}",
             )
 
+    def sell_position(
+        self,
+        token_id: str,
+        shares: float,
+        min_price: float = 0.01,
+    ) -> TradeResult:
+        """
+        Sell an existing position (early exit).
+
+        Used for take-profit and stop-loss exits.
+
+        Args:
+            token_id: Token ID to sell
+            shares: Number of shares to sell
+            min_price: Minimum acceptable price (for slippage control)
+
+        Returns:
+            TradeResult with execution details
+        """
+        if self.config.dry_run:
+            logger.info(
+                f"[DRY RUN] SELL {shares:.2f} shares "
+                f"for {token_id[:16]}... (min price: {min_price:.4f})"
+            )
+            return TradeResult(
+                success=True,
+                order_id="dry_run_sell",
+                filled_size=shares,
+                filled_price=min_price,
+            )
+
+        try:
+            # Use aggressive price to ensure fill (market sell)
+            # We set a minimum but aim to fill quickly
+            price = max(0.01, min_price)
+            shares = max(0.01, shares)
+
+            order_args = OrderArgs(
+                price=price,
+                size=shares,
+                side=SELL,
+                token_id=token_id,
+            )
+
+            signed_order = self.client.create_order(order_args)
+
+            # Use FOK for immediate fill or GTC for resting order
+            # FOK ensures we either exit now or not at all
+            response = self.client.post_order(signed_order, OrderType.FOK)
+
+            # Log raw response for debugging
+            logger.debug(f"Sell order response: {response}")
+
+            # Validate response
+            is_valid, error_msg = _validate_order_response(response)
+            if not is_valid:
+                # Try GTC if FOK fails (allow partial fills)
+                logger.warning(f"FOK sell failed ({error_msg}), trying GTC...")
+                signed_order = self.client.create_order(order_args)
+                response = self.client.post_order(signed_order, OrderType.GTC)
+                is_valid, error_msg = _validate_order_response(response)
+
+                if not is_valid:
+                    logger.error(f"Sell order rejected: {error_msg}")
+                    return TradeResult(success=False, error_message=error_msg)
+
+            order_id = response.get("orderID") or response.get("order_id", "")
+
+            # Extract fill information
+            filled_size_raw = response.get("filledSize") or response.get("size_matched", 0)
+            filled_price_raw = response.get("avgPrice") or response.get("price", price)
+            try:
+                filled_size = float(filled_size_raw) if filled_size_raw else shares
+                filled_price = float(filled_price_raw) if filled_price_raw else price
+            except (ValueError, TypeError):
+                filled_size = shares
+                filled_price = price
+
+            logger.info(
+                f"SELL ORDER executed: {shares:.2f} shares "
+                f"filled {filled_size:.2f} @ {filled_price:.4f} "
+                f"- Order ID: {order_id[:16]}..."
+            )
+
+            return TradeResult(
+                success=True,
+                order_id=order_id,
+                filled_size=filled_size,
+                filled_price=filled_price,
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to sell position: {e}")
+            return TradeResult(
+                success=False,
+                error_message=str(e),
+            )
+
     def cancel_order(self, order_id: str) -> bool:
         """
         Cancel a specific order.

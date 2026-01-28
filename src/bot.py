@@ -124,6 +124,8 @@ class TradingBot:
         self.balance_sync_interval = 30.0  # Sync balance every 30s
         self.orders_sync_interval = 60.0  # Sync open orders every 60s
         self.period_transition_delay = 5.0  # Seconds to wait after period boundary for price data
+        self.position_log_interval = 30.0  # Log position status every 30s
+        self.last_position_log = None  # Track last position log time
 
         # Control flags
         self._running = False
@@ -766,11 +768,22 @@ class TradingBot:
                 # Check pending orders for fills
                 await self._check_pending_orders()
 
+                # Check positions for early exit (take-profit / stop-loss)
+                if self.config.trading.early_exit_enabled:
+                    await self._check_early_exits()
+
                 # Move expiring markets out of active trading
                 await self._check_expiring_markets()
 
-                # Check if trading is allowed
-                can_trade, reason = self.risk_manager.can_trade()
+                # Log position status periodically (every 30s)
+                self._log_position_status()
+
+                # Calculate equity (cash + unrealized position value)
+                # This prevents false drawdown triggers when positions are open
+                equity = self._calculate_equity()
+
+                # Check if trading is allowed (use equity for drawdown check)
+                can_trade, reason = self.risk_manager.can_trade(equity=equity)
                 if not can_trade:
                     logger.warning(f"Trading paused: {reason}")
                     await asyncio.sleep(60.0)
@@ -1019,6 +1032,232 @@ class TradingBot:
             finally:
                 # Remove from pending regardless of cancel success
                 self._pending_orders.pop(order_id, None)
+
+    async def _check_early_exits(self):
+        """
+        Check open positions for take-profit or stop-loss conditions.
+
+        For each position:
+        1. Get current market price from order book
+        2. Calculate unrealized P&L percentage
+        3. If >= take_profit_pct: sell to lock in profit
+        4. If <= -stop_loss_pct: sell to limit loss
+        """
+        if not self.risk_manager.positions:
+            return
+
+        now = datetime.now(timezone.utc)
+        trading = self.config.trading
+
+        for market_key, position in list(self.risk_manager.positions.items()):
+            try:
+                # Check minimum hold time
+                hold_time = (now - position.entry_time).total_seconds()
+                if hold_time < trading.early_exit_min_hold_time:
+                    continue
+
+                # Find the market (in active or expiring)
+                market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
+                if not market:
+                    continue
+
+                # Get current market price for our position side
+                if position.side == Side.UP:
+                    current_price = market.best_bid  # Selling UP, get bid
+                else:
+                    # For DOWN, price is 1 - UP_ask (we sell DOWN = buy UP at ask)
+                    current_price = 1.0 - market.best_ask if market.best_ask else None
+
+                if current_price is None or current_price <= 0:
+                    continue
+
+                # Calculate unrealized P&L percentage
+                entry_price = position.entry_price
+                pnl_pct = (current_price - entry_price) / entry_price
+
+                # Check take-profit
+                if pnl_pct >= trading.take_profit_pct:
+                    logger.info(
+                        f"{Colors.BRIGHT_GREEN}💰 TAKE PROFIT: {market.asset} {position.side.value} | "
+                        f"P&L: {pnl_pct:+.0%} | Entry: {entry_price:.2f} → Exit: {current_price:.2f}{Colors.RESET}"
+                    )
+                    await self._execute_early_exit(market, position, current_price, "take_profit")
+                    continue
+
+                # Check stop-loss
+                if pnl_pct <= -trading.stop_loss_pct:
+                    logger.info(
+                        f"{Colors.BRIGHT_RED}🛑 STOP LOSS: {market.asset} {position.side.value} | "
+                        f"P&L: {pnl_pct:+.0%} | Entry: {entry_price:.2f} → Exit: {current_price:.2f}{Colors.RESET}"
+                    )
+                    await self._execute_early_exit(market, position, current_price, "stop_loss")
+                    continue
+
+            except Exception as e:
+                logger.error(f"Error checking early exit for {market_key}: {e}")
+
+    async def _execute_early_exit(
+        self,
+        market: MarketState,
+        position,
+        exit_price: float,
+        exit_reason: str,
+    ):
+        """
+        Execute early exit (sell position before settlement).
+
+        Args:
+            market: Market state
+            position: Position to exit
+            exit_price: Price to sell at
+            exit_reason: "take_profit" or "stop_loss"
+        """
+        if self.config.dry_run:
+            logger.info(f"[DRY RUN] Would sell {position.shares:.2f} shares at {exit_price:.4f}")
+            # Still process the exit for tracking
+            pnl = (exit_price - position.entry_price) * position.shares
+            await self._process_early_exit_result(market, position, exit_price, pnl, exit_reason)
+            return
+
+        if not self.executor:
+            logger.warning("No executor available for early exit")
+            return
+
+        try:
+            # Create a sell signal
+            from .models import Signal, OrderAction
+            sell_signal = Signal(
+                market=market,
+                side=position.side,
+                recommended_action=OrderAction.MARKET,  # Market order for quick exit
+                recommended_price=exit_price,
+                size_usd=position.shares * exit_price,
+                size_shares=position.shares,
+                edge=0.0,  # Not relevant for exit
+                reasoning=f"Early exit: {exit_reason}",
+            )
+
+            # Execute sell order
+            result = self.executor.sell_position(
+                token_id=position.token_id,
+                shares=position.shares,
+                min_price=exit_price * 0.98,  # Allow 2% slippage
+            )
+
+            if result and result.success:
+                actual_price = result.filled_price or exit_price
+                pnl = (actual_price - position.entry_price) * position.shares
+                logger.info(
+                    f"✅ Early exit executed: {market.asset} {position.side.value} | "
+                    f"Sold {result.filled_size:.2f} @ {actual_price:.4f} | P&L: ${pnl:+.2f}"
+                )
+                await self._process_early_exit_result(market, position, actual_price, pnl, exit_reason)
+            else:
+                error_msg = result.error_message if result else "Unknown error"
+                logger.warning(f"Early exit failed: {error_msg}")
+
+        except Exception as e:
+            logger.error(f"Error executing early exit: {e}")
+
+    async def _process_early_exit_result(
+        self,
+        market: MarketState,
+        position,
+        exit_price: float,
+        pnl: float,
+        exit_reason: str,
+    ):
+        """
+        Process the result of an early exit - update tracking, ML, etc.
+
+        Args:
+            market: Market state
+            position: Closed position
+            exit_price: Actual exit price
+            pnl: Realized P&L
+            exit_reason: "take_profit" or "stop_loss"
+        """
+        won = pnl > 0
+
+        # Record with risk manager
+        self.risk_manager.record_position_close(
+            market_key=market.condition_id,
+            exit_price=exit_price,
+            pnl=pnl,
+        )
+
+        # Record with trade history (mark as early exit)
+        trade_history = get_trade_history()
+        trade_history.record_close(
+            market_id=market.condition_id,
+            won=won,
+            pnl=pnl,
+            exit_price=exit_price,
+        )
+
+        # Record ML outcome - this helps ML learn which trades were good
+        if self.ml_predictor:
+            from types import SimpleNamespace
+
+            # Get ML features
+            if position.ml_volatility is not None:
+                volatility = position.ml_volatility
+                momentum = position.ml_momentum or 0.0
+                arb_type = position.ml_arb_type or "none"
+                spread = position.ml_spread or 0.0
+                bid_depth = position.ml_bid_depth or 0.0
+                ask_depth = position.ml_ask_depth or 0.0
+                price_trend = position.ml_price_trend or 0.0
+                distance_from_target = position.ml_distance_from_target or 0.0
+            else:
+                volatility = self.signal_generator.get_volatility(market.asset)
+                current_price = self.signal_generator.get_price(market.asset)
+                momentum = 0.0
+                if current_price and market.target_price:
+                    momentum = (current_price - market.target_price) / market.target_price
+                    momentum = max(-1, min(1, momentum * 10))
+                arb_type = "none"
+                spread = market.best_ask - market.best_bid if market.best_ask and market.best_bid else 0.0
+                bid_depth = market.bid_depth
+                ask_depth = market.ask_depth
+                price_trend = 0.0
+                distance_from_target = 0.0
+                if current_price and market.target_price:
+                    distance_from_target = abs(current_price - market.target_price) / market.target_price
+
+            fake_signal = SimpleNamespace(
+                edge=0.0,
+                market=market,
+                side=position.side,
+                _arb_type=arb_type,
+            )
+
+            # Record with early exit flag
+            self.ml_predictor.record_outcome(
+                signal=fake_signal,
+                volatility=volatility,
+                price_momentum=momentum,
+                won=won,
+                arb_type=arb_type,
+                spread=spread,
+                bid_depth=bid_depth,
+                ask_depth=ask_depth,
+                price_trend=price_trend,
+                distance_from_target=distance_from_target,
+            )
+
+        # Clear asset cooldown so we can trade again
+        asset = market.asset
+        if asset in self._last_order_time:
+            del self._last_order_time[asset]
+
+        # Log summary
+        result_emoji = "💰" if exit_reason == "take_profit" else "🛑"
+        logger.info(
+            f"{result_emoji} EARLY EXIT COMPLETE: {market.asset} | "
+            f"Reason: {exit_reason} | P&L: ${pnl:+.2f} | "
+            f"Bankroll: ${self.risk_manager.current_bankroll:.2f}"
+        )
 
     async def _check_settlements(self):
         """
@@ -1463,6 +1702,109 @@ class TradingBot:
             status_parts.append(f"{Colors.DIM}{price_str}{Colors.RESET}")
 
         logger.info(" │ ".join(status_parts))
+
+    def _calculate_equity(self) -> float:
+        """
+        Calculate current equity: cash + unrealized position value.
+
+        For each open position, estimate its current value based on
+        order book prices. This gives a more accurate picture of
+        actual account value than just looking at cash.
+
+        Returns:
+            Total equity (cash + unrealized position value)
+        """
+        cash = self.risk_manager.current_bankroll
+        unrealized_value = 0.0
+
+        for market_key, position in self.risk_manager.positions.items():
+            # Find the market
+            market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
+            if not market:
+                # If we can't find market, use cost basis as conservative estimate
+                unrealized_value += position.cost_basis
+                continue
+
+            # Get current market price for our side
+            if position.side == Side.UP:
+                current_price = market.best_bid  # What we could sell for
+            else:
+                # For DOWN, value is 1 - UP_ask
+                current_price = 1.0 - market.best_ask if market.best_ask else None
+
+            if current_price and current_price > 0:
+                # Current value = shares * current price
+                unrealized_value += position.shares * current_price
+            else:
+                # Fallback to cost basis
+                unrealized_value += position.cost_basis
+
+        return cash + unrealized_value
+
+    def _log_position_status(self):
+        """
+        Log detailed position status including unrealized P&L.
+
+        Called periodically (every 30s) to give visibility into position performance.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Check if it's time to log
+        if self.last_position_log:
+            elapsed = (now - self.last_position_log).total_seconds()
+            if elapsed < self.position_log_interval:
+                return
+        self.last_position_log = now
+
+        positions = self.risk_manager.positions
+        if not positions:
+            return  # Nothing to log
+
+        # Calculate equity
+        equity = self._calculate_equity()
+        cash = self.risk_manager.current_bankroll
+        unrealized_total = equity - cash
+
+        logger.info(f"{Colors.BRIGHT_CYAN}📊 POSITION STATUS{Colors.RESET}")
+        logger.info(
+            f"   Cash: ${cash:.2f} | Unrealized: ${unrealized_total:+.2f} | "
+            f"Equity: ${equity:.2f}"
+        )
+
+        for market_key, position in positions.items():
+            market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
+            asset = position.market.asset if hasattr(position, 'market') else "???"
+            side = position.side.value
+
+            # Calculate unrealized P&L
+            current_price = None
+            if market:
+                if position.side == Side.UP:
+                    current_price = market.best_bid
+                else:
+                    current_price = 1.0 - market.best_ask if market.best_ask else None
+
+            if current_price and current_price > 0:
+                current_value = position.shares * current_price
+                unrealized_pnl = current_value - position.cost_basis
+                pnl_pct = (current_price - position.entry_price) / position.entry_price
+
+                # Color based on P&L
+                pnl_color = Colors.BRIGHT_GREEN if unrealized_pnl > 0 else Colors.BRIGHT_RED
+
+                # Time remaining
+                time_remaining = market.time_remaining if market else 0
+
+                logger.info(
+                    f"   {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} → "
+                    f"{current_price:.2f} | {pnl_color}P&L: ${unrealized_pnl:+.2f} ({pnl_pct:+.0%}){Colors.RESET} | "
+                    f"Time: {time_remaining:.0f}s"
+                )
+            else:
+                logger.info(
+                    f"   {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} | "
+                    f"(no price data)"
+                )
 
     def _has_active_position(self, asset: str) -> bool:
         """

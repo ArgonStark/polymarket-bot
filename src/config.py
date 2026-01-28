@@ -153,6 +153,35 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("HISTORY_MIN_PREDICTION_ACCURACY", "0.45"))
     )
 
+    # === Early Exit Settings (Take-Profit / Stop-Loss) ===
+    # Close positions early to lock in profits or limit losses
+
+    # Enable early exit feature (disabled by default - experimental)
+    early_exit_enabled: bool = field(
+        default_factory=lambda: os.getenv("EARLY_EXIT_ENABLED", "false").lower() == "true"
+    )
+
+    # Take-profit threshold (e.g., 0.30 = close when +30% profit)
+    take_profit_pct: float = field(
+        default_factory=lambda: float(os.getenv("TAKE_PROFIT_PCT", "0.30"))
+    )
+
+    # Stop-loss threshold (e.g., 0.25 = close when -25% loss)
+    stop_loss_pct: float = field(
+        default_factory=lambda: float(os.getenv("STOP_LOSS_PCT", "0.25"))
+    )
+
+    # Minimum time into position before allowing early exit (seconds)
+    # Prevents exiting too quickly on noise
+    early_exit_min_hold_time: float = field(
+        default_factory=lambda: float(os.getenv("EARLY_EXIT_MIN_HOLD", "60"))
+    )
+
+    # Check positions for early exit every N seconds
+    early_exit_check_interval: float = field(
+        default_factory=lambda: float(os.getenv("EARLY_EXIT_INTERVAL", "5"))
+    )
+
     # === Arbitrage Strategy Settings ===
     # Based on successful bot patterns that made $5-10k daily
 
