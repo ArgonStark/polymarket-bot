@@ -307,5 +307,18 @@ class ChainlinkFeed:
             logger.info("Chainlink WebSocket disconnected")
 
     def get_all_prices(self) -> dict[str, float]:
-        """Get all current prices."""
-        return self._prices.copy()
+        """
+        Get all current prices mapped by asset symbol.
+
+        Returns:
+            Dict of asset -> price (e.g., {"BTC": 104000.50, "ETH": 3200.25})
+        """
+        result = {}
+        for symbol, price in self._prices.items():
+            # Convert "btc/usd" -> "BTC"
+            if "/" in symbol:
+                asset = symbol.split("/")[0].upper()
+            else:
+                asset = symbol.upper()
+            result[asset] = price
+        return result
