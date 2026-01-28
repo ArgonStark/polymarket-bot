@@ -3,6 +3,9 @@ Chainlink RTDS (Real-Time Data Stream) WebSocket client.
 
 Connects to Polymarket's Chainlink price feed for real-time
 cryptocurrency prices used for market settlement.
+
+Also subscribes to Binance prices from the same Polymarket WebSocket,
+eliminating the need for a separate Binance connection.
 """
 
 import json
@@ -20,14 +23,24 @@ from ..config import BotConfig
 
 logger = logging.getLogger(__name__)
 
+# Binance symbol mapping for Polymarket's crypto_prices topic
+# Polymarket uses lowercase concatenated format: "btcusdt", "ethusdt", etc.
+BINANCE_SYMBOL_MAP = {
+    "btcusdt": "BTC",
+    "ethusdt": "ETH",
+    "solusdt": "SOL",
+    "xrpusdt": "XRP",
+}
+
 
 @dataclass
 class ChainlinkFeed:
     """
-    WebSocket client for Chainlink price data.
+    WebSocket client for Chainlink and Binance price data.
 
-    Connects to wss://ws-live-data.polymarket.com and subscribes
-    to the crypto_prices_chainlink topic for real-time price updates.
+    Connects to wss://ws-live-data.polymarket.com and subscribes to:
+    - crypto_prices_chainlink: Chainlink oracle prices (for settlement)
+    - crypto_prices: Binance prices (faster, for leading indicator)
     """
 
     config: BotConfig
@@ -35,7 +48,9 @@ class ChainlinkFeed:
 
     # Internal state
     _ws: Optional[websocket.WebSocketApp] = None
-    _prices: dict[str, float] = field(default_factory=dict)
+    _prices: dict[str, float] = field(default_factory=dict)  # Chainlink prices
+    _binance_prices: dict[str, float] = field(default_factory=dict)  # Binance prices
+    _binance_timestamps: dict[str, datetime] = field(default_factory=dict)
     _price_history: dict[str, PriceHistory] = field(default_factory=dict)
     _connected: bool = False
     _reconnect_delay: float = field(init=False)
@@ -109,7 +124,7 @@ class ChainlinkFeed:
         self._reconnect_delay = self.config.websocket.initial_reconnect_delay  # Reset reconnect delay
         self._retry_count = 0  # Reset retry count on successful connection
 
-        # Subscribe to crypto prices
+        # Subscribe to both Chainlink and Binance crypto prices
         subscribe_msg = {
             "action": "subscribe",
             "subscriptions": [
@@ -117,12 +132,17 @@ class ChainlinkFeed:
                     "topic": self.config.endpoints.chainlink_topic,
                     "type": "*",
                     "filters": "",  # All symbols
+                },
+                {
+                    "topic": "crypto_prices",  # Binance prices via Polymarket
+                    "type": "update",
+                    "filters": "btcusdt,ethusdt,solusdt,xrpusdt",
                 }
             ],
         }
         try:
             ws.send(json.dumps(subscribe_msg))
-            logger.info(f"Subscribed to {self.config.endpoints.chainlink_topic}")
+            logger.info(f"Subscribed to {self.config.endpoints.chainlink_topic} and crypto_prices (Binance)")
         except Exception as e:
             logger.error(f"Failed to send subscription message: {e}")
 
@@ -137,6 +157,8 @@ class ChainlinkFeed:
 
             # Check if it's a price update
             topic = data.get("topic")
+
+            # Handle Chainlink prices
             if topic == self.config.endpoints.chainlink_topic:
                 payload = data.get("payload", {})
                 symbol = payload.get("symbol")  # e.g., "btc/usd"
@@ -166,11 +188,35 @@ class ChainlinkFeed:
                         timestamp=timestamp,
                     )
 
-                    logger.debug(f"Price update: {symbol} = ${price:,.2f}")
+                    logger.debug(f"Chainlink: {symbol} = ${price:,.2f}")
 
                     # Notify callback
                     if self.on_price_update:
                         self.on_price_update(chainlink_price)
+
+            # Handle Binance prices (via Polymarket's crypto_prices topic)
+            elif topic == "crypto_prices":
+                payload = data.get("payload", {})
+                binance_symbol = payload.get("symbol")  # e.g., "btcusdt"
+                price = payload.get("value") or payload.get("price")
+                timestamp_ms = payload.get("timestamp")
+
+                if binance_symbol and price is not None:
+                    # Map Binance symbol to asset
+                    asset = BINANCE_SYMBOL_MAP.get(binance_symbol.lower())
+                    if asset:
+                        self._binance_prices[asset] = float(price)
+
+                        # Parse timestamp
+                        if timestamp_ms:
+                            timestamp = datetime.fromtimestamp(
+                                timestamp_ms / 1000, tz=timezone.utc
+                            )
+                        else:
+                            timestamp = datetime.now(timezone.utc)
+                        self._binance_timestamps[asset] = timestamp
+
+                        logger.debug(f"Binance: {asset} = ${float(price):,.2f}")
 
             elif data.get("type") == "subscribed":
                 logger.info(f"Successfully subscribed: {data}")
@@ -308,7 +354,7 @@ class ChainlinkFeed:
 
     def get_all_prices(self) -> dict[str, float]:
         """
-        Get all current prices mapped by asset symbol.
+        Get all current Chainlink prices mapped by asset symbol.
 
         Returns:
             Dict of asset -> price (e.g., {"BTC": 104000.50, "ETH": 3200.25})
@@ -322,3 +368,41 @@ class ChainlinkFeed:
                 asset = symbol.upper()
             result[asset] = price
         return result
+
+    # ========== Binance Price Methods ==========
+
+    def get_binance_price(self, asset: str) -> Optional[float]:
+        """
+        Get current Binance price for an asset.
+
+        Args:
+            asset: Asset symbol like "BTC", "ETH", etc.
+
+        Returns:
+            Current Binance price or None if not available
+        """
+        return self._binance_prices.get(asset.upper())
+
+    def get_all_binance_prices(self) -> dict[str, float]:
+        """
+        Get all current Binance prices.
+
+        Returns:
+            Dict of asset -> price (e.g., {"BTC": 104000.50, "ETH": 3200.25})
+        """
+        return dict(self._binance_prices)
+
+    def get_binance_price_age(self, asset: str) -> Optional[float]:
+        """
+        Get how old the Binance price data is in seconds.
+
+        Args:
+            asset: Asset symbol like "BTC"
+
+        Returns:
+            Age in seconds, or None if no price available
+        """
+        timestamp = self._binance_timestamps.get(asset.upper())
+        if timestamp:
+            return (datetime.now(timezone.utc) - timestamp).total_seconds()
+        return None
