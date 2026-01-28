@@ -744,12 +744,27 @@ class TradingBot:
                         remaining = warmup_seconds - elapsed
                         # Log progress every 10 seconds
                         if int(elapsed) % 10 == 0 and int(elapsed) > 0:
-                            prices = self.chainlink_feed.get_all_prices()
-                            price_count = len(prices)
+                            chainlink_prices = self.chainlink_feed.get_all_prices()
+                            binance_prices = self.binance_feed.get_all_prices()
+
+                            # Build price comparison string
+                            price_info = []
+                            for asset in self.config.supported_assets:
+                                cl_price = chainlink_prices.get(asset)
+                                bn_price = binance_prices.get(asset)
+                                if cl_price and bn_price:
+                                    lead = bn_price - cl_price
+                                    lead_pct = (lead / cl_price) * 100 if cl_price else 0
+                                    price_info.append(
+                                        f"{asset}: CL=${cl_price:,.0f} BN=${bn_price:,.0f} ({lead_pct:+.2f}%)"
+                                    )
+                                elif cl_price:
+                                    price_info.append(f"{asset}: CL=${cl_price:,.0f}")
+
                             logger.info(
                                 f"👀 OBSERVING: {remaining:.0f}s remaining | "
-                                f"Prices tracked: {price_count} | "
-                                f"Markets found: {len(self.markets)}"
+                                f"Markets: {len(self.markets)} | "
+                                f"{' | '.join(price_info) if price_info else 'Waiting for prices...'}"
                             )
                         # Still discover markets and collect data, but don't trade
                         await self._refresh_markets()
@@ -759,10 +774,24 @@ class TradingBot:
                     else:
                         # Warm-up complete!
                         self._warmup_complete = True
-                        prices = self.chainlink_feed.get_all_prices()
+                        chainlink_prices = self.chainlink_feed.get_all_prices()
+                        binance_prices = self.binance_feed.get_all_prices()
+
+                        # Build final price summary
+                        price_summary = []
+                        for asset in self.config.supported_assets:
+                            cl_price = chainlink_prices.get(asset)
+                            bn_price = binance_prices.get(asset)
+                            if cl_price and bn_price:
+                                lead_pct = ((bn_price - cl_price) / cl_price) * 100
+                                price_summary.append(f"{asset}=${cl_price:,.0f} (Binance {lead_pct:+.2f}%)")
+                            elif cl_price:
+                                price_summary.append(f"{asset}=${cl_price:,.0f}")
+
                         logger.info(
                             f"✅ WARM-UP COMPLETE: Now trading! | "
-                            f"Prices: {len(prices)} | Markets: {len(self.markets)}"
+                            f"Markets: {len(self.markets)} | "
+                            f"{' | '.join(price_summary)}"
                         )
 
                 # Check if data feeds are healthy (circuit breakers)
@@ -777,6 +806,10 @@ class TradingBot:
                     logger.warning("Chainlink feed circuit breaker open - trading with stale prices")
                 elif self.clob_feed._circuit_open:
                     logger.warning("CLOB feed circuit breaker open - trading with stale order books")
+
+                # Binance feed is optional (confirmation only) - just log if down
+                if self.binance_feed._circuit_open:
+                    logger.debug("Binance feed circuit breaker open - trading without confirmation signal")
 
                 # Discover and refresh markets
                 await self._refresh_markets()
