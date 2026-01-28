@@ -398,6 +398,12 @@ class TradingBot:
                 signal = order_data.get("signal")
                 asset = order_data.get("asset", signal.market.asset if signal else "???")
 
+                # Log the status we received
+                logger.info(
+                    f"📋 Order {order_id[:8]}... ({asset}): status={order_info.status.value} | "
+                    f"filled={order_info.filled_size:.2f} | wait={wait_time:.0f}s"
+                )
+
                 if order_info.status.value == "FILLED":
                     # Order filled - record the position
                     logger.info(
@@ -407,6 +413,7 @@ class TradingBot:
 
                     if signal:
                         # Record position with risk manager
+                        logger.info(f"📍 Recording position for {asset} {signal.side.value}")
                         self.risk_manager.record_position_open(
                             signal=signal,
                             entry_price=order_info.price,
@@ -442,6 +449,9 @@ class TradingBot:
                             arb_type=order_data.get("ml_arb_type") or "none",
                             edge=signal.edge,
                         )
+
+                    else:
+                        logger.warning(f"⚠️ Order filled but signal is None - cannot record position for {asset}")
 
                     orders_to_remove.append(order_id)
 
