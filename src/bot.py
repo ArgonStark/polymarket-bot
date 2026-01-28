@@ -16,9 +16,11 @@ from .data import (
     ChainlinkFeed,
     CLOBFeed,
     GammaAPI,
+    BinanceFeed,
     fetch_all_historical_prices,
     prepopulate_price_histories,
 )
+from .data.binance import BinancePrice
 from .execution import create_trading_client, OrderExecutor
 from .execution.client import get_account_balance
 from .strategy import SignalGenerator, RiskManager
@@ -66,6 +68,10 @@ class TradingBot:
         self.clob_feed = CLOBFeed(
             config=config,
             on_orderbook_update=self._on_orderbook_update,
+        )
+        self.binance_feed = BinanceFeed(
+            config=config,
+            on_price_update=self._on_binance_price,
         )
         self.gamma_api = GammaAPI(config=config)
 
@@ -619,6 +625,7 @@ class TradingBot:
             await asyncio.gather(
                 self._run_chainlink_feed(),
                 self._run_clob_feed(),
+                self._run_binance_feed(),  # Fast price feed for leading indicator
                 self._run_trading_loop(),
                 self._run_settlement_loop(),  # New: dedicated settlement checker
                 return_exceptions=True,
@@ -643,6 +650,7 @@ class TradingBot:
         # Disconnect data feeds
         self.chainlink_feed.disconnect()
         self.clob_feed.disconnect()
+        self.binance_feed.disconnect()
         self.gamma_api.close()
 
         # Shutdown notification thread pool
@@ -699,6 +707,18 @@ class TradingBot:
             await self.clob_feed.connect_async()
         except Exception as e:
             logger.error(f"CLOB feed error: {e}")
+
+    async def _run_binance_feed(self):
+        """
+        Run Binance price feed in background.
+
+        Binance provides faster price updates (~50ms) than Chainlink,
+        used as a leading indicator to predict where Chainlink will go.
+        """
+        try:
+            await self.binance_feed.connect_async()
+        except Exception as e:
+            logger.error(f"Binance feed error: {e}")
 
     async def _run_trading_loop(self):
         """Main trading loop - handles market discovery and signal execution."""
@@ -1988,6 +2008,16 @@ class TradingBot:
         """Handle Chainlink price update."""
         # Update signal generator with new price (used for probability calculations)
         self.signal_generator.update_price(price.symbol, price.price)
+
+    def _on_binance_price(self, price: BinancePrice):
+        """
+        Handle Binance price update.
+
+        Binance prices are faster than Chainlink (~50ms vs ~500ms).
+        Used as a leading indicator to predict Chainlink movements.
+        """
+        # Update signal generator with Binance price (used for confirmation)
+        self.signal_generator.update_binance_price(price.asset, price.price)
 
     def _on_orderbook_update(self, token_id: str, orderbook):
         """Handle order book update."""

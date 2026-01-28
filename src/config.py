@@ -311,6 +311,9 @@ class EndpointsConfig:
     # Gamma API for market discovery
     gamma_api_url: str = "https://gamma-api.polymarket.com"
 
+    # Binance WebSocket for fast price updates (leading indicator)
+    binance_ws_url: str = "wss://stream.binance.com:9443"
+
 
 @dataclass
 class NotificationsConfig:
