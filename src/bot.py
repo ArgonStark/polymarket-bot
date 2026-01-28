@@ -412,6 +412,22 @@ class TradingBot:
                             ml_distance_from_target=order_data.get("ml_distance_from_target"),
                         )
 
+                        # Record in trade history
+                        trade_history = get_trade_history()
+                        current_price = self.signal_generator.get_price(signal.market.asset)
+                        trade_history.record_open(
+                            asset=asset,
+                            side=signal.side.value,
+                            entry_price=order_info.price,
+                            shares=order_info.filled_size,
+                            target_price=signal.market.target_price,
+                            chainlink_price=current_price,
+                            market_id=signal.market.condition_id,
+                            predicted_prob=order_data.get("ml_confidence"),
+                            arb_type=order_data.get("ml_arb_type") or "none",
+                            edge=signal.edge,
+                        )
+
                     orders_to_remove.append(order_id)
 
                 elif order_info.status.value == "PARTIAL":
