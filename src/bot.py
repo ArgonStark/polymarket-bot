@@ -1657,18 +1657,14 @@ class TradingBot:
             self._update_market_from_orderbook(market)
             return
 
-        # Check Binance price availability (used for confirmation signal)
+        # Check Binance price availability (used for confirmation signal - optional)
         binance_price = self.signal_generator.get_binance_price(market.asset)
         chainlink_price = self.signal_generator.get_price(market.asset)
 
-        if binance_price is None:
-            logger.debug(
-                f"[{market.asset}] Waiting for Binance price data..."
-            )
-            self._update_market_from_orderbook(market)
-            return
+        # Binance is optional - used for confirmation signal boost, not required
+        # The signal generator handles missing Binance data gracefully
 
-        # Log price comparison during first trade readiness
+        # Log price comparison when both prices are available
         if chainlink_price and binance_price:
             lead = binance_price - chainlink_price
             lead_pct = (lead / chainlink_price) * 100 if chainlink_price else 0
