@@ -760,12 +760,27 @@ class TradingBot:
                         remaining = warmup_seconds - elapsed
                         # Log progress every 10 seconds
                         if int(elapsed) % 10 == 0 and int(elapsed) > 0:
-                            prices = self.chainlink_feed.get_all_prices()
-                            price_count = len(prices)
+                            chainlink_prices = self.chainlink_feed.get_all_prices()
+                            binance_prices = self.binance_feed.get_all_prices()
+
+                            # Build price comparison string
+                            price_info = []
+                            for asset in self.config.supported_assets:
+                                cl_price = chainlink_prices.get(asset)
+                                bn_price = binance_prices.get(asset)
+                                if cl_price and bn_price:
+                                    lead = bn_price - cl_price
+                                    lead_pct = (lead / cl_price) * 100 if cl_price else 0
+                                    price_info.append(
+                                        f"{asset}: CL=${cl_price:,.0f} BN=${bn_price:,.0f} ({lead_pct:+.2f}%)"
+                                    )
+                                elif cl_price:
+                                    price_info.append(f"{asset}: CL=${cl_price:,.0f}")
+
                             logger.info(
                                 f"👀 OBSERVING: {remaining:.0f}s remaining | "
-                                f"Prices tracked: {price_count} | "
-                                f"Markets found: {len(self.markets)}"
+                                f"Markets: {len(self.markets)} | "
+                                f"{' | '.join(price_info) if price_info else 'Waiting for prices...'}"
                             )
                         # Still discover markets and collect data, but don't trade
                         await self._refresh_markets()
@@ -773,12 +788,53 @@ class TradingBot:
                         await asyncio.sleep(self.config.loop_interval)
                         continue
                     else:
+                        # Warm-up complete - verify data feeds
+                        chainlink_prices = self.chainlink_feed.get_all_prices()
+                        binance_prices = self.binance_feed.get_all_prices()
+
+                        # Check data availability
+                        missing_chainlink = []
+                        missing_binance = []
+                        for asset in self.config.supported_assets:
+                            if not chainlink_prices.get(asset):
+                                missing_chainlink.append(asset)
+                            if not binance_prices.get(asset):
+                                missing_binance.append(asset)
+
+                        # Warn about missing Binance data (but don't block)
+                        if missing_binance:
+                            logger.warning(
+                                f"⚠️ Binance prices missing for: {', '.join(missing_binance)} - "
+                                f"trading without confirmation signal for these assets"
+                            )
+
+                        # Block if Chainlink data missing (required for settlement)
+                        if missing_chainlink:
+                            logger.warning(
+                                f"⚠️ Chainlink prices missing for: {', '.join(missing_chainlink)} - "
+                                f"extending warm-up..."
+                            )
+                            await asyncio.sleep(5.0)
+                            continue
+
                         # Warm-up complete!
                         self._warmup_complete = True
-                        prices = self.chainlink_feed.get_all_prices()
+
+                        # Build final price summary with comparison
+                        price_summary = []
+                        for asset in self.config.supported_assets:
+                            cl_price = chainlink_prices.get(asset)
+                            bn_price = binance_prices.get(asset)
+                            if cl_price and bn_price:
+                                lead_pct = ((bn_price - cl_price) / cl_price) * 100
+                                price_summary.append(f"{asset}=${cl_price:,.0f} (Binance {lead_pct:+.2f}%)")
+                            elif cl_price:
+                                price_summary.append(f"{asset}=${cl_price:,.0f} (no Binance)")
+
                         logger.info(
                             f"✅ WARM-UP COMPLETE: Now trading! | "
-                            f"Prices: {len(prices)} | Markets: {len(self.markets)}"
+                            f"Markets: {len(self.markets)} | "
+                            f"{' | '.join(price_summary)}"
                         )
 
                 # Check if data feeds are healthy (circuit breakers)
@@ -793,6 +849,10 @@ class TradingBot:
                     logger.warning("Chainlink feed circuit breaker open - trading with stale prices")
                 elif self.clob_feed._circuit_open:
                     logger.warning("CLOB feed circuit breaker open - trading with stale order books")
+
+                # Binance feed is optional (confirmation only) - just log if down
+                if self.binance_feed._circuit_open:
+                    logger.debug("Binance feed circuit breaker open - trading without confirmation signal")
 
                 # Discover and refresh markets
                 await self._refresh_markets()
@@ -1586,16 +1646,36 @@ class TradingBot:
             self._update_market_from_orderbook(market)
             return
 
-        # Check minimum price samples for this asset
+        # Check minimum price samples for this asset (Chainlink)
         asset_symbol = f"{market.asset.lower()}/usd"
         price_history = self.signal_generator.price_histories.get(asset_symbol, [])
         min_samples = self.config.trading.min_price_samples
         if len(price_history) < min_samples:
             logger.debug(
-                f"[{market.asset}] Need more price data: {len(price_history)}/{min_samples} samples"
+                f"[{market.asset}] Need more Chainlink data: {len(price_history)}/{min_samples} samples"
             )
             self._update_market_from_orderbook(market)
             return
+
+        # Check Binance price availability (used for confirmation signal)
+        binance_price = self.signal_generator.get_binance_price(market.asset)
+        chainlink_price = self.signal_generator.get_price(market.asset)
+
+        if binance_price is None:
+            logger.debug(
+                f"[{market.asset}] Waiting for Binance price data..."
+            )
+            self._update_market_from_orderbook(market)
+            return
+
+        # Log price comparison during first trade readiness
+        if chainlink_price and binance_price:
+            lead = binance_price - chainlink_price
+            lead_pct = (lead / chainlink_price) * 100 if chainlink_price else 0
+            logger.debug(
+                f"[{market.asset}] Price check: Chainlink=${chainlink_price:,.2f}, "
+                f"Binance=${binance_price:,.2f}, Lead={lead_pct:+.3f}%"
+            )
 
         # Update market state from order book
         self._update_market_from_orderbook(market)
