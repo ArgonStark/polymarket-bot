@@ -87,6 +87,12 @@ class TradingBot:
             self.ml_predictor = get_ml_predictor()
             self.ml_predictor.min_confidence = config.trading.ml_min_confidence
             self.ml_predictor.min_training_samples = config.trading.ml_min_samples
+            logger.info(
+                f"🤖 ML enabled: {self.ml_predictor.training_samples} samples loaded | "
+                f"Model: {self.ml_predictor.model_path}"
+            )
+        else:
+            logger.info("🤖 ML disabled (set ML_ENABLED=true to enable)")
 
         # Market state - three-stage lifecycle
         self.markets: dict[str, MarketState] = {}  # Active trading markets

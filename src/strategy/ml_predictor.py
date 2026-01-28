@@ -496,6 +496,10 @@ class MLSignalPredictor:
         self.model.update(feature_vector, 1 if won else 0)
         self.training_samples += 1
 
+        # Log outcome recording
+        result_str = "WIN" if won else "LOSS"
+        logger.info(f"🤖 ML recorded: {result_str} | Sample #{self.training_samples}")
+
         # Log learning progress
         if self.training_samples % 5 == 0:
             accuracy = self.correct_predictions / max(1, self.predictions_made)
@@ -555,7 +559,7 @@ class MLSignalPredictor:
             }
             with open(self.model_path, "w") as f:
                 json.dump(data, f, indent=2)
-            logger.debug(f"ML model saved to {self.model_path}")
+            logger.info(f"🤖 ML model saved: {self.training_samples} samples → {self.model_path}")
         except Exception as e:
             logger.error(f"Failed to save ML model: {e}")
 
