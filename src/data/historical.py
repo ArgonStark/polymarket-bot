@@ -96,10 +96,12 @@ async def fetch_historical_prices(
             return prices
 
     except asyncio.TimeoutError:
-        logger.warning(f"Timeout fetching historical prices for {asset}")
+        logger.debug(f"Timeout fetching historical prices for {asset}")
         return []
     except Exception as e:
-        logger.warning(f"Error fetching historical prices for {asset}: {e}")
+        # Log at debug level - this is expected to fail in sandboxed environments
+        # The bot will collect prices during warm-up period instead
+        logger.debug(f"Could not fetch historical prices for {asset}: {e}")
         return []
     finally:
         if close_session:
