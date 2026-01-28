@@ -125,6 +125,7 @@ class ChainlinkFeed:
         self._retry_count = 0  # Reset retry count on successful connection
 
         # Subscribe to both Chainlink and Binance crypto prices
+        # Note: filters must be valid JSON (array or object), not comma-separated string
         subscribe_msg = {
             "action": "subscribe",
             "subscriptions": [
@@ -136,7 +137,7 @@ class ChainlinkFeed:
                 {
                     "topic": "crypto_prices",  # Binance prices via Polymarket
                     "type": "update",
-                    "filters": "btcusdt,ethusdt,solusdt,xrpusdt",
+                    "filters": '["btcusdt","ethusdt","solusdt","xrpusdt"]',  # JSON array format
                 }
             ],
         }
