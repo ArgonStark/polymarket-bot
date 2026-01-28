@@ -642,15 +642,24 @@ class TradingBot:
         logger.info("Starting trading bot...")
 
         try:
-            # Run all components concurrently
-            await asyncio.gather(
+            # Build list of tasks to run
+            tasks = [
                 self._run_chainlink_feed(),
                 self._run_clob_feed(),
-                self._run_binance_feed(),  # Fast price feed for leading indicator
                 self._run_trading_loop(),
-                self._run_settlement_loop(),  # New: dedicated settlement checker
-                return_exceptions=True,
-            )
+                self._run_settlement_loop(),
+            ]
+
+            # Only add direct Binance feed if enabled
+            # Otherwise, Binance prices come via Polymarket's WebSocket (bundled in ChainlinkFeed)
+            if self.config.endpoints.binance_direct_enabled:
+                logger.info("Using DIRECT Binance WebSocket connection")
+                tasks.append(self._run_binance_feed())
+            else:
+                logger.info("Using Polymarket's bundled Binance prices (BINANCE_DIRECT=false)")
+
+            # Run all components concurrently
+            await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
             logger.info("Bot cancelled")
         except Exception as e:
@@ -671,13 +680,29 @@ class TradingBot:
         # Disconnect data feeds
         self.chainlink_feed.disconnect()
         self.clob_feed.disconnect()
-        self.binance_feed.disconnect()
+        if self.config.endpoints.binance_direct_enabled:
+            self.binance_feed.disconnect()
         self.gamma_api.close()
 
         # Shutdown notification thread pool
         shutdown_notification_executor()
 
         logger.info("Trading bot shutdown complete")
+
+    def _get_binance_prices(self) -> dict[str, float]:
+        """
+        Get Binance prices from appropriate source based on config.
+
+        If BINANCE_DIRECT=true: Uses direct Binance WebSocket (binance_feed)
+        If BINANCE_DIRECT=false: Uses Polymarket's bundled Binance prices (chainlink_feed)
+
+        Returns:
+            Dict of asset -> price (e.g., {"BTC": 104000.50, "ETH": 3200.25})
+        """
+        if self.config.endpoints.binance_direct_enabled:
+            return self.binance_feed.get_all_prices()
+        else:
+            return self.chainlink_feed.get_all_binance_prices()
 
     async def _get_initial_bankroll(self) -> float:
         """
@@ -766,7 +791,7 @@ class TradingBot:
                         # Log progress every 10 seconds
                         if int(elapsed) % 10 == 0 and int(elapsed) > 0:
                             chainlink_prices = self.chainlink_feed.get_all_prices()
-                            binance_prices = self.binance_feed.get_all_prices()
+                            binance_prices = self._get_binance_prices()
 
                             # Build price comparison string
                             price_info = []
@@ -795,7 +820,7 @@ class TradingBot:
                     else:
                         # Warm-up complete - verify data feeds
                         chainlink_prices = self.chainlink_feed.get_all_prices()
-                        binance_prices = self.binance_feed.get_all_prices()
+                        binance_prices = self._get_binance_prices()
 
                         # Check data availability
                         missing_chainlink = []
@@ -856,7 +881,8 @@ class TradingBot:
                     logger.warning("CLOB feed circuit breaker open - trading with stale order books")
 
                 # Binance feed is optional (confirmation only) - just log if down
-                if self.binance_feed._circuit_open:
+                # Only check circuit breaker when using direct Binance connection
+                if self.config.endpoints.binance_direct_enabled and self.binance_feed._circuit_open:
                     logger.debug("Binance feed circuit breaker open - trading without confirmation signal")
 
                 # Discover and refresh markets

@@ -314,6 +314,12 @@ class EndpointsConfig:
     # Binance WebSocket for fast price updates (leading indicator)
     binance_ws_url: str = "wss://stream.binance.com:9443"
 
+    # Use direct Binance WebSocket connection (requires external network access)
+    # If false, uses Binance prices bundled via Polymarket's WebSocket (recommended)
+    binance_direct_enabled: bool = field(
+        default_factory=lambda: os.getenv("BINANCE_DIRECT", "false").lower() == "true"
+    )
+
 
 @dataclass
 class NotificationsConfig:
