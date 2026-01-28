@@ -367,32 +367,42 @@ class TradingBot:
         if self.client is None or self.executor is None:
             return
 
+        # Log that we're checking pending orders
+        logger.debug(f"Checking {len(self._pending_orders)} pending orders...")
+
         orders_to_remove = []
 
         for order_id, order_data in list(self._pending_orders.items()):
             try:
+                asset = order_data.get("asset", "???")
+                placed_time = order_data.get("placed_time")
+                wait_time = (now - placed_time).total_seconds() if placed_time else 0
+
                 # Check order status
                 order_info = self.executor.get_order_status(order_id)
 
                 if order_info is None:
                     # Order not found - might have been filled or cancelled
-                    # Check how long we've been waiting
-                    placed_time = order_data.get("placed_time")
-                    if placed_time:
-                        wait_time = (now - placed_time).total_seconds()
-                        if wait_time > 120:  # 2 minutes timeout
-                            logger.warning(
-                                f"Order {order_id[:16]}... not found after {wait_time:.0f}s - removing"
-                            )
-                            orders_to_remove.append(order_id)
-                            # Restore cooldown to allow new order
-                            asset = order_data.get("asset")
-                            if asset and asset in self._last_order_time:
-                                del self._last_order_time[asset]
+                    if wait_time > 60:  # 1 minute timeout (reduced from 2)
+                        logger.warning(
+                            f"⚠️ Order {order_id[:8]}... ({asset}) not found after {wait_time:.0f}s - removing"
+                        )
+                        orders_to_remove.append(order_id)
+                        # Restore cooldown to allow new order
+                        if asset in self._last_order_time:
+                            del self._last_order_time[asset]
+                    else:
+                        logger.debug(f"Order {order_id[:8]}... ({asset}) status unknown, waiting {wait_time:.0f}s")
                     continue
 
                 signal = order_data.get("signal")
                 asset = order_data.get("asset", signal.market.asset if signal else "???")
+
+                # Log the status we received
+                logger.info(
+                    f"📋 Order {order_id[:8]}... ({asset}): status={order_info.status.value} | "
+                    f"filled={order_info.filled_size:.2f} | wait={wait_time:.0f}s"
+                )
 
                 if order_info.status.value == "FILLED":
                     # Order filled - record the position
@@ -403,6 +413,7 @@ class TradingBot:
 
                     if signal:
                         # Record position with risk manager
+                        logger.info(f"📍 Recording position for {asset} {signal.side.value}")
                         self.risk_manager.record_position_open(
                             signal=signal,
                             entry_price=order_info.price,
@@ -439,6 +450,9 @@ class TradingBot:
                             edge=signal.edge,
                         )
 
+                    else:
+                        logger.warning(f"⚠️ Order filled but signal is None - cannot record position for {asset}")
+
                     orders_to_remove.append(order_id)
 
                 elif order_info.status.value == "PARTIAL":
@@ -460,8 +474,8 @@ class TradingBot:
                     if asset in self._last_order_time:
                         del self._last_order_time[asset]
 
-                elif order_info.status.value == "OPEN":
-                    # Still open - check if we should cancel
+                elif order_info.status.value in ["OPEN", "PENDING"]:
+                    # Still open/pending - check if we should cancel
                     should_cancel = False
                     cancel_reason = ""
 
@@ -483,23 +497,43 @@ class TradingBot:
                             should_cancel = True
                             cancel_reason = "market no longer active"
 
-                    # Also cancel if order is too old (over 2 minutes)
-                    placed_time = order_data.get("placed_time")
-                    if placed_time and (now - placed_time).total_seconds() > 120:
+                    # Also cancel if order is too old (over 90 seconds)
+                    if wait_time > 90:
                         should_cancel = True
-                        cancel_reason = "order timeout (2min)"
+                        cancel_reason = f"order timeout ({wait_time:.0f}s)"
 
                     if should_cancel:
                         logger.warning(
                             f"⚠️ Cancelling unfilled order for {asset} - {cancel_reason}"
                         )
-                        self.executor.cancel_order(order_id)
+                        try:
+                            self.executor.cancel_order(order_id)
+                        except Exception as cancel_err:
+                            logger.warning(f"Failed to cancel order: {cancel_err}")
+                        orders_to_remove.append(order_id)
+                        if asset in self._last_order_time:
+                            del self._last_order_time[asset]
+                    else:
+                        logger.debug(f"Order {order_id[:8]}... ({asset}) still {order_info.status.value}, waiting {wait_time:.0f}s")
+
+                else:
+                    # Unknown status - log and apply timeout
+                    logger.warning(f"Unknown order status '{order_info.status.value}' for {asset}")
+                    if wait_time > 90:
+                        logger.warning(f"⚠️ Removing stale order for {asset} with status {order_info.status.value}")
                         orders_to_remove.append(order_id)
                         if asset in self._last_order_time:
                             del self._last_order_time[asset]
 
             except Exception as e:
-                logger.error(f"Error checking order {order_id[:16]}...: {e}")
+                logger.error(f"Error checking order {order_id[:8]}...: {e}")
+                # On error, still remove stale orders
+                if wait_time > 120:
+                    logger.warning(f"⚠️ Removing errored order {order_id[:8]}... after {wait_time:.0f}s")
+                    orders_to_remove.append(order_id)
+                    asset = order_data.get("asset")
+                    if asset and asset in self._last_order_time:
+                        del self._last_order_time[asset]
 
         # Remove processed orders
         for order_id in orders_to_remove:
@@ -2148,11 +2182,57 @@ class TradingBot:
             f"Tracked positions={risk_pos_count} | Bankroll=${self.risk_manager.current_bankroll:.2f}"
         )
 
+        # === DETAILED TRADE ANALYSIS LOG ===
+        arb_type = getattr(signal, '_arb_type', 'unknown')
+        ml_confidence = getattr(signal, '_ml_confidence', None)
+        binance_conf = getattr(signal, '_ml_binance_confirmation', 'NONE')
+        binance_lead = getattr(signal, '_ml_binance_lead_pct', 0) or 0
+
+        # Price analysis
+        price_vs_target = "ABOVE" if current_price and target and current_price >= target else "BELOW"
+        distance_pct = abs(current_price - target) / target * 100 if current_price and target else 0
+
+        logger.info(f"{Colors.BRIGHT_CYAN}╔══════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        logger.info(f"{Colors.BRIGHT_CYAN}║  📊 TRADE ANALYSIS: {asset} {signal.side.value:4}{Colors.RESET}")
+        logger.info(f"{Colors.BRIGHT_CYAN}╠══════════════════════════════════════════════════════════════╣{Colors.RESET}")
+
+        # Why this trade?
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  🎯 Signal Type: {arb_type.upper()}")
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  📝 Reasoning: {signal.reasoning}")
+
+        # Price info
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  💰 Chainlink: ${current_price:,.2f} ({price_vs_target} target by {distance_pct:.2f}%)")
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  🎯 Target: ${target:,.2f}")
+
+        # Market prices
+        market = signal.market
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  📈 UP price: bid={market.best_bid:.3f} / ask={market.best_ask:.3f}")
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  📉 DOWN price: bid={1-market.best_ask:.3f} / ask={1-market.best_bid:.3f}")
+
+        # Edge calculation
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  ✨ Edge: {signal.edge:.1%} (min required: {self.config.trading.min_edge:.1%})")
+
+        # Binance confirmation
+        if binance_conf != "NONE":
+            logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  🔗 Binance: {binance_conf} confirmation (lead: {binance_lead:+.3f}%)")
+
+        # ML prediction
+        if ml_confidence:
+            logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  🤖 ML Confidence: {ml_confidence:.0%} win probability")
+
+        # Time remaining
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  ⏱️  Time left: {signal.time_remaining:.0f}s")
+
+        # Position size
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  💵 Size: ${signal.size_usd:.2f} ({signal.size_shares:.2f} shares @ {signal.recommended_price:.3f})")
+
+        logger.info(f"{Colors.BRIGHT_CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
+
         # Log the trade attempt with colors
         direction = "▲" if signal.side == Side.UP else "▼"
         side_color = Colors.BRIGHT_GREEN if signal.side == Side.UP else Colors.BRIGHT_RED
         logger.info(
-            f"{side_color}>>> {asset} {signal.side.value} {direction}{Colors.RESET} │ "
+            f"{side_color}>>> EXECUTING: {asset} {signal.side.value} {direction}{Colors.RESET} │ "
             f"Edge: {Colors.BRIGHT_YELLOW}{signal.edge:.0%}{Colors.RESET} │ "
             f"${current_price:,.0f} vs ${target:,.0f} │ "
             f"${signal.size_usd:.2f}"
@@ -2240,9 +2320,10 @@ class TradingBot:
                 self._pending_orders[result.order_id] = {
                     "signal": signal,
                     "asset": asset,
+                    "side": signal.side.value,  # "UP" or "DOWN"
                     "placed_time": now,
                     "price": signal.recommended_price,
-                    "size_shares": signal.size_shares,
+                    "size": signal.size_shares,  # For display in status logs
                     "ml_volatility": ml_volatility,
                     "ml_momentum": ml_momentum,
                     "ml_confidence": ml_confidence,

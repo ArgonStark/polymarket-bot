@@ -556,12 +556,31 @@ class OrderExecutor:
             if not order_info:
                 return None
 
+            # Log the raw status for debugging
+            raw_status = order_info.get("status", "")
+            logger.debug(f"Order {order_id[:8]}... raw status: {raw_status}")
+
+            # Polymarket uses different status values than expected:
+            # MATCHED = Trade matched, being executed
+            # MINED = Transaction mined into blockchain
+            # CONFIRMED = Trade successful (finalized) - treat as FILLED
+            # RETRYING = Transaction failed, being retried
+            # FAILED = Trade failed permanently - treat as CANCELLED
+            # LIVE = Order is live on the book (not yet matched)
             status_map = {
+                # Standard statuses
                 "OPEN": OrderStatus.OPEN,
+                "LIVE": OrderStatus.OPEN,  # Polymarket uses LIVE for open orders
                 "FILLED": OrderStatus.FILLED,
                 "CANCELLED": OrderStatus.CANCELLED,
                 "EXPIRED": OrderStatus.EXPIRED,
                 "PARTIAL": OrderStatus.PARTIAL,
+                # Polymarket-specific statuses
+                "MATCHED": OrderStatus.PARTIAL,  # Being executed, not yet confirmed
+                "MINED": OrderStatus.PARTIAL,    # Mined but not confirmed
+                "CONFIRMED": OrderStatus.FILLED,  # Successfully filled
+                "RETRYING": OrderStatus.OPEN,     # Still trying
+                "FAILED": OrderStatus.CANCELLED,  # Failed permanently
             }
 
             return Order(
