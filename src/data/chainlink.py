@@ -155,6 +155,15 @@ class ChainlinkFeed:
         try:
             data = json.loads(message)
 
+            # Debug: Log first few messages to understand format
+            if not hasattr(self, '_msg_count'):
+                self._msg_count = 0
+            self._msg_count += 1
+            if self._msg_count <= 10:
+                # Log first 10 messages to understand the format
+                msg_preview = str(data)[:500] if len(str(data)) > 500 else str(data)
+                logger.info(f"WS MSG #{self._msg_count}: {msg_preview}")
+
             # Check if it's a price update
             topic = data.get("topic")
 
@@ -223,6 +232,11 @@ class ChainlinkFeed:
 
             elif data.get("type") == "error":
                 logger.error(f"WebSocket error: {data}")
+
+            else:
+                # Log unmatched messages for debugging
+                if self._msg_count <= 20:
+                    logger.warning(f"Unmatched WS message (topic={topic}): {str(data)[:200]}")
 
         except json.JSONDecodeError:
             # Silently ignore parse errors for keepalive/ping messages
