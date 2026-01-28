@@ -274,15 +274,24 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
                 continue
 
             # Extract timestamp from slug (e.g., btc-updown-15m-1706123400)
+            # If we can't determine the timestamp, skip to be safe (don't block new trades)
+            market_ts = None
             try:
                 parts = slug.split("-")
                 if len(parts) >= 4:
                     market_ts = int(parts[-1])
-                    # Check if market is still active (settles at market_ts + 900)
-                    if current_time > market_ts + 900:
-                        continue  # Market already settled
             except (ValueError, IndexError):
-                pass  # Continue anyway if we can't parse timestamp
+                pass
+
+            if market_ts is None:
+                # Can't determine market timestamp - skip this position
+                logger.debug(f"Skipping position with unparseable slug: {slug}")
+                continue
+
+            # Check if market is still active (settles at market_ts + 900)
+            if current_time > market_ts + 900:
+                logger.debug(f"Skipping settled position: {slug} (settled {current_time - market_ts - 900:.0f}s ago)")
+                continue  # Market already settled
 
             # Identify asset
             asset = None

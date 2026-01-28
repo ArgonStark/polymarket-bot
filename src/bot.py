@@ -1444,6 +1444,22 @@ class TradingBot:
                     self.clob_feed.unsubscribe(market.up_token_id)
                     self.clob_feed.unsubscribe(market.down_token_id)
 
+                    # IMPORTANT: Clear all tracking for this asset so new market can trade
+                    asset = market.asset
+
+                    # Clear cached API positions
+                    if hasattr(self, '_api_positions') and asset in self._api_positions:
+                        del self._api_positions[asset]
+                        logger.info(f"✅ Cleared cached position for {asset} after settlement")
+
+                    # Clear cooldown
+                    if asset in self._last_order_time:
+                        del self._last_order_time[asset]
+                        logger.debug(f"Cleared cooldown for {asset} after settlement")
+
+                    # Cancel any pending orders for this asset
+                    await self._cancel_pending_orders_for_asset(asset)
+
                     # Cleanup old settled markets (keep last 100)
                     if len(self.settled_markets) > 100:
                         self.settled_markets = set(list(self.settled_markets)[-100:])
@@ -1942,9 +1958,13 @@ class TradingBot:
 
     def _log_position_status(self):
         """
-        Log detailed position status including unrealized P&L.
+        Log detailed position status including all tracking state.
 
-        Called periodically (every 30s) to give visibility into position performance.
+        Called periodically (every 30s) to give visibility into:
+        - Tracked positions (risk_manager.positions)
+        - API-discovered positions (_api_positions)
+        - Pending orders (_pending_orders)
+        - Active cooldowns (_last_order_time)
         """
         now = datetime.now(timezone.utc)
 
@@ -1956,20 +1976,23 @@ class TradingBot:
         self.last_position_log = now
 
         positions = self.risk_manager.positions
-        if not positions:
-            return  # Nothing to log
+        api_positions = getattr(self, '_api_positions', {})
+        pending_orders = getattr(self, '_pending_orders', {})
 
         # Calculate equity
         equity = self._calculate_equity()
         cash = self.risk_manager.current_bankroll
         unrealized_total = equity - cash
 
-        logger.info(f"{Colors.BRIGHT_CYAN}📊 POSITION STATUS{Colors.RESET}")
+        # Always log header with summary
+        logger.info(f"{Colors.BRIGHT_CYAN}📊 POSITION STATUS (every 30s){Colors.RESET}")
         logger.info(
-            f"   Cash: ${cash:.2f} | Unrealized: ${unrealized_total:+.2f} | "
-            f"Equity: ${equity:.2f}"
+            f"   Tracked: {len(positions)} | API: {len(api_positions)} | "
+            f"Pending: {len(pending_orders)} | "
+            f"Cash: ${cash:.2f} | Equity: ${equity:.2f}"
         )
 
+        # Log tracked positions with P&L
         for market_key, position in positions.items():
             market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
             asset = position.market.asset if hasattr(position, 'market') else "???"
@@ -1995,15 +2018,43 @@ class TradingBot:
                 time_remaining = market.time_remaining if market else 0
 
                 logger.info(
-                    f"   {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} → "
+                    f"   📍 {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} → "
                     f"{current_price:.2f} | {pnl_color}P&L: ${unrealized_pnl:+.2f} ({pnl_pct:+.0%}){Colors.RESET} | "
                     f"Time: {time_remaining:.0f}s"
                 )
             else:
                 logger.info(
-                    f"   {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} | "
+                    f"   📍 {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} | "
                     f"(no price data)"
                 )
+
+        # Log API-discovered positions (if any)
+        for asset, pos_info in api_positions.items():
+            # Check if already logged as tracked position
+            tracked_assets = [p.market.asset for p in positions.values() if hasattr(p, 'market')]
+            if asset not in tracked_assets:
+                logger.info(
+                    f"   🔍 {asset} (API): {pos_info.get('size', 0):.1f} shares @ "
+                    f"${pos_info.get('price', 0):.2f} | Market: {pos_info.get('market', 'unknown')}"
+                )
+
+        # Log pending orders
+        for order_id, order_data in pending_orders.items():
+            asset = order_data.get("asset", "???")
+            side = order_data.get("side", "???")
+            size = order_data.get("size", 0)
+            logger.info(f"   ⏳ {asset} {side}: PENDING | {size:.1f} shares | Order: {order_id[:8]}...")
+
+        # Log active cooldowns
+        active_cooldowns = []
+        for asset, last_time in self._last_order_time.items():
+            elapsed = (now - last_time).total_seconds()
+            remaining = self._order_cooldown_seconds - elapsed
+            if remaining > 0:
+                active_cooldowns.append(f"{asset}:{remaining:.0f}s")
+
+        if active_cooldowns:
+            logger.info(f"   ⏱️  Cooldowns: {', '.join(active_cooldowns)}")
 
     def _has_active_position(self, asset: str) -> bool:
         """
