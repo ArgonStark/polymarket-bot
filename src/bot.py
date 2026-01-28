@@ -367,28 +367,32 @@ class TradingBot:
         if self.client is None or self.executor is None:
             return
 
+        # Log that we're checking pending orders
+        logger.debug(f"Checking {len(self._pending_orders)} pending orders...")
+
         orders_to_remove = []
 
         for order_id, order_data in list(self._pending_orders.items()):
             try:
+                asset = order_data.get("asset", "???")
+                placed_time = order_data.get("placed_time")
+                wait_time = (now - placed_time).total_seconds() if placed_time else 0
+
                 # Check order status
                 order_info = self.executor.get_order_status(order_id)
 
                 if order_info is None:
                     # Order not found - might have been filled or cancelled
-                    # Check how long we've been waiting
-                    placed_time = order_data.get("placed_time")
-                    if placed_time:
-                        wait_time = (now - placed_time).total_seconds()
-                        if wait_time > 120:  # 2 minutes timeout
-                            logger.warning(
-                                f"Order {order_id[:16]}... not found after {wait_time:.0f}s - removing"
-                            )
-                            orders_to_remove.append(order_id)
-                            # Restore cooldown to allow new order
-                            asset = order_data.get("asset")
-                            if asset and asset in self._last_order_time:
-                                del self._last_order_time[asset]
+                    if wait_time > 60:  # 1 minute timeout (reduced from 2)
+                        logger.warning(
+                            f"⚠️ Order {order_id[:8]}... ({asset}) not found after {wait_time:.0f}s - removing"
+                        )
+                        orders_to_remove.append(order_id)
+                        # Restore cooldown to allow new order
+                        if asset in self._last_order_time:
+                            del self._last_order_time[asset]
+                    else:
+                        logger.debug(f"Order {order_id[:8]}... ({asset}) status unknown, waiting {wait_time:.0f}s")
                     continue
 
                 signal = order_data.get("signal")
@@ -460,8 +464,8 @@ class TradingBot:
                     if asset in self._last_order_time:
                         del self._last_order_time[asset]
 
-                elif order_info.status.value == "OPEN":
-                    # Still open - check if we should cancel
+                elif order_info.status.value in ["OPEN", "PENDING"]:
+                    # Still open/pending - check if we should cancel
                     should_cancel = False
                     cancel_reason = ""
 
@@ -483,23 +487,43 @@ class TradingBot:
                             should_cancel = True
                             cancel_reason = "market no longer active"
 
-                    # Also cancel if order is too old (over 2 minutes)
-                    placed_time = order_data.get("placed_time")
-                    if placed_time and (now - placed_time).total_seconds() > 120:
+                    # Also cancel if order is too old (over 90 seconds)
+                    if wait_time > 90:
                         should_cancel = True
-                        cancel_reason = "order timeout (2min)"
+                        cancel_reason = f"order timeout ({wait_time:.0f}s)"
 
                     if should_cancel:
                         logger.warning(
                             f"⚠️ Cancelling unfilled order for {asset} - {cancel_reason}"
                         )
-                        self.executor.cancel_order(order_id)
+                        try:
+                            self.executor.cancel_order(order_id)
+                        except Exception as cancel_err:
+                            logger.warning(f"Failed to cancel order: {cancel_err}")
+                        orders_to_remove.append(order_id)
+                        if asset in self._last_order_time:
+                            del self._last_order_time[asset]
+                    else:
+                        logger.debug(f"Order {order_id[:8]}... ({asset}) still {order_info.status.value}, waiting {wait_time:.0f}s")
+
+                else:
+                    # Unknown status - log and apply timeout
+                    logger.warning(f"Unknown order status '{order_info.status.value}' for {asset}")
+                    if wait_time > 90:
+                        logger.warning(f"⚠️ Removing stale order for {asset} with status {order_info.status.value}")
                         orders_to_remove.append(order_id)
                         if asset in self._last_order_time:
                             del self._last_order_time[asset]
 
             except Exception as e:
-                logger.error(f"Error checking order {order_id[:16]}...: {e}")
+                logger.error(f"Error checking order {order_id[:8]}...: {e}")
+                # On error, still remove stale orders
+                if wait_time > 120:
+                    logger.warning(f"⚠️ Removing errored order {order_id[:8]}... after {wait_time:.0f}s")
+                    orders_to_remove.append(order_id)
+                    asset = order_data.get("asset")
+                    if asset and asset in self._last_order_time:
+                        del self._last_order_time[asset]
 
         # Remove processed orders
         for order_id in orders_to_remove:
@@ -2286,9 +2310,10 @@ class TradingBot:
                 self._pending_orders[result.order_id] = {
                     "signal": signal,
                     "asset": asset,
+                    "side": signal.side.value,  # "UP" or "DOWN"
                     "placed_time": now,
                     "price": signal.recommended_price,
-                    "size_shares": signal.size_shares,
+                    "size": signal.size_shares,  # For display in status logs
                     "ml_volatility": ml_volatility,
                     "ml_momentum": ml_momentum,
                     "ml_confidence": ml_confidence,
