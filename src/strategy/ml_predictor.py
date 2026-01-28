@@ -224,14 +224,18 @@ class MLSignalPredictor:
     min_confidence: float = 0.55  # Minimum predicted win probability to trade
     min_training_samples: int = 10  # Minimum trades before using ML filter
     training_samples: int = 0
-    model_path: str = "ml_model.json"
+    model_path: str = ""  # Set in __post_init__
 
     # Performance tracking
     predictions_made: int = 0
     correct_predictions: int = 0
 
     def __post_init__(self):
-        """Load model if exists."""
+        """Initialize model path and load model if exists."""
+        # Use absolute path based on project root (two levels up from this file)
+        if not self.model_path:
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            self.model_path = os.path.join(project_root, "ml_model.json")
         self._load_model()
 
     def extract_features(
@@ -386,9 +390,8 @@ class MLSignalPredictor:
                 f"Accuracy: {accuracy:.0%} ({self.correct_predictions}/{self.predictions_made})"
             )
 
-        # Save model periodically
-        if self.training_samples % 10 == 0:
-            self._save_model()
+        # Save model after EVERY trade (user might stop bot at any time)
+        self._save_model()
 
     def get_model_stats(self) -> dict:
         """Get model statistics."""
@@ -401,6 +404,30 @@ class MLSignalPredictor:
             "min_confidence": self.min_confidence,
             "is_active": self.training_samples >= self.min_training_samples,
         }
+
+    def is_prediction_accurate(self, min_accuracy: float = 0.45, min_samples: int = 10) -> tuple[bool, str]:
+        """
+        Check if model predictions are accurate enough to continue trading.
+
+        Args:
+            min_accuracy: Minimum required accuracy (default 45%)
+            min_samples: Minimum predictions needed before checking (default 10)
+
+        Returns:
+            Tuple of (is_accurate, reason)
+        """
+        if self.predictions_made < min_samples:
+            return (True, f"Not enough predictions yet ({self.predictions_made}/{min_samples})")
+
+        accuracy = self.correct_predictions / self.predictions_made
+        if accuracy < min_accuracy:
+            return (
+                False,
+                f"Prediction accuracy {accuracy:.0%} below {min_accuracy:.0%} minimum "
+                f"({self.correct_predictions}/{self.predictions_made} correct)"
+            )
+
+        return (True, f"Accuracy OK: {accuracy:.0%}")
 
     def _save_model(self):
         """Save model to disk."""

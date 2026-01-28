@@ -1151,27 +1151,57 @@ class TradingBot:
         )
 
         # Record ML outcome for model learning
-        if self.ml_predictor and position.ml_volatility is not None:
-            # We need to recreate the signal to record the outcome
-            # Create a minimal signal-like object for ML recording
+        # Always try to record if ML is enabled - extract features if not stored
+        if self.ml_predictor:
             from types import SimpleNamespace
+
+            # Get ML features - either from stored position data or extract now
+            if position.ml_volatility is not None:
+                # Use stored ML data
+                volatility = position.ml_volatility
+                momentum = position.ml_momentum or 0.0
+                arb_type = position.ml_arb_type or "none"
+                spread = position.ml_spread or 0.0
+                bid_depth = position.ml_bid_depth or 0.0
+                ask_depth = position.ml_ask_depth or 0.0
+                price_trend = position.ml_price_trend or 0.0
+                distance_from_target = position.ml_distance_from_target or 0.0
+            else:
+                # Extract features now (for positions without stored ML data)
+                volatility = self.signal_generator.get_volatility(market.asset)
+                current_price = self.signal_generator.get_price(market.asset)
+                momentum = 0.0
+                if current_price and market.target_price:
+                    momentum = (current_price - market.target_price) / market.target_price
+                    momentum = max(-1, min(1, momentum * 10))
+                arb_type = "none"
+                spread = market.best_ask - market.best_bid if market.best_ask and market.best_bid else 0.0
+                bid_depth = market.bid_depth
+                ask_depth = market.ask_depth
+                price_trend = 0.0
+                distance_from_target = 0.0
+                if current_price and market.target_price:
+                    distance_from_target = abs(current_price - market.target_price) / market.target_price
+
+                logger.debug(f"Extracted ML features at settlement for {market.asset}")
+
             fake_signal = SimpleNamespace(
-                edge=0.0,  # Not needed for outcome
+                edge=0.0,
                 market=market,
                 side=position.side,
-                _arb_type=position.ml_arb_type,  # Pass arb type to extract_features
+                _arb_type=arb_type,
             )
             self.ml_predictor.record_outcome(
                 signal=fake_signal,
-                volatility=position.ml_volatility,
-                price_momentum=position.ml_momentum or 0.0,
+                volatility=volatility,
+                price_momentum=momentum,
                 won=won,
-                arb_type=position.ml_arb_type or "none",
-                spread=position.ml_spread or 0.0,
-                bid_depth=position.ml_bid_depth or 0.0,
-                ask_depth=position.ml_ask_depth or 0.0,
-                price_trend=position.ml_price_trend or 0.0,
-                distance_from_target=position.ml_distance_from_target or 0.0,
+                arb_type=arb_type,
+                spread=spread,
+                bid_depth=bid_depth,
+                ask_depth=ask_depth,
+                price_trend=price_trend,
+                distance_from_target=distance_from_target,
             )
 
     async def _process_market(self, market: MarketState):
