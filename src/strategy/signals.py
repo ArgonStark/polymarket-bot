@@ -656,9 +656,9 @@ class SignalGenerator:
         # Calculate position size
         size_usd, size_shares = self._calculate_position_size(edge, price)
 
-        # Record leg 1 for potential hedging (if not already a hedge)
-        if best["type"] != "hedge" and not best.get("is_leg2"):
-            self.arb_detector.record_leg1_entry(market, side, price)
+        # NOTE: LEG1 is recorded in bot.py AFTER successful trade execution
+        # This prevents recording legs for trades that don't execute due to
+        # cooldown, insufficient balance, or execution failures.
 
         # Clear leg if this is a hedge
         if best.get("is_leg2"):
