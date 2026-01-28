@@ -71,19 +71,36 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("MIN_TIME_REMAINING", "30"))
     )
 
-    # Base position size in USD
+    # Base position size in USD (smaller = more trades, less risk per trade)
     base_position_size: float = field(
-        default_factory=lambda: float(os.getenv("BASE_POSITION_SIZE", "25"))
+        default_factory=lambda: float(os.getenv("BASE_POSITION_SIZE", "10"))
     )
 
     # Maximum position as percentage of bankroll
     max_position_pct: float = field(
-        default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.15"))
+        default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.10"))
     )
 
-    # Maximum concurrent positions
+    # Maximum concurrent positions (higher = parallel trading)
     max_concurrent_positions: int = field(
-        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "2"))
+        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "4"))
+    )
+
+    # Cooldown between trades for SAME asset (seconds)
+    # Lower = faster trading, but risk of duplicate orders
+    order_cooldown_seconds: int = field(
+        default_factory=lambda: int(os.getenv("ORDER_COOLDOWN_SECONDS", "15"))
+    )
+
+    # Asset priority - higher priority assets get checked first
+    # BTC and ETH are most liquid, best for arbitrage
+    asset_priority: list = field(
+        default_factory=lambda: os.getenv("ASSET_PRIORITY", "BTC,ETH,SOL,XRP").split(",")
+    )
+
+    # Enable parallel market processing (faster but more API calls)
+    parallel_execution: bool = field(
+        default_factory=lambda: os.getenv("PARALLEL_EXECUTION", "true").lower() == "true"
     )
 
     # Daily loss limit as percentage of starting bankroll
@@ -363,8 +380,10 @@ class BotConfig:
         default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"]
     )
 
-    # Trading loop interval (seconds)
-    loop_interval: float = 0.5
+    # Trading loop interval (seconds) - lower = faster signal detection
+    loop_interval: float = field(
+        default_factory=lambda: float(os.getenv("LOOP_INTERVAL", "0.25"))
+    )
 
     # Market refresh interval (seconds)
     market_refresh_interval: float = 60.0
