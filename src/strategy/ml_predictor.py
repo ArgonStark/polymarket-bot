@@ -249,6 +249,330 @@ class SimpleLogisticRegression:
 
 
 @dataclass
+class SimpleNeuralNetwork:
+    """
+    Simple 2-layer neural network for online learning.
+    More powerful than logistic regression, adapts to new patterns.
+
+    Architecture: Input(11) -> Hidden(16) -> Output(1)
+    Uses ReLU activation and online gradient descent.
+    """
+    input_size: int = 11  # Simplified features for trader model
+    hidden_size: int = 16
+    learning_rate: float = 0.05
+
+    # Weights
+    weights_ih: list[list[float]] = field(default_factory=list)  # Input -> Hidden
+    weights_ho: list[float] = field(default_factory=list)  # Hidden -> Output
+    bias_h: list[float] = field(default_factory=list)  # Hidden bias
+    bias_o: float = 0.0  # Output bias
+
+    def __post_init__(self):
+        """Initialize weights if not provided."""
+        import random
+        random.seed(42)
+
+        if not self.weights_ih:
+            # Xavier initialization
+            scale = (2.0 / (self.input_size + self.hidden_size)) ** 0.5
+            self.weights_ih = [
+                [random.gauss(0, scale) for _ in range(self.input_size)]
+                for _ in range(self.hidden_size)
+            ]
+
+        if not self.weights_ho:
+            scale = (2.0 / (self.hidden_size + 1)) ** 0.5
+            self.weights_ho = [random.gauss(0, scale) for _ in range(self.hidden_size)]
+
+        if not self.bias_h:
+            self.bias_h = [0.0] * self.hidden_size
+
+    def _relu(self, x: float) -> float:
+        """ReLU activation."""
+        return max(0, x)
+
+    def _relu_derivative(self, x: float) -> float:
+        """ReLU derivative."""
+        return 1.0 if x > 0 else 0.0
+
+    def _sigmoid(self, x: float) -> float:
+        """Sigmoid activation for output."""
+        x = max(-500, min(500, x))
+        return 1.0 / (1.0 + math.exp(-x))
+
+    def forward(self, features: list[float]) -> tuple[float, list[float]]:
+        """Forward pass, returns (output, hidden_activations)."""
+        # Pad or truncate features to match input size
+        if len(features) < self.input_size:
+            features = features + [0.0] * (self.input_size - len(features))
+        elif len(features) > self.input_size:
+            features = features[:self.input_size]
+
+        # Hidden layer
+        hidden = []
+        for i in range(self.hidden_size):
+            z = self.bias_h[i] + sum(
+                w * f for w, f in zip(self.weights_ih[i], features)
+            )
+            hidden.append(self._relu(z))
+
+        # Output layer
+        z_out = self.bias_o + sum(w * h for w, h in zip(self.weights_ho, hidden))
+        output = self._sigmoid(z_out)
+
+        return output, hidden
+
+    def predict_proba(self, features: list[float]) -> float:
+        """Predict probability of win."""
+        output, _ = self.forward(features)
+        return output
+
+    def update(self, features: list[float], outcome: int):
+        """Update weights using backpropagation."""
+        # Pad or truncate features
+        if len(features) < self.input_size:
+            features = features + [0.0] * (self.input_size - len(features))
+        elif len(features) > self.input_size:
+            features = features[:self.input_size]
+
+        # Forward pass
+        output, hidden = self.forward(features)
+
+        # Calculate output error
+        output_error = outcome - output
+        output_delta = output_error * output * (1 - output)  # Sigmoid derivative
+
+        # Update output weights
+        for i in range(self.hidden_size):
+            self.weights_ho[i] += self.learning_rate * output_delta * hidden[i]
+        self.bias_o += self.learning_rate * output_delta
+
+        # Calculate hidden errors and update hidden weights
+        for i in range(self.hidden_size):
+            # Hidden layer pre-activation for ReLU derivative
+            z_h = self.bias_h[i] + sum(
+                w * f for w, f in zip(self.weights_ih[i], features)
+            )
+            hidden_delta = output_delta * self.weights_ho[i] * self._relu_derivative(z_h)
+
+            for j in range(self.input_size):
+                self.weights_ih[i][j] += self.learning_rate * hidden_delta * features[j]
+            self.bias_h[i] += self.learning_rate * hidden_delta
+
+    def to_dict(self) -> dict:
+        """Serialize model."""
+        return {
+            "input_size": self.input_size,
+            "hidden_size": self.hidden_size,
+            "learning_rate": self.learning_rate,
+            "weights_ih": self.weights_ih,
+            "weights_ho": self.weights_ho,
+            "bias_h": self.bias_h,
+            "bias_o": self.bias_o,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SimpleNeuralNetwork":
+        """Deserialize model."""
+        return cls(
+            input_size=data.get("input_size", 11),
+            hidden_size=data.get("hidden_size", 16),
+            learning_rate=data.get("learning_rate", 0.05),
+            weights_ih=data.get("weights_ih", []),
+            weights_ho=data.get("weights_ho", []),
+            bias_h=data.get("bias_h", []),
+            bias_o=data.get("bias_o", 0.0),
+        )
+
+
+class TraderModelLoader:
+    """
+    Loads the pre-trained Random Forest model from successful trader data.
+    """
+
+    def __init__(self, model_path: str = None):
+        if model_path is None:
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            model_path = os.path.join(project_root, "trader_model.json")
+
+        self.model_path = model_path
+        self.trees = []
+        self.feature_names = []
+        self.is_loaded = False
+        self._load()
+
+    def _load(self):
+        """Load model from disk."""
+        try:
+            if os.path.exists(self.model_path):
+                with open(self.model_path, "r") as f:
+                    data = json.load(f)
+
+                model_data = data.get("model", {})
+                self.trees = model_data.get("trees", [])
+                self.feature_names = model_data.get("feature_names", [])
+                self.is_loaded = len(self.trees) > 0
+
+                if self.is_loaded:
+                    metrics = data.get("metrics", {}).get("test", {})
+                    logger.info(
+                        f"Loaded trader model: {len(self.trees)} trees | "
+                        f"Accuracy: {metrics.get('accuracy', 0)*100:.1f}%"
+                    )
+        except Exception as e:
+            logger.warning(f"Could not load trader model: {e}")
+            self.is_loaded = False
+
+    def _predict_tree(self, tree: dict, features: list[float]) -> float:
+        """Predict using a single tree."""
+        if tree.get("leaf"):
+            return tree.get("prediction", 0.5)
+
+        feature_idx = tree.get("feature", 0)
+        threshold = tree.get("threshold", 0.5)
+
+        if feature_idx < len(features) and features[feature_idx] <= threshold:
+            return self._predict_tree(tree.get("left", {"leaf": True, "prediction": 0.5}), features)
+        else:
+            return self._predict_tree(tree.get("right", {"leaf": True, "prediction": 0.5}), features)
+
+    def predict_proba(self, features: list[float]) -> float:
+        """Predict probability using Random Forest."""
+        if not self.is_loaded or not self.trees:
+            return 0.5
+
+        predictions = [self._predict_tree(tree, features) for tree in self.trees]
+        return sum(predictions) / len(predictions)
+
+    def extract_simple_features(self, signal, market) -> list[float]:
+        """
+        Extract simplified features matching the trader model format.
+
+        The trader model uses 11 features:
+        [price, size, usdc_size, hour, day, time_remaining, is_btc, is_eth, is_sol, is_xrp, is_up]
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+
+        # Get price (use recommended_price from signal)
+        price = getattr(signal, 'recommended_price', 0.5)
+
+        # Size (normalized)
+        size = getattr(signal, 'size_shares', 10) / 100
+        usdc_size = getattr(signal, 'size_usd', 10) / 200
+
+        # Time features
+        hour = now.hour / 24
+        day = now.weekday() / 7
+
+        # Time remaining
+        time_remaining = getattr(signal, 'time_remaining', 450) / 900
+
+        # Asset one-hot
+        asset = market.asset if hasattr(market, 'asset') else "BTC"
+        is_btc = 1.0 if asset == "BTC" else 0.0
+        is_eth = 1.0 if asset == "ETH" else 0.0
+        is_sol = 1.0 if asset == "SOL" else 0.0
+        is_xrp = 1.0 if asset == "XRP" else 0.0
+
+        # Side
+        side = getattr(signal, 'side', None)
+        is_up = 1.0 if side and side.value == "UP" else 0.0
+
+        return [price, size, usdc_size, hour, day, time_remaining,
+                is_btc, is_eth, is_sol, is_xrp, is_up]
+
+
+@dataclass
+class HybridPredictor:
+    """
+    Hybrid ML predictor combining:
+    1. Random Forest (pre-trained on successful trader)
+    2. Neural Network (online learning from your trades)
+
+    The combination provides stable base predictions while
+    adapting to current market conditions.
+    """
+
+    # Base model weight (0.7 = 70% base, 30% adaptive)
+    base_weight: float = 0.7
+
+    # Models
+    trader_model: TraderModelLoader = field(default_factory=TraderModelLoader)
+    adaptive_model: SimpleNeuralNetwork = field(default_factory=SimpleNeuralNetwork)
+
+    # Tracking
+    predictions_made: int = 0
+    correct_predictions: int = 0
+    training_samples: int = 0
+
+    def predict_proba(self, signal, market, full_features: list[float]) -> float:
+        """
+        Predict win probability using hybrid approach.
+
+        Args:
+            signal: Trading signal
+            market: Market state
+            full_features: Full 29-feature vector for adaptive model
+
+        Returns:
+            Combined probability estimate
+        """
+        # Get base prediction from trader model
+        if self.trader_model.is_loaded:
+            simple_features = self.trader_model.extract_simple_features(signal, market)
+            base_prob = self.trader_model.predict_proba(simple_features)
+        else:
+            base_prob = 0.5
+
+        # Get adaptive prediction (uses first 11 features)
+        adaptive_features = full_features[:11] if len(full_features) >= 11 else full_features
+        adaptive_prob = self.adaptive_model.predict_proba(adaptive_features)
+
+        # Combine predictions
+        if self.trader_model.is_loaded:
+            combined = self.base_weight * base_prob + (1 - self.base_weight) * adaptive_prob
+        else:
+            # If no trader model, use only adaptive
+            combined = adaptive_prob
+
+        return combined
+
+    def update(self, features: list[float], outcome: int):
+        """Update adaptive model with new outcome."""
+        # Only update adaptive model (trader model is static)
+        adaptive_features = features[:11] if len(features) >= 11 else features
+        self.adaptive_model.update(adaptive_features, outcome)
+        self.training_samples += 1
+
+    def to_dict(self) -> dict:
+        """Serialize hybrid predictor."""
+        return {
+            "base_weight": self.base_weight,
+            "adaptive_model": self.adaptive_model.to_dict(),
+            "predictions_made": self.predictions_made,
+            "correct_predictions": self.correct_predictions,
+            "training_samples": self.training_samples,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "HybridPredictor":
+        """Deserialize hybrid predictor."""
+        predictor = cls(
+            base_weight=data.get("base_weight", 0.7),
+            predictions_made=data.get("predictions_made", 0),
+            correct_predictions=data.get("correct_predictions", 0),
+            training_samples=data.get("training_samples", 0),
+        )
+
+        if "adaptive_model" in data:
+            predictor.adaptive_model = SimpleNeuralNetwork.from_dict(data["adaptive_model"])
+
+        return predictor
+
+
+@dataclass
 class MLSignalPredictor:
     """
     Machine Learning predictor for signal quality.
@@ -258,6 +582,7 @@ class MLSignalPredictor:
     - Uses online learning (updates after each trade)
     - Persists model to disk
     - Provides win probability predictions
+    - HYBRID MODE: Combines pre-trained trader model with adaptive neural network
     """
 
     model: SimpleLogisticRegression = field(default_factory=SimpleLogisticRegression)
@@ -270,6 +595,10 @@ class MLSignalPredictor:
     predictions_made: int = 0
     correct_predictions: int = 0
 
+    # Hybrid predictor (combines trader model + adaptive neural network)
+    hybrid_predictor: Optional[HybridPredictor] = None
+    use_hybrid: bool = True  # Enable hybrid mode by default
+
     def __post_init__(self):
         """Initialize model path and load model if exists."""
         # Use absolute path based on project root (two levels up from this file)
@@ -277,6 +606,14 @@ class MLSignalPredictor:
             project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             self.model_path = os.path.join(project_root, "ml_model.json")
         self._load_model()
+
+        # Initialize hybrid predictor
+        if self.use_hybrid and self.hybrid_predictor is None:
+            self.hybrid_predictor = HybridPredictor()
+            if self.hybrid_predictor.trader_model.is_loaded:
+                logger.info("🤖 Hybrid ML enabled: Trader model + Adaptive NN")
+            else:
+                logger.info("🤖 Hybrid ML enabled: Adaptive NN only (no trader model found)")
 
     def extract_features(
         self,
@@ -427,16 +764,25 @@ class MLSignalPredictor:
             trend_1h, trend_4h, trend_1d
         )
         feature_vector = features.to_vector()
-        confidence = self.model.predict_proba(feature_vector)
+
+        # Use hybrid predictor if available, otherwise use logistic regression
+        if self.use_hybrid and self.hybrid_predictor is not None:
+            # Get market from signal for hybrid predictor
+            market = getattr(signal, 'market', None)
+            confidence = self.hybrid_predictor.predict_proba(signal, market, feature_vector)
+            model_type = "Hybrid" if self.hybrid_predictor.trader_model.is_loaded else "NN"
+        else:
+            confidence = self.model.predict_proba(feature_vector)
+            model_type = "LR"
 
         # Log feature importance info for debugging
         arb_info = f" [ARB: {arb_type}]" if arb_type != "none" else ""
         bn_info = f" [BN: {binance_confirmation}]" if binance_confirmation != "NONE" else ""
 
         if confidence < threshold:
-            return (False, confidence, f"ML rejected: {confidence:.0%} < {threshold:.0%}{arb_info}{bn_info}")
+            return (False, confidence, f"{model_type} rejected: {confidence:.0%} < {threshold:.0%}{arb_info}{bn_info}")
         else:
-            return (True, confidence, f"ML confidence: {confidence:.0%} (threshold: {threshold:.0%}){arb_info}{bn_info}")
+            return (True, confidence, f"{model_type} confidence: {confidence:.0%} (threshold: {threshold:.0%}){arb_info}{bn_info}")
 
     def record_outcome(
         self,
@@ -496,9 +842,14 @@ class MLSignalPredictor:
         self.model.update(feature_vector, 1 if won else 0)
         self.training_samples += 1
 
+        # Also update hybrid predictor's adaptive model
+        if self.use_hybrid and self.hybrid_predictor is not None:
+            self.hybrid_predictor.update(feature_vector, 1 if won else 0)
+
         # Log outcome recording
         result_str = "WIN" if won else "LOSS"
-        logger.info(f"🤖 ML recorded: {result_str} | Sample #{self.training_samples}")
+        model_type = "Hybrid" if (self.use_hybrid and self.hybrid_predictor and self.hybrid_predictor.trader_model.is_loaded) else "ML"
+        logger.info(f"🤖 {model_type} recorded: {result_str} | Sample #{self.training_samples}")
 
         # Log learning progress
         if self.training_samples % 5 == 0:
@@ -514,14 +865,25 @@ class MLSignalPredictor:
     def get_model_stats(self) -> dict:
         """Get model statistics."""
         accuracy = self.correct_predictions / max(1, self.predictions_made)
-        return {
+        stats = {
             "training_samples": self.training_samples,
             "predictions_made": self.predictions_made,
             "correct_predictions": self.correct_predictions,
             "accuracy": accuracy,
             "min_confidence": self.min_confidence,
             "is_active": self.training_samples >= self.min_training_samples,
+            "hybrid_enabled": self.use_hybrid,
         }
+
+        # Add hybrid predictor stats
+        if self.use_hybrid and self.hybrid_predictor is not None:
+            stats["trader_model_loaded"] = self.hybrid_predictor.trader_model.is_loaded
+            stats["hybrid_training_samples"] = self.hybrid_predictor.training_samples
+            stats["model_type"] = "Hybrid RF+NN" if self.hybrid_predictor.trader_model.is_loaded else "Adaptive NN"
+        else:
+            stats["model_type"] = "Logistic Regression"
+
+        return stats
 
     def is_prediction_accurate(self, min_accuracy: float = 0.45, min_samples: int = 10) -> tuple[bool, str]:
         """
@@ -557,9 +919,16 @@ class MLSignalPredictor:
                 "correct_predictions": self.correct_predictions,
                 "min_confidence": self.min_confidence,
             }
+
+            # Save hybrid predictor state
+            if self.use_hybrid and self.hybrid_predictor is not None:
+                data["hybrid_predictor"] = self.hybrid_predictor.to_dict()
+
             with open(self.model_path, "w") as f:
                 json.dump(data, f, indent=2)
-            logger.info(f"🤖 ML model saved: {self.training_samples} samples → {self.model_path}")
+
+            model_type = "Hybrid" if (self.use_hybrid and self.hybrid_predictor and self.hybrid_predictor.trader_model.is_loaded) else "ML"
+            logger.info(f"🤖 {model_type} model saved: {self.training_samples} samples → {self.model_path}")
         except Exception as e:
             logger.error(f"Failed to save ML model: {e}")
 
@@ -630,6 +999,10 @@ class MLSignalPredictor:
 
                 self.model = SimpleLogisticRegression.from_dict(model_data)
                 self.min_confidence = data.get("min_confidence", 0.55)
+
+                # Load hybrid predictor state if present
+                if self.use_hybrid and "hybrid_predictor" in data:
+                    self.hybrid_predictor = HybridPredictor.from_dict(data["hybrid_predictor"])
 
                 logger.info(
                     f"🤖 ML model loaded: {self.training_samples} samples, "
