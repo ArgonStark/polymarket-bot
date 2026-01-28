@@ -9,6 +9,8 @@ ENHANCED: Now includes features for:
 - Market spread and order book depth
 - Price trend from historical data
 - Distance from target price
+- Binance price lead (faster indicator)
+- Binance confirmation signals (STRONG, MEDIUM, WEAK, NONE)
 - Better integration with all bot components
 """
 
@@ -26,6 +28,9 @@ logger = logging.getLogger(__name__)
 # Arbitrage signal types for one-hot encoding
 ARB_TYPES = ["none", "binary_arb", "asymmetric", "dump", "hedge"]
 
+# Binance confirmation types for one-hot encoding
+BINANCE_CONF_TYPES = ["NONE", "WEAK", "MEDIUM", "STRONG"]
+
 
 @dataclass
 class TradeFeatures:
@@ -39,6 +44,8 @@ class TradeFeatures:
     - ask_depth: Order book ask depth
     - price_trend: Short-term price trend from historical data
     - distance_from_target: How far current price is from target
+    - binance_lead_pct: Binance price lead over Chainlink (faster indicator)
+    - binance_confirmation: Confirmation signal type (STRONG, MEDIUM, WEAK, NONE)
     """
     # Core features
     edge: float  # Expected edge/profit margin
@@ -50,7 +57,7 @@ class TradeFeatures:
     asset: str  # BTC, ETH, SOL, XRP
     side: str  # UP or DOWN
 
-    # NEW: Enhanced features
+    # Enhanced features
     arb_type: str = "none"  # Type of arbitrage (none, binary_arb, asymmetric, dump, hedge)
     spread: float = 0.0  # Market bid-ask spread
     bid_depth: float = 0.0  # Order book bid depth
@@ -58,8 +65,12 @@ class TradeFeatures:
     price_trend: float = 0.0  # Short-term price trend (-1 to 1)
     distance_from_target: float = 0.0  # Normalized distance from target price
 
+    # Binance confirmation features (leading indicator)
+    binance_lead_pct: float = 0.0  # (Binance - Chainlink) / Chainlink
+    binance_confirmation: str = "NONE"  # STRONG, MEDIUM, WEAK, NONE
+
     def to_vector(self) -> list[float]:
-        """Convert to feature vector for model (21 features total)."""
+        """Convert to feature vector for model (26 features total)."""
         # Normalize features to roughly 0-1 range
         vector = [
             # Core features (6)
@@ -76,19 +87,27 @@ class TradeFeatures:
             1.0 if self.asset == "XRP" else 0.0,
             # Side (1)
             1.0 if self.side == "UP" else 0.0,
-            # NEW: Arb type one-hot (5)
+            # Arb type one-hot (5)
             1.0 if self.arb_type == "none" else 0.0,
             1.0 if self.arb_type == "binary_arb" else 0.0,
             1.0 if self.arb_type == "asymmetric" else 0.0,
             1.0 if self.arb_type == "dump" else 0.0,
             1.0 if self.arb_type == "hedge" else 0.0,
-            # NEW: Market features (4)
+            # Market features (4)
             min(self.spread * 10, 1.0),  # spread 0.1 -> 1.0
             min(self.bid_depth / 10000, 1.0),  # depth 10k -> 1.0
             min(self.ask_depth / 10000, 1.0),
             (self.price_trend + 1) / 2,  # -1,1 -> 0,1
-            # NEW: Distance from target (1)
+            # Distance from target (1)
             min(abs(self.distance_from_target) * 100, 1.0),  # 1% -> 1.0
+            # Binance confirmation features (5)
+            # Lead percentage normalized: -1% to +1% -> 0 to 1
+            (max(-0.01, min(0.01, self.binance_lead_pct)) + 0.01) / 0.02,
+            # Confirmation type one-hot (4)
+            1.0 if self.binance_confirmation == "NONE" else 0.0,
+            1.0 if self.binance_confirmation == "WEAK" else 0.0,
+            1.0 if self.binance_confirmation == "MEDIUM" else 0.0,
+            1.0 if self.binance_confirmation == "STRONG" else 0.0,
         ]
         return vector
 
@@ -109,6 +128,8 @@ class TradeFeatures:
             "ask_depth": self.ask_depth,
             "price_trend": self.price_trend,
             "distance_from_target": self.distance_from_target,
+            "binance_lead_pct": self.binance_lead_pct,
+            "binance_confirmation": self.binance_confirmation,
         }
 
     @classmethod
@@ -129,6 +150,8 @@ class TradeFeatures:
             ask_depth=data.get("ask_depth", 0.0),
             price_trend=data.get("price_trend", 0.0),
             distance_from_target=data.get("distance_from_target", 0.0),
+            binance_lead_pct=data.get("binance_lead_pct", 0.0),
+            binance_confirmation=data.get("binance_confirmation", "NONE"),
         )
 
 
@@ -138,12 +161,12 @@ class SimpleLogisticRegression:
     A simple logistic regression model that doesn't require sklearn.
     Uses online learning to update weights incrementally.
 
-    UPDATED: Now supports 21 features (was 11) for enhanced ML integration.
+    UPDATED: Now supports 26 features for enhanced ML integration including Binance data.
     """
     weights: list[float] = field(default_factory=list)
     bias: float = 0.0
     learning_rate: float = 0.1
-    n_features: int = 21  # Number of features in TradeFeatures.to_vector()
+    n_features: int = 26  # Number of features in TradeFeatures.to_vector()
 
     def __post_init__(self):
         if not self.weights:
@@ -249,6 +272,8 @@ class MLSignalPredictor:
         ask_depth: float = 0.0,
         price_trend: float = 0.0,
         distance_from_target: float = 0.0,
+        binance_lead_pct: float = 0.0,
+        binance_confirmation: str = "NONE",
     ) -> TradeFeatures:
         """
         Extract features from a trading signal.
@@ -263,6 +288,8 @@ class MLSignalPredictor:
             ask_depth: Order book ask depth
             price_trend: Short-term price trend from historical data
             distance_from_target: How far current price is from target
+            binance_lead_pct: Binance price lead over Chainlink (as decimal)
+            binance_confirmation: Confirmation type (STRONG, MEDIUM, WEAK, NONE)
         """
         now = datetime.now(timezone.utc)
 
@@ -285,6 +312,8 @@ class MLSignalPredictor:
             ask_depth=ask_depth,
             price_trend=price_trend,
             distance_from_target=distance_from_target,
+            binance_lead_pct=binance_lead_pct,
+            binance_confirmation=binance_confirmation,
         )
 
     def should_trade(
@@ -298,6 +327,8 @@ class MLSignalPredictor:
         ask_depth: float = 0.0,
         price_trend: float = 0.0,
         distance_from_target: float = 0.0,
+        binance_lead_pct: float = 0.0,
+        binance_confirmation: str = "NONE",
     ) -> tuple[bool, float, str]:
         """
         Decide if we should take this trade based on ML prediction.
@@ -312,6 +343,8 @@ class MLSignalPredictor:
             ask_depth: Order book ask depth
             price_trend: Short-term price trend
             distance_from_target: Distance from target price
+            binance_lead_pct: Binance price lead over Chainlink
+            binance_confirmation: Confirmation type (STRONG, MEDIUM, WEAK, NONE)
 
         Returns:
             Tuple of (should_trade, confidence, reason)
@@ -323,18 +356,19 @@ class MLSignalPredictor:
         # Extract features and predict
         features = self.extract_features(
             signal, volatility, price_momentum, arb_type,
-            spread, bid_depth, ask_depth, price_trend, distance_from_target
+            spread, bid_depth, ask_depth, price_trend, distance_from_target,
+            binance_lead_pct, binance_confirmation
         )
         feature_vector = features.to_vector()
         confidence = self.model.predict_proba(feature_vector)
 
         # Log feature importance info for debugging
+        arb_info = f" [ARB: {arb_type}]" if arb_type != "none" else ""
+        bn_info = f" [BN: {binance_confirmation}]" if binance_confirmation != "NONE" else ""
         if confidence < self.min_confidence:
-            arb_info = f" [ARB: {arb_type}]" if arb_type != "none" else ""
-            return (False, confidence, f"ML rejected: {confidence:.0%} < {self.min_confidence:.0%}{arb_info}")
+            return (False, confidence, f"ML rejected: {confidence:.0%} < {self.min_confidence:.0%}{arb_info}{bn_info}")
         else:
-            arb_info = f" [ARB: {arb_type}]" if arb_type != "none" else ""
-            return (True, confidence, f"ML confidence: {confidence:.0%}{arb_info}")
+            return (True, confidence, f"ML confidence: {confidence:.0%}{arb_info}{bn_info}")
 
     def record_outcome(
         self,
@@ -348,6 +382,8 @@ class MLSignalPredictor:
         ask_depth: float = 0.0,
         price_trend: float = 0.0,
         distance_from_target: float = 0.0,
+        binance_lead_pct: float = 0.0,
+        binance_confirmation: str = "NONE",
     ):
         """
         Record a trade outcome and update the model.
@@ -363,10 +399,13 @@ class MLSignalPredictor:
             ask_depth: Order book ask depth at trade time
             price_trend: Price trend at trade time
             distance_from_target: Distance from target at trade time
+            binance_lead_pct: Binance price lead over Chainlink at trade time
+            binance_confirmation: Confirmation type at trade time
         """
         features = self.extract_features(
             signal, volatility, price_momentum, arb_type,
-            spread, bid_depth, ask_depth, price_trend, distance_from_target
+            spread, bid_depth, ask_depth, price_trend, distance_from_target,
+            binance_lead_pct, binance_confirmation
         )
         feature_vector = features.to_vector()
 
@@ -455,16 +494,19 @@ class MLSignalPredictor:
                 model_data = data.get("model", {})
                 old_weights = model_data.get("weights", [])
 
-                # Check if we need to migrate from old (11 features) to new (21 features)
-                expected_features = 21
+                # Check if we need to migrate feature counts
+                # 11 -> 21: Added arb type and market features
+                # 21 -> 26: Added Binance confirmation features
+                expected_features = 26
+                import random
+                random.seed(42)
+
                 if len(old_weights) == 11:
                     logger.info(
-                        f"🤖 Migrating ML model from 11 to 21 features..."
+                        f"🤖 Migrating ML model from 11 to 26 features (adding arb + Binance)..."
                     )
-                    # Extend weights with zeros for new features
-                    import random
-                    random.seed(42)
-                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(10)]
+                    # Extend weights with small random values for new features
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(15)]
                     model_data["weights"] = new_weights
                     # Reset training samples since feature set changed significantly
                     self.training_samples = max(0, data.get("training_samples", 0) // 2)
@@ -472,6 +514,20 @@ class MLSignalPredictor:
                     self.correct_predictions = 0
                     logger.info(
                         f"🤖 Migration complete - model needs retraining with new features"
+                    )
+                elif len(old_weights) == 21:
+                    logger.info(
+                        f"🤖 Migrating ML model from 21 to 26 features (adding Binance)..."
+                    )
+                    # Extend weights for Binance features only
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(5)]
+                    model_data["weights"] = new_weights
+                    # Keep most training data, slight reset since new features added
+                    self.training_samples = max(0, int(data.get("training_samples", 0) * 0.75))
+                    self.predictions_made = int(data.get("predictions_made", 0) * 0.75)
+                    self.correct_predictions = int(data.get("correct_predictions", 0) * 0.75)
+                    logger.info(
+                        f"🤖 Migration complete - model will retrain with Binance features"
                     )
                 else:
                     self.training_samples = data.get("training_samples", 0)
@@ -587,6 +643,19 @@ def extract_ml_features_from_market(
     if current_price and market.target_price:
         distance_from_target = (current_price - market.target_price) / market.target_price
 
+    # Binance confirmation features
+    binance_lead_pct = 0.0
+    binance_confirmation = "NONE"
+
+    # Get Binance confirmation if available
+    if hasattr(signal_generator, 'get_binance_confirmation'):
+        binance_conf = signal_generator.get_binance_confirmation(
+            asset=market.asset,
+            target_price=market.target_price,
+        )
+        binance_lead_pct = binance_conf.get("lead_pct", 0.0) or 0.0
+        binance_confirmation = binance_conf.get("confirmation_type", "NONE")
+
     return {
         "volatility": volatility,
         "price_momentum": price_momentum,
@@ -596,4 +665,6 @@ def extract_ml_features_from_market(
         "ask_depth": ask_depth,
         "price_trend": price_trend,
         "distance_from_target": distance_from_target,
+        "binance_lead_pct": binance_lead_pct,
+        "binance_confirmation": binance_confirmation,
     }
