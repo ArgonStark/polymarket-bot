@@ -73,9 +73,13 @@ class RiskManager:
 
         logger.info(f"Risk manager initialized with ${bankroll:.2f} bankroll")
 
-    def can_trade(self) -> tuple[bool, str]:
+    def can_trade(self, equity: Optional[float] = None) -> tuple[bool, str]:
         """
         Check if trading is currently allowed.
+
+        Args:
+            equity: Current equity (cash + unrealized position value).
+                   If not provided, uses current_bankroll (conservative).
 
         Returns:
             Tuple of (can_trade, reason_if_not)
@@ -102,9 +106,12 @@ class RiskManager:
         if self.consecutive_losses >= trading.max_consecutive_losses:
             return (False, f"Hit {self.consecutive_losses} consecutive losses")
 
-        # Check drawdown from peak
+        # Check drawdown from peak using EQUITY (not just cash)
+        # Equity = cash + unrealized position value
+        # This prevents false drawdown triggers when positions are open and winning
+        current_equity = equity if equity is not None else self.current_bankroll
         if self.peak_bankroll > 0:
-            drawdown = (self.peak_bankroll - self.current_bankroll) / self.peak_bankroll
+            drawdown = (self.peak_bankroll - current_equity) / self.peak_bankroll
             if drawdown >= trading.max_drawdown_pct:
                 return (False, f"Drawdown {drawdown:.1%} exceeds {trading.max_drawdown_pct:.0%} limit")
 

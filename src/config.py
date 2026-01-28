@@ -156,9 +156,9 @@ class TradingConfig:
     # === Early Exit Settings (Take-Profit / Stop-Loss) ===
     # Close positions early to lock in profits or limit losses
 
-    # Enable early exit feature
+    # Enable early exit feature (disabled by default - experimental)
     early_exit_enabled: bool = field(
-        default_factory=lambda: os.getenv("EARLY_EXIT_ENABLED", "true").lower() == "true"
+        default_factory=lambda: os.getenv("EARLY_EXIT_ENABLED", "false").lower() == "true"
     )
 
     # Take-profit threshold (e.g., 0.30 = close when +30% profit)

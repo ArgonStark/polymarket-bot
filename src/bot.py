@@ -124,6 +124,8 @@ class TradingBot:
         self.balance_sync_interval = 30.0  # Sync balance every 30s
         self.orders_sync_interval = 60.0  # Sync open orders every 60s
         self.period_transition_delay = 5.0  # Seconds to wait after period boundary for price data
+        self.position_log_interval = 30.0  # Log position status every 30s
+        self.last_position_log = None  # Track last position log time
 
         # Control flags
         self._running = False
@@ -773,8 +775,15 @@ class TradingBot:
                 # Move expiring markets out of active trading
                 await self._check_expiring_markets()
 
-                # Check if trading is allowed
-                can_trade, reason = self.risk_manager.can_trade()
+                # Log position status periodically (every 30s)
+                self._log_position_status()
+
+                # Calculate equity (cash + unrealized position value)
+                # This prevents false drawdown triggers when positions are open
+                equity = self._calculate_equity()
+
+                # Check if trading is allowed (use equity for drawdown check)
+                can_trade, reason = self.risk_manager.can_trade(equity=equity)
                 if not can_trade:
                     logger.warning(f"Trading paused: {reason}")
                     await asyncio.sleep(60.0)
@@ -1693,6 +1702,109 @@ class TradingBot:
             status_parts.append(f"{Colors.DIM}{price_str}{Colors.RESET}")
 
         logger.info(" │ ".join(status_parts))
+
+    def _calculate_equity(self) -> float:
+        """
+        Calculate current equity: cash + unrealized position value.
+
+        For each open position, estimate its current value based on
+        order book prices. This gives a more accurate picture of
+        actual account value than just looking at cash.
+
+        Returns:
+            Total equity (cash + unrealized position value)
+        """
+        cash = self.risk_manager.current_bankroll
+        unrealized_value = 0.0
+
+        for market_key, position in self.risk_manager.positions.items():
+            # Find the market
+            market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
+            if not market:
+                # If we can't find market, use cost basis as conservative estimate
+                unrealized_value += position.cost_basis
+                continue
+
+            # Get current market price for our side
+            if position.side == Side.UP:
+                current_price = market.best_bid  # What we could sell for
+            else:
+                # For DOWN, value is 1 - UP_ask
+                current_price = 1.0 - market.best_ask if market.best_ask else None
+
+            if current_price and current_price > 0:
+                # Current value = shares * current price
+                unrealized_value += position.shares * current_price
+            else:
+                # Fallback to cost basis
+                unrealized_value += position.cost_basis
+
+        return cash + unrealized_value
+
+    def _log_position_status(self):
+        """
+        Log detailed position status including unrealized P&L.
+
+        Called periodically (every 30s) to give visibility into position performance.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Check if it's time to log
+        if self.last_position_log:
+            elapsed = (now - self.last_position_log).total_seconds()
+            if elapsed < self.position_log_interval:
+                return
+        self.last_position_log = now
+
+        positions = self.risk_manager.positions
+        if not positions:
+            return  # Nothing to log
+
+        # Calculate equity
+        equity = self._calculate_equity()
+        cash = self.risk_manager.current_bankroll
+        unrealized_total = equity - cash
+
+        logger.info(f"{Colors.BRIGHT_CYAN}📊 POSITION STATUS{Colors.RESET}")
+        logger.info(
+            f"   Cash: ${cash:.2f} | Unrealized: ${unrealized_total:+.2f} | "
+            f"Equity: ${equity:.2f}"
+        )
+
+        for market_key, position in positions.items():
+            market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
+            asset = position.market.asset if hasattr(position, 'market') else "???"
+            side = position.side.value
+
+            # Calculate unrealized P&L
+            current_price = None
+            if market:
+                if position.side == Side.UP:
+                    current_price = market.best_bid
+                else:
+                    current_price = 1.0 - market.best_ask if market.best_ask else None
+
+            if current_price and current_price > 0:
+                current_value = position.shares * current_price
+                unrealized_pnl = current_value - position.cost_basis
+                pnl_pct = (current_price - position.entry_price) / position.entry_price
+
+                # Color based on P&L
+                pnl_color = Colors.BRIGHT_GREEN if unrealized_pnl > 0 else Colors.BRIGHT_RED
+
+                # Time remaining
+                time_remaining = market.time_remaining if market else 0
+
+                logger.info(
+                    f"   {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} → "
+                    f"{current_price:.2f} | {pnl_color}P&L: ${unrealized_pnl:+.2f} ({pnl_pct:+.0%}){Colors.RESET} | "
+                    f"Time: {time_remaining:.0f}s"
+                )
+            else:
+                logger.info(
+                    f"   {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} | "
+                    f"(no price data)"
+                )
 
     def _has_active_position(self, asset: str) -> bool:
         """
