@@ -766,6 +766,10 @@ class TradingBot:
                 # Check pending orders for fills
                 await self._check_pending_orders()
 
+                # Check positions for early exit (take-profit / stop-loss)
+                if self.config.trading.early_exit_enabled:
+                    await self._check_early_exits()
+
                 # Move expiring markets out of active trading
                 await self._check_expiring_markets()
 
@@ -1019,6 +1023,232 @@ class TradingBot:
             finally:
                 # Remove from pending regardless of cancel success
                 self._pending_orders.pop(order_id, None)
+
+    async def _check_early_exits(self):
+        """
+        Check open positions for take-profit or stop-loss conditions.
+
+        For each position:
+        1. Get current market price from order book
+        2. Calculate unrealized P&L percentage
+        3. If >= take_profit_pct: sell to lock in profit
+        4. If <= -stop_loss_pct: sell to limit loss
+        """
+        if not self.risk_manager.positions:
+            return
+
+        now = datetime.now(timezone.utc)
+        trading = self.config.trading
+
+        for market_key, position in list(self.risk_manager.positions.items()):
+            try:
+                # Check minimum hold time
+                hold_time = (now - position.entry_time).total_seconds()
+                if hold_time < trading.early_exit_min_hold_time:
+                    continue
+
+                # Find the market (in active or expiring)
+                market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
+                if not market:
+                    continue
+
+                # Get current market price for our position side
+                if position.side == Side.UP:
+                    current_price = market.best_bid  # Selling UP, get bid
+                else:
+                    # For DOWN, price is 1 - UP_ask (we sell DOWN = buy UP at ask)
+                    current_price = 1.0 - market.best_ask if market.best_ask else None
+
+                if current_price is None or current_price <= 0:
+                    continue
+
+                # Calculate unrealized P&L percentage
+                entry_price = position.entry_price
+                pnl_pct = (current_price - entry_price) / entry_price
+
+                # Check take-profit
+                if pnl_pct >= trading.take_profit_pct:
+                    logger.info(
+                        f"{Colors.BRIGHT_GREEN}💰 TAKE PROFIT: {market.asset} {position.side.value} | "
+                        f"P&L: {pnl_pct:+.0%} | Entry: {entry_price:.2f} → Exit: {current_price:.2f}{Colors.RESET}"
+                    )
+                    await self._execute_early_exit(market, position, current_price, "take_profit")
+                    continue
+
+                # Check stop-loss
+                if pnl_pct <= -trading.stop_loss_pct:
+                    logger.info(
+                        f"{Colors.BRIGHT_RED}🛑 STOP LOSS: {market.asset} {position.side.value} | "
+                        f"P&L: {pnl_pct:+.0%} | Entry: {entry_price:.2f} → Exit: {current_price:.2f}{Colors.RESET}"
+                    )
+                    await self._execute_early_exit(market, position, current_price, "stop_loss")
+                    continue
+
+            except Exception as e:
+                logger.error(f"Error checking early exit for {market_key}: {e}")
+
+    async def _execute_early_exit(
+        self,
+        market: MarketState,
+        position,
+        exit_price: float,
+        exit_reason: str,
+    ):
+        """
+        Execute early exit (sell position before settlement).
+
+        Args:
+            market: Market state
+            position: Position to exit
+            exit_price: Price to sell at
+            exit_reason: "take_profit" or "stop_loss"
+        """
+        if self.config.dry_run:
+            logger.info(f"[DRY RUN] Would sell {position.shares:.2f} shares at {exit_price:.4f}")
+            # Still process the exit for tracking
+            pnl = (exit_price - position.entry_price) * position.shares
+            await self._process_early_exit_result(market, position, exit_price, pnl, exit_reason)
+            return
+
+        if not self.executor:
+            logger.warning("No executor available for early exit")
+            return
+
+        try:
+            # Create a sell signal
+            from .models import Signal, OrderAction
+            sell_signal = Signal(
+                market=market,
+                side=position.side,
+                recommended_action=OrderAction.MARKET,  # Market order for quick exit
+                recommended_price=exit_price,
+                size_usd=position.shares * exit_price,
+                size_shares=position.shares,
+                edge=0.0,  # Not relevant for exit
+                reasoning=f"Early exit: {exit_reason}",
+            )
+
+            # Execute sell order
+            result = self.executor.sell_position(
+                token_id=position.token_id,
+                shares=position.shares,
+                min_price=exit_price * 0.98,  # Allow 2% slippage
+            )
+
+            if result and result.success:
+                actual_price = result.filled_price or exit_price
+                pnl = (actual_price - position.entry_price) * position.shares
+                logger.info(
+                    f"✅ Early exit executed: {market.asset} {position.side.value} | "
+                    f"Sold {result.filled_size:.2f} @ {actual_price:.4f} | P&L: ${pnl:+.2f}"
+                )
+                await self._process_early_exit_result(market, position, actual_price, pnl, exit_reason)
+            else:
+                error_msg = result.error_message if result else "Unknown error"
+                logger.warning(f"Early exit failed: {error_msg}")
+
+        except Exception as e:
+            logger.error(f"Error executing early exit: {e}")
+
+    async def _process_early_exit_result(
+        self,
+        market: MarketState,
+        position,
+        exit_price: float,
+        pnl: float,
+        exit_reason: str,
+    ):
+        """
+        Process the result of an early exit - update tracking, ML, etc.
+
+        Args:
+            market: Market state
+            position: Closed position
+            exit_price: Actual exit price
+            pnl: Realized P&L
+            exit_reason: "take_profit" or "stop_loss"
+        """
+        won = pnl > 0
+
+        # Record with risk manager
+        self.risk_manager.record_position_close(
+            market_key=market.condition_id,
+            exit_price=exit_price,
+            pnl=pnl,
+        )
+
+        # Record with trade history (mark as early exit)
+        trade_history = get_trade_history()
+        trade_history.record_close(
+            market_id=market.condition_id,
+            won=won,
+            pnl=pnl,
+            exit_price=exit_price,
+        )
+
+        # Record ML outcome - this helps ML learn which trades were good
+        if self.ml_predictor:
+            from types import SimpleNamespace
+
+            # Get ML features
+            if position.ml_volatility is not None:
+                volatility = position.ml_volatility
+                momentum = position.ml_momentum or 0.0
+                arb_type = position.ml_arb_type or "none"
+                spread = position.ml_spread or 0.0
+                bid_depth = position.ml_bid_depth or 0.0
+                ask_depth = position.ml_ask_depth or 0.0
+                price_trend = position.ml_price_trend or 0.0
+                distance_from_target = position.ml_distance_from_target or 0.0
+            else:
+                volatility = self.signal_generator.get_volatility(market.asset)
+                current_price = self.signal_generator.get_price(market.asset)
+                momentum = 0.0
+                if current_price and market.target_price:
+                    momentum = (current_price - market.target_price) / market.target_price
+                    momentum = max(-1, min(1, momentum * 10))
+                arb_type = "none"
+                spread = market.best_ask - market.best_bid if market.best_ask and market.best_bid else 0.0
+                bid_depth = market.bid_depth
+                ask_depth = market.ask_depth
+                price_trend = 0.0
+                distance_from_target = 0.0
+                if current_price and market.target_price:
+                    distance_from_target = abs(current_price - market.target_price) / market.target_price
+
+            fake_signal = SimpleNamespace(
+                edge=0.0,
+                market=market,
+                side=position.side,
+                _arb_type=arb_type,
+            )
+
+            # Record with early exit flag
+            self.ml_predictor.record_outcome(
+                signal=fake_signal,
+                volatility=volatility,
+                price_momentum=momentum,
+                won=won,
+                arb_type=arb_type,
+                spread=spread,
+                bid_depth=bid_depth,
+                ask_depth=ask_depth,
+                price_trend=price_trend,
+                distance_from_target=distance_from_target,
+            )
+
+        # Clear asset cooldown so we can trade again
+        asset = market.asset
+        if asset in self._last_order_time:
+            del self._last_order_time[asset]
+
+        # Log summary
+        result_emoji = "💰" if exit_reason == "take_profit" else "🛑"
+        logger.info(
+            f"{result_emoji} EARLY EXIT COMPLETE: {market.asset} | "
+            f"Reason: {exit_reason} | P&L: ${pnl:+.2f} | "
+            f"Bankroll: ${self.risk_manager.current_bankroll:.2f}"
+        )
 
     async def _check_settlements(self):
         """
