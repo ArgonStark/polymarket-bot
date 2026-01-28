@@ -216,6 +216,188 @@ class TradeHistory:
         """Get most recent trades."""
         return self.trades[-count:] if self.trades else []
 
+    def should_trade_asset(self, asset: str, min_trades: int = 5, min_win_rate: float = 0.35) -> tuple[bool, str]:
+        """
+        Check if we should trade a specific asset based on historical performance.
+
+        Args:
+            asset: Asset symbol (BTC, ETH, SOL, XRP)
+            min_trades: Minimum trades needed before applying filter
+            min_win_rate: Minimum win rate required to continue trading
+
+        Returns:
+            Tuple of (should_trade, reason)
+        """
+        completed = [t for t in self.trades if t.get("actual_outcome") is not None and t["asset"] == asset]
+
+        if len(completed) < min_trades:
+            return (True, f"Not enough data for {asset} ({len(completed)}/{min_trades} trades)")
+
+        wins = sum(1 for t in completed if t["actual_outcome"] == "WIN")
+        win_rate = wins / len(completed)
+
+        if win_rate < min_win_rate:
+            return (False, f"{asset} win rate {win_rate:.0%} below {min_win_rate:.0%} ({len(completed)} trades)")
+
+        return (True, f"{asset} OK: {win_rate:.0%} win rate ({len(completed)} trades)")
+
+    def should_trade_side(self, side: str, min_trades: int = 5, min_win_rate: float = 0.35) -> tuple[bool, str]:
+        """
+        Check if we should trade a specific side based on historical performance.
+
+        Args:
+            side: Side ("UP" or "DOWN")
+            min_trades: Minimum trades needed before applying filter
+            min_win_rate: Minimum win rate required to continue trading
+
+        Returns:
+            Tuple of (should_trade, reason)
+        """
+        completed = [t for t in self.trades if t.get("actual_outcome") is not None and t["side"] == side]
+
+        if len(completed) < min_trades:
+            return (True, f"Not enough data for {side} ({len(completed)}/{min_trades} trades)")
+
+        wins = sum(1 for t in completed if t["actual_outcome"] == "WIN")
+        win_rate = wins / len(completed)
+
+        if win_rate < min_win_rate:
+            return (False, f"{side} win rate {win_rate:.0%} below {min_win_rate:.0%} ({len(completed)} trades)")
+
+        return (True, f"{side} OK: {win_rate:.0%} win rate ({len(completed)} trades)")
+
+    def evaluate_trade(
+        self,
+        asset: str,
+        side: str,
+        min_trades: int = 5,
+        min_win_rate: float = 0.35,
+        check_prediction_accuracy: bool = True,
+        min_prediction_accuracy: float = 0.45,
+    ) -> tuple[bool, str]:
+        """
+        Full evaluation of whether a trade should be taken.
+
+        Checks:
+        1. Asset historical performance
+        2. Side historical performance
+        3. Asset+Side combination performance
+        4. Overall prediction accuracy (if enabled)
+
+        Args:
+            asset: Asset symbol
+            side: Trade side ("UP" or "DOWN")
+            min_trades: Minimum trades for each check
+            min_win_rate: Minimum win rate required
+            check_prediction_accuracy: Whether to check ML prediction accuracy
+            min_prediction_accuracy: Minimum prediction accuracy required
+
+        Returns:
+            Tuple of (should_trade, reason)
+        """
+        reasons = []
+
+        # Check asset performance
+        asset_ok, asset_reason = self.should_trade_asset(asset, min_trades, min_win_rate)
+        if not asset_ok:
+            return (False, asset_reason)
+        reasons.append(asset_reason)
+
+        # Check side performance
+        side_ok, side_reason = self.should_trade_side(side, min_trades, min_win_rate)
+        if not side_ok:
+            return (False, side_reason)
+        reasons.append(side_reason)
+
+        # Check asset+side combination
+        combo_trades = [
+            t for t in self.trades
+            if t.get("actual_outcome") is not None
+            and t["asset"] == asset
+            and t["side"] == side
+        ]
+        if len(combo_trades) >= min_trades:
+            combo_wins = sum(1 for t in combo_trades if t["actual_outcome"] == "WIN")
+            combo_win_rate = combo_wins / len(combo_trades)
+            if combo_win_rate < min_win_rate:
+                return (False, f"{asset} {side} combo win rate {combo_win_rate:.0%} too low ({len(combo_trades)} trades)")
+            reasons.append(f"{asset} {side}: {combo_win_rate:.0%}")
+
+        # Check overall prediction accuracy
+        if check_prediction_accuracy:
+            completed = [t for t in self.trades if t.get("actual_outcome") is not None]
+            predictions_correct = 0
+            predictions_made = 0
+            for t in completed:
+                if t.get("predicted_prob") is not None:
+                    predictions_made += 1
+                    predicted_win = t["predicted_prob"] >= 0.5
+                    actual_win = t["actual_outcome"] == "WIN"
+                    if predicted_win == actual_win:
+                        predictions_correct += 1
+
+            if predictions_made >= min_trades:
+                accuracy = predictions_correct / predictions_made
+                if accuracy < min_prediction_accuracy:
+                    return (False, f"Prediction accuracy {accuracy:.0%} below {min_prediction_accuracy:.0%} ({predictions_made} predictions)")
+                reasons.append(f"ML accuracy: {accuracy:.0%}")
+
+        return (True, " | ".join(reasons))
+
+    def get_performance_summary(self) -> dict:
+        """
+        Get a comprehensive performance summary for display.
+
+        Returns:
+            Dict with performance metrics
+        """
+        completed = [t for t in self.trades if t.get("actual_outcome") is not None]
+
+        if not completed:
+            return {
+                "has_data": False,
+                "total_trades": len(self.trades),
+                "completed_trades": 0,
+            }
+
+        wins = sum(1 for t in completed if t["actual_outcome"] == "WIN")
+        total_pnl = sum(t.get("pnl", 0) or 0 for t in completed)
+
+        # Recent performance (last 10 trades)
+        recent = completed[-10:] if len(completed) >= 10 else completed
+        recent_wins = sum(1 for t in recent if t["actual_outcome"] == "WIN")
+        recent_pnl = sum(t.get("pnl", 0) or 0 for t in recent)
+
+        # Prediction accuracy
+        predictions_correct = 0
+        predictions_made = 0
+        for t in completed:
+            if t.get("predicted_prob") is not None:
+                predictions_made += 1
+                predicted_win = t["predicted_prob"] >= 0.5
+                actual_win = t["actual_outcome"] == "WIN"
+                if predicted_win == actual_win:
+                    predictions_correct += 1
+
+        return {
+            "has_data": True,
+            "total_trades": len(self.trades),
+            "completed_trades": len(completed),
+            "open_trades": len(self.trades) - len(completed),
+            "wins": wins,
+            "losses": len(completed) - wins,
+            "win_rate": wins / len(completed),
+            "total_pnl": total_pnl,
+            "avg_pnl": total_pnl / len(completed),
+            "recent_trades": len(recent),
+            "recent_wins": recent_wins,
+            "recent_win_rate": recent_wins / len(recent) if recent else 0,
+            "recent_pnl": recent_pnl,
+            "predictions_made": predictions_made,
+            "predictions_correct": predictions_correct,
+            "prediction_accuracy": predictions_correct / predictions_made if predictions_made > 0 else 0,
+        }
+
     def _save_history(self):
         """Save history to disk."""
         try:

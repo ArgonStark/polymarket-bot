@@ -135,6 +135,24 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("ML_MIN_SAMPLES", "10"))
     )
 
+    # === Trade History Review Settings ===
+    # Bot reviews past performance before taking new trades
+
+    # Minimum completed trades before history filter kicks in
+    history_min_trades: int = field(
+        default_factory=lambda: int(os.getenv("HISTORY_MIN_TRADES", "5"))
+    )
+
+    # Minimum win rate for asset/side to continue trading
+    history_min_win_rate: float = field(
+        default_factory=lambda: float(os.getenv("HISTORY_MIN_WIN_RATE", "0.35"))
+    )
+
+    # Minimum prediction accuracy required (if ML predictions available)
+    history_min_prediction_accuracy: float = field(
+        default_factory=lambda: float(os.getenv("HISTORY_MIN_PREDICTION_ACCURACY", "0.45"))
+    )
+
     # === Arbitrage Strategy Settings ===
     # Based on successful bot patterns that made $5-10k daily
 
