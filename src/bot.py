@@ -410,6 +410,11 @@ class TradingBot:
                             ml_ask_depth=order_data.get("ml_ask_depth"),
                             ml_price_trend=order_data.get("ml_price_trend"),
                             ml_distance_from_target=order_data.get("ml_distance_from_target"),
+                            ml_binance_lead_pct=order_data.get("ml_binance_lead_pct"),
+                            ml_binance_confirmation=order_data.get("ml_binance_confirmation"),
+                            ml_trend_1h=order_data.get("ml_trend_1h"),
+                            ml_trend_4h=order_data.get("ml_trend_4h"),
+                            ml_trend_1d=order_data.get("ml_trend_1d"),
                         )
 
                         # Record in trade history
@@ -1305,6 +1310,11 @@ class TradingBot:
                 ask_depth = position.ml_ask_depth or 0.0
                 price_trend = position.ml_price_trend or 0.0
                 distance_from_target = position.ml_distance_from_target or 0.0
+                binance_lead_pct = position.ml_binance_lead_pct or 0.0
+                binance_confirmation = position.ml_binance_confirmation or "NONE"
+                trend_1h = position.ml_trend_1h or 0.0
+                trend_4h = position.ml_trend_4h or 0.0
+                trend_1d = position.ml_trend_1d or 0.0
             else:
                 volatility = self.signal_generator.get_volatility(market.asset)
                 current_price = self.signal_generator.get_price(market.asset)
@@ -1320,6 +1330,20 @@ class TradingBot:
                 distance_from_target = 0.0
                 if current_price and market.target_price:
                     distance_from_target = abs(current_price - market.target_price) / market.target_price
+                binance_lead_pct = 0.0
+                binance_confirmation = "NONE"
+                trend_1h = 0.0
+                trend_4h = 0.0
+                trend_1d = 0.0
+                # Try to fetch trends if available
+                try:
+                    from .data.binance import get_multi_timeframe_trends
+                    trends = get_multi_timeframe_trends(market.asset)
+                    trend_1h = trends.get("trend_1h", 0.0)
+                    trend_4h = trends.get("trend_4h", 0.0)
+                    trend_1d = trends.get("trend_1d", 0.0)
+                except Exception:
+                    pass
 
             fake_signal = SimpleNamespace(
                 edge=0.0,
@@ -1340,6 +1364,11 @@ class TradingBot:
                 ask_depth=ask_depth,
                 price_trend=price_trend,
                 distance_from_target=distance_from_target,
+                binance_lead_pct=binance_lead_pct,
+                binance_confirmation=binance_confirmation,
+                trend_1h=trend_1h,
+                trend_4h=trend_4h,
+                trend_1d=trend_1d,
             )
 
         # Clear asset cooldown so we can trade again
@@ -1579,6 +1608,11 @@ class TradingBot:
                 ask_depth = position.ml_ask_depth or 0.0
                 price_trend = position.ml_price_trend or 0.0
                 distance_from_target = position.ml_distance_from_target or 0.0
+                binance_lead_pct = position.ml_binance_lead_pct or 0.0
+                binance_confirmation = position.ml_binance_confirmation or "NONE"
+                trend_1h = position.ml_trend_1h or 0.0
+                trend_4h = position.ml_trend_4h or 0.0
+                trend_1d = position.ml_trend_1d or 0.0
             else:
                 # Extract features now (for positions without stored ML data)
                 volatility = self.signal_generator.get_volatility(market.asset)
@@ -1595,6 +1629,20 @@ class TradingBot:
                 distance_from_target = 0.0
                 if current_price and market.target_price:
                     distance_from_target = abs(current_price - market.target_price) / market.target_price
+                binance_lead_pct = 0.0
+                binance_confirmation = "NONE"
+                trend_1h = 0.0
+                trend_4h = 0.0
+                trend_1d = 0.0
+                # Try to fetch trends if available
+                try:
+                    from .data.binance import get_multi_timeframe_trends
+                    trends = get_multi_timeframe_trends(market.asset)
+                    trend_1h = trends.get("trend_1h", 0.0)
+                    trend_4h = trends.get("trend_4h", 0.0)
+                    trend_1d = trends.get("trend_1d", 0.0)
+                except Exception:
+                    pass
 
                 logger.debug(f"Extracted ML features at settlement for {market.asset}")
 
@@ -1615,6 +1663,11 @@ class TradingBot:
                 ask_depth=ask_depth,
                 price_trend=price_trend,
                 distance_from_target=distance_from_target,
+                binance_lead_pct=binance_lead_pct,
+                binance_confirmation=binance_confirmation,
+                trend_1h=trend_1h,
+                trend_4h=trend_4h,
+                trend_1d=trend_1d,
             )
 
     async def _process_market(self, market: MarketState):
@@ -1751,6 +1804,11 @@ class TradingBot:
             signal._ml_ask_depth = ml_features["ask_depth"]
             signal._ml_price_trend = ml_features["price_trend"]
             signal._ml_distance_from_target = ml_features["distance_from_target"]
+            signal._ml_binance_lead_pct = ml_features.get("binance_lead_pct", 0.0)
+            signal._ml_binance_confirmation = ml_features.get("binance_confirmation", "NONE")
+            signal._ml_trend_1h = ml_features.get("trend_1h", 0.0)
+            signal._ml_trend_4h = ml_features.get("trend_4h", 0.0)
+            signal._ml_trend_1d = ml_features.get("trend_1d", 0.0)
 
         # Execute the signal
         await self._execute_signal(signal)
@@ -2019,6 +2077,11 @@ class TradingBot:
             ml_ask_depth = getattr(signal, '_ml_ask_depth', None)
             ml_price_trend = getattr(signal, '_ml_price_trend', None)
             ml_distance_from_target = getattr(signal, '_ml_distance_from_target', None)
+            ml_binance_lead_pct = getattr(signal, '_ml_binance_lead_pct', None)
+            ml_binance_confirmation = getattr(signal, '_ml_binance_confirmation', None)
+            ml_trend_1h = getattr(signal, '_ml_trend_1h', None)
+            ml_trend_4h = getattr(signal, '_ml_trend_4h', None)
+            ml_trend_1d = getattr(signal, '_ml_trend_1d', None)
 
             conf_str = f" (ML: {ml_confidence:.0%})" if ml_confidence else ""
             arb_str = f" [{ml_arb_type}]" if ml_arb_type and ml_arb_type != "none" else ""
@@ -2039,6 +2102,11 @@ class TradingBot:
                     ml_ask_depth=ml_ask_depth,
                     ml_price_trend=ml_price_trend,
                     ml_distance_from_target=ml_distance_from_target,
+                    ml_binance_lead_pct=ml_binance_lead_pct,
+                    ml_binance_confirmation=ml_binance_confirmation,
+                    ml_trend_1h=ml_trend_1h,
+                    ml_trend_4h=ml_trend_4h,
+                    ml_trend_1d=ml_trend_1d,
                 )
 
                 # Record in trade history
@@ -2086,6 +2154,11 @@ class TradingBot:
                     "ml_ask_depth": ml_ask_depth,
                     "ml_price_trend": ml_price_trend,
                     "ml_distance_from_target": ml_distance_from_target,
+                    "ml_binance_lead_pct": ml_binance_lead_pct,
+                    "ml_binance_confirmation": ml_binance_confirmation,
+                    "ml_trend_1h": ml_trend_1h,
+                    "ml_trend_4h": ml_trend_4h,
+                    "ml_trend_1d": ml_trend_1d,
                 }
 
                 logger.info(
