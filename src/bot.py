@@ -28,6 +28,7 @@ from .strategy.ml_predictor import (
     extract_ml_features_from_market,
     calculate_price_trend,
 )
+from .strategy.trade_history import get_trade_history
 from .utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
 
 
@@ -1150,6 +1151,15 @@ class TradingBot:
             pnl=pnl,
         )
 
+        # Record with trade history
+        trade_history = get_trade_history()
+        trade_history.record_close(
+            market_id=market.condition_id,
+            won=won,
+            pnl=pnl,
+            exit_price=1.0 if won else 0.0,
+        )
+
         # Record ML outcome for model learning
         # Always try to record if ML is enabled - extract features if not stored
         if self.ml_predictor:
@@ -1491,6 +1501,22 @@ class TradingBot:
                     ml_price_trend=ml_price_trend,
                     ml_distance_from_target=ml_distance_from_target,
                 )
+
+                # Record in trade history
+                trade_history = get_trade_history()
+                trade_history.record_open(
+                    asset=asset,
+                    side=signal.side.value,
+                    entry_price=result.filled_price or signal.recommended_price,
+                    shares=result.filled_size,
+                    target_price=signal.market.target_price,
+                    chainlink_price=current_price,
+                    market_id=signal.market.condition_id,
+                    predicted_prob=ml_confidence,
+                    arb_type=ml_arb_type or "none",
+                    edge=signal.edge,
+                )
+
                 logger.info(f"    {Colors.BRIGHT_GREEN}✓ FILLED @ {result.filled_price:.2f}{conf_str}{arb_str}{Colors.RESET}")
 
                 # Log positions AFTER trade
