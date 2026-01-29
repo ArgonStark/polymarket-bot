@@ -517,7 +517,9 @@ class SignalGenerator:
         """Calculate recommended entry price for order."""
         if action == OrderAction.MARKET:
             # Very aggressive price for guaranteed immediate fill
-            return 0.99 if side == Side.UP else 0.99
+            # For UP: pay up to 0.99 for UP token
+            # For DOWN: pay up to 0.99 for DOWN token
+            return 0.99
 
         elif action == OrderAction.LIMIT:
             # Buy at best ask to fill immediately

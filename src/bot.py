@@ -1434,8 +1434,8 @@ class TradingBot:
                 _arb_type=arb_type,
                 # Additional attributes needed by TraderModelLoader
                 recommended_price=position.entry_price,
-                size_shares=position.size,
-                size_usd=position.size * position.entry_price,
+                size_shares=position.shares,
+                size_usd=position.shares * position.entry_price,
                 time_remaining=market.time_remaining,
             )
 
@@ -1756,8 +1756,8 @@ class TradingBot:
                 _arb_type=arb_type,
                 # Additional attributes needed by TraderModelLoader
                 recommended_price=position.entry_price,
-                size_shares=position.size,
-                size_usd=position.size * position.entry_price,
+                size_shares=position.shares,
+                size_usd=position.shares * position.entry_price,
                 time_remaining=market.time_remaining,
             )
             self.ml_predictor.record_outcome(
