@@ -754,9 +754,9 @@ class GammaAPI:
             Market dict or None if not found
         """
         # Use query parameter instead of path parameter
-        # The Gamma API /markets/{id} expects internal IDs, not condition IDs
+        # The Gamma API uses condition_ids (plural) as the filter parameter
         url = f"{self.base_url}/markets"
-        params = {"condition_id": condition_id}
+        params = {"condition_ids": condition_id}
 
         try:
             response = self._session.get(url, params=params, timeout=10)
