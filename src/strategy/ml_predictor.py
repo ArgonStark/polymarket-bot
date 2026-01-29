@@ -81,7 +81,7 @@ class TradeFeatures:
         # Normalize features to roughly 0-1 range
         vector = [
             # Core features (6)
-            min(self.edge * 10, 1.0),  # edge 0.1 -> 1.0
+            max(0.0, min(self.edge * 10, 1.0)),  # edge 0.1 -> 1.0, clamp negatives to 0
             min(self.time_remaining / 900, 1.0),  # 900s -> 1.0
             min(self.volatility * 100, 1.0),  # 0.01 -> 1.0
             (self.price_momentum + 1) / 2,  # -1,1 -> 0,1
@@ -514,21 +514,23 @@ class HybridPredictor:
         Args:
             signal: Trading signal
             market: Market state
-            full_features: Full 29-feature vector for adaptive model
+            full_features: Full 29-feature vector (used as fallback)
 
         Returns:
             Combined probability estimate
         """
+        # Extract simple features for both models (same format)
+        simple_features = self.trader_model.extract_simple_features(signal, market)
+
         # Get base prediction from trader model
         if self.trader_model.is_loaded:
-            simple_features = self.trader_model.extract_simple_features(signal, market)
             base_prob = self.trader_model.predict_proba(simple_features)
         else:
             base_prob = 0.5
 
-        # Get adaptive prediction (uses first 11 features)
-        adaptive_features = full_features[:11] if len(full_features) >= 11 else full_features
-        adaptive_prob = self.adaptive_model.predict_proba(adaptive_features)
+        # Get adaptive prediction using SAME features as trader model
+        # This ensures both models learn the same patterns
+        adaptive_prob = self.adaptive_model.predict_proba(simple_features)
 
         # Combine predictions
         if self.trader_model.is_loaded:
@@ -539,10 +541,15 @@ class HybridPredictor:
 
         return combined
 
-    def update(self, features: list[float], outcome: int):
+    def update(self, features: list[float], outcome: int, signal=None, market=None):
         """Update adaptive model with new outcome."""
         # Only update adaptive model (trader model is static)
-        adaptive_features = features[:11] if len(features) >= 11 else features
+        # Use same feature format as prediction for consistency
+        if signal is not None and market is not None:
+            adaptive_features = self.trader_model.extract_simple_features(signal, market)
+        else:
+            # Fallback to first 11 features if signal/market not provided
+            adaptive_features = features[:11] if len(features) >= 11 else features
         self.adaptive_model.update(adaptive_features, outcome)
         self.training_samples += 1
 
@@ -754,7 +761,7 @@ class MLSignalPredictor:
 
         # Learning mode - allow all trades to collect training data
         if threshold == 0.0:
-            return (True, 0.5, f"Learning mode ({self.training_samples}/10 samples)")
+            return (True, 0.5, f"Learning mode ({self.training_samples}/25 samples)")
 
         # Extract features and predict
         features = self.extract_features(
@@ -832,7 +839,12 @@ class MLSignalPredictor:
 
         # Get prediction before updating (for accuracy tracking)
         if self.training_samples >= self.min_training_samples:
-            pred_prob = self.model.predict_proba(feature_vector)
+            # Use hybrid predictor if available for accurate tracking
+            if self.use_hybrid and self.hybrid_predictor is not None:
+                market = getattr(signal, 'market', None)
+                pred_prob = self.hybrid_predictor.predict_proba(signal, market, feature_vector)
+            else:
+                pred_prob = self.model.predict_proba(feature_vector)
             predicted_win = pred_prob >= 0.5
             if predicted_win == won:
                 self.correct_predictions += 1
@@ -844,7 +856,8 @@ class MLSignalPredictor:
 
         # Also update hybrid predictor's adaptive model
         if self.use_hybrid and self.hybrid_predictor is not None:
-            self.hybrid_predictor.update(feature_vector, 1 if won else 0)
+            market = getattr(signal, 'market', None)
+            self.hybrid_predictor.update(feature_vector, 1 if won else 0, signal=signal, market=market)
 
         # Log outcome recording
         result_str = "WIN" if won else "LOSS"
