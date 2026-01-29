@@ -81,6 +81,17 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
 
     print(f"Found {len(trades)} trades\n")
 
+    # Debug: show first few trades structure
+    print("DEBUG: Sample trade structure (first 3 trades):")
+    print("-" * 60)
+    for i, trade in enumerate(trades[:3]):
+        print(f"\nTrade {i+1} keys: {list(trade.keys())}")
+        # Print all fields
+        for key, value in trade.items():
+            print(f"  {key}: {value}")
+        print()
+    print("-" * 60 + "\n")
+
     # Track synced trades
     synced_count = 0
     skipped_count = 0
