@@ -22,7 +22,7 @@ from .data import (
 )
 from .data.binance import BinancePrice
 from .execution import create_trading_client, OrderExecutor
-from .execution.client import get_account_balance
+from .execution.client import get_account_balance, get_trades
 from .strategy import SignalGenerator, RiskManager
 from .strategy.ml_predictor import (
     get_ml_predictor,
@@ -138,6 +138,12 @@ class TradingBot:
         self.period_transition_delay = 5.0  # Seconds to wait after period boundary for price data
         self.position_log_interval = 30.0  # Log position status every 30s
         self.last_position_log = None  # Track last position log time
+
+        # ML Sync from Polymarket API - bypasses internal position tracking
+        # This ensures ML learns from actual trades even if internal tracking fails
+        self._ml_synced_trades: set[str] = set()  # Set of trade IDs already synced to ML
+        self.ml_sync_interval = 60.0  # Sync ML every 60 seconds
+        self.last_ml_sync = None  # Track last ML sync time
 
         # Control flags
         self._running = False
@@ -456,12 +462,63 @@ class TradingBot:
                     orders_to_remove.append(order_id)
 
                 elif order_info.status.value == "PARTIAL":
-                    # Partially filled - log progress
+                    # Partially filled - check if essentially complete
                     fill_pct = order_info.fill_pct * 100
-                    logger.info(
-                        f"⏳ ORDER PARTIAL: {asset} | "
-                        f"Filled: {fill_pct:.0f}% ({order_info.filled_size:.2f} shares)"
-                    )
+                    original_size = order_data.get("size", 0)
+
+                    # If 95%+ filled, treat as FILLED (blockchain confirmation pending)
+                    if fill_pct >= 95 or (original_size > 0 and order_info.filled_size >= original_size * 0.95):
+                        logger.info(
+                            f"✅ ORDER FILLED (via PARTIAL 100%): {asset} | "
+                            f"Shares: {order_info.filled_size:.2f} @ {order_info.price:.4f}"
+                        )
+
+                        if signal:
+                            # Record position with risk manager
+                            logger.info(f"📍 Recording position for {asset} {signal.side.value}")
+                            self.risk_manager.record_position_open(
+                                signal=signal,
+                                entry_price=order_info.price,
+                                shares=order_info.filled_size,
+                                ml_volatility=order_data.get("ml_volatility"),
+                                ml_momentum=order_data.get("ml_momentum"),
+                                ml_confidence=order_data.get("ml_confidence"),
+                                ml_arb_type=order_data.get("ml_arb_type"),
+                                ml_spread=order_data.get("ml_spread"),
+                                ml_bid_depth=order_data.get("ml_bid_depth"),
+                                ml_ask_depth=order_data.get("ml_ask_depth"),
+                                ml_price_trend=order_data.get("ml_price_trend"),
+                                ml_distance_from_target=order_data.get("ml_distance_from_target"),
+                                ml_binance_lead_pct=order_data.get("ml_binance_lead_pct"),
+                                ml_binance_confirmation=order_data.get("ml_binance_confirmation"),
+                                ml_trend_1h=order_data.get("ml_trend_1h"),
+                                ml_trend_4h=order_data.get("ml_trend_4h"),
+                                ml_trend_1d=order_data.get("ml_trend_1d"),
+                            )
+
+                            # Record in trade history
+                            trade_history = get_trade_history()
+                            current_price = self.signal_generator.get_price(signal.market.asset)
+                            trade_history.record_open(
+                                asset=asset,
+                                side=signal.side.value,
+                                entry_price=order_info.price,
+                                shares=order_info.filled_size,
+                                target_price=signal.market.target_price,
+                                chainlink_price=current_price,
+                                market_id=signal.market.condition_id,
+                                predicted_prob=order_data.get("ml_confidence"),
+                                arb_type=order_data.get("ml_arb_type") or "none",
+                                edge=signal.edge,
+                            )
+
+                        orders_to_remove.append(order_id)
+                    else:
+                        # Actually partial - log progress
+                        logger.info(
+                            f"⏳ ORDER PARTIAL: {asset} | "
+                            f"Filled: {fill_pct:.0f}% ({order_info.filled_size:.2f} shares)"
+                        )
 
                 elif order_info.status.value in ["CANCELLED", "EXPIRED", "REJECTED"]:
                     # Order failed - remove and allow retry
@@ -1009,6 +1066,11 @@ class TradingBot:
         while self._running:
             try:
                 await self._check_settlements()
+
+                # Sync ML from Polymarket API - ensures ML learns from actual trades
+                # This bypasses internal position tracking which may fail
+                await self._sync_ml_from_polymarket()
+
                 await asyncio.sleep(self.settlement_check_interval)
 
             except asyncio.CancelledError:
@@ -1760,6 +1822,22 @@ class TradingBot:
                 size_usd=position.shares * position.entry_price,
                 time_remaining=market.time_remaining,
             )
+
+            # Log ML learning with prediction accuracy
+            ml_conf = position.ml_confidence
+            ml_prediction = "WIN" if ml_conf and ml_conf >= 0.5 else "LOSS" if ml_conf else None
+            actual_result = "WIN" if won else "LOSS"
+
+            if ml_prediction:
+                correct = ml_prediction == actual_result
+                correct_str = f"{Colors.BRIGHT_GREEN}✓ CORRECT{Colors.RESET}" if correct else f"{Colors.BRIGHT_RED}✗ WRONG{Colors.RESET}"
+                logger.info(
+                    f"🤖 ML EVAL: {market.asset} | "
+                    f"Predicted: {ml_prediction} ({ml_conf:.0%}) | Actual: {actual_result} | {correct_str}"
+                )
+            else:
+                logger.info(f"🤖 ML EVAL: {market.asset} | Actual: {actual_result} (learning mode - no prediction)")
+
             self.ml_predictor.record_outcome(
                 signal=fake_signal,
                 volatility=volatility,
@@ -1777,6 +1855,221 @@ class TradingBot:
                 trend_4h=trend_4h,
                 trend_1d=trend_1d,
             )
+
+    async def _sync_ml_from_polymarket(self):
+        """
+        Sync ML model with actual trades from Polymarket API.
+
+        This is a DIRECT sync that bypasses internal position tracking, ensuring
+        the ML model learns from actual trades even if internal tracking fails.
+
+        The process:
+        1. Fetch trade history from Polymarket CLOB API
+        2. For each 15-min crypto trade, check if the market has settled
+        3. Record outcomes to ML for learning
+
+        This runs periodically alongside normal settlement processing.
+        """
+        # Only run if ML is enabled and we have a client
+        if not self.ml_predictor or not self.client:
+            return
+
+        # Rate limit - only sync every ml_sync_interval seconds
+        now = datetime.now(timezone.utc)
+        if self.last_ml_sync:
+            elapsed = (now - self.last_ml_sync).total_seconds()
+            if elapsed < self.ml_sync_interval:
+                return
+
+        self.last_ml_sync = now
+
+        try:
+            # Fetch recent trades from Polymarket
+            trades = get_trades(self.client, limit=50)
+            if not trades:
+                logger.debug("No trades from Polymarket API")
+                return
+
+            # Filter to 15-min crypto trades that have settled
+            import time
+            current_ts = int(time.time())
+            synced_count = 0
+            skipped_count = 0
+
+            for trade in trades:
+                try:
+                    # Get trade details
+                    trade_id = trade.get("id") or trade.get("trade_id") or str(trade.get("matchTime", ""))
+                    if not trade_id:
+                        continue
+
+                    # Skip if already synced
+                    if trade_id in self._ml_synced_trades:
+                        skipped_count += 1
+                        continue
+
+                    # Get market info from trade
+                    market_slug = trade.get("marketSlug", "") or trade.get("market_slug", "")
+                    asset_id = trade.get("assetId") or trade.get("asset_id") or ""
+
+                    # Check if this is a 15-min crypto market
+                    # Slug format: btc-updown-15m-{timestamp}
+                    if "updown-15m" not in market_slug.lower():
+                        self._ml_synced_trades.add(trade_id)  # Don't check again
+                        continue
+
+                    # Extract market start timestamp from slug
+                    market_ts = None
+                    try:
+                        parts = market_slug.split("-")
+                        if len(parts) >= 4:
+                            market_ts = int(parts[-1])
+                    except (ValueError, IndexError):
+                        pass
+
+                    if not market_ts:
+                        self._ml_synced_trades.add(trade_id)
+                        continue
+
+                    # Check if market has settled (15 min = 900 seconds after start)
+                    settle_time = market_ts + 900
+                    if current_ts < settle_time + 30:  # Wait 30s after settle for resolution
+                        # Not settled yet - don't sync
+                        continue
+
+                    # Identify asset from slug
+                    asset = None
+                    for a in ["btc", "eth", "sol", "xrp"]:
+                        if market_slug.lower().startswith(a):
+                            asset = a.upper()
+                            break
+
+                    if not asset:
+                        self._ml_synced_trades.add(trade_id)
+                        continue
+
+                    # Determine trade side from outcome
+                    outcome = trade.get("outcome", "") or trade.get("side", "")
+                    if isinstance(outcome, str):
+                        outcome_lower = outcome.lower()
+                        if "up" in outcome_lower or "yes" in outcome_lower:
+                            side = Side.UP
+                        elif "down" in outcome_lower or "no" in outcome_lower:
+                            side = Side.DOWN
+                        else:
+                            # Try to determine from token
+                            self._ml_synced_trades.add(trade_id)
+                            continue
+                    else:
+                        self._ml_synced_trades.add(trade_id)
+                        continue
+
+                    # Get market resolution - determine if trade won
+                    # For 15-min markets: price >= target = UP wins
+                    resolution = self.gamma_api.get_market_resolution(
+                        trade.get("conditionId", "") or trade.get("condition_id", "")
+                    )
+
+                    winning_outcome = None
+                    if resolution and resolution.get("resolved"):
+                        winning_outcome = resolution.get("winning_outcome")
+                    else:
+                        # Try local determination using Chainlink price
+                        chainlink_price = self.signal_generator.get_price(asset)
+                        # We need the target price - try to get from slug timestamp
+                        target_price = self.gamma_api.fetch_price_to_beat(asset, market_ts)
+                        if chainlink_price and target_price:
+                            winning_outcome = "UP" if chainlink_price >= target_price else "DOWN"
+
+                    if not winning_outcome:
+                        # Can't determine outcome yet - don't sync
+                        continue
+
+                    # Determine if this trade won
+                    won = side.value == winning_outcome
+
+                    # Get trade price and size for feature extraction
+                    trade_price = float(trade.get("price", 0) or 0)
+                    trade_size = float(trade.get("size", 0) or 0)
+
+                    if trade_price <= 0 or trade_size <= 0:
+                        self._ml_synced_trades.add(trade_id)
+                        continue
+
+                    # Get current volatility estimate
+                    volatility = self.signal_generator.get_volatility(asset)
+
+                    # Build a minimal signal for ML recording
+                    from types import SimpleNamespace
+
+                    # Try to get additional features
+                    target_price = self.gamma_api.fetch_price_to_beat(asset, market_ts) or 0
+                    chainlink_price = self.signal_generator.get_price(asset) or target_price
+
+                    fake_signal = SimpleNamespace(
+                        edge=0.0,  # We don't know the original edge
+                        market=SimpleNamespace(
+                            asset=asset,
+                            target_price=target_price,
+                            time_remaining=0,  # Already settled
+                            best_bid=trade_price,
+                            best_ask=trade_price,
+                            bid_depth=0,
+                            ask_depth=0,
+                        ),
+                        side=side,
+                        _arb_type="none",
+                        recommended_price=trade_price,
+                        size_shares=trade_size,
+                        size_usd=trade_size * trade_price,
+                        time_remaining=0,
+                    )
+
+                    # Record outcome to ML
+                    self.ml_predictor.record_outcome(
+                        signal=fake_signal,
+                        volatility=volatility,
+                        price_momentum=0.0,
+                        won=won,
+                        arb_type="none",
+                        spread=0.0,
+                        bid_depth=0,
+                        ask_depth=0,
+                        price_trend=0.0,
+                        distance_from_target=0.0,
+                        binance_lead_pct=0.0,
+                        binance_confirmation="NONE",
+                        trend_1h=0.0,
+                        trend_4h=0.0,
+                        trend_1d=0.0,
+                    )
+
+                    self._ml_synced_trades.add(trade_id)
+                    synced_count += 1
+
+                    result_str = "WIN" if won else "LOSS"
+                    logger.info(
+                        f"🔄 ML SYNC: {asset} {side.value} @ {trade_price:.4f} | "
+                        f"Result: {result_str} | Source: Polymarket API"
+                    )
+
+                except Exception as e:
+                    logger.debug(f"Error processing trade for ML sync: {e}")
+                    continue
+
+            if synced_count > 0:
+                logger.info(
+                    f"🤖 ML Sync complete: {synced_count} new outcomes recorded | "
+                    f"Total samples: {self.ml_predictor.training_samples}"
+                )
+
+            # Limit memory growth - keep only recent trade IDs
+            if len(self._ml_synced_trades) > 1000:
+                # Convert to list, keep last 500, convert back
+                self._ml_synced_trades = set(list(self._ml_synced_trades)[-500:])
+
+        except Exception as e:
+            logger.error(f"ML sync from Polymarket failed: {e}")
 
     async def _process_market(self, market: MarketState):
         """
@@ -2051,31 +2344,72 @@ class TradingBot:
         unrealized_total = equity - cash
 
         # Always log header with summary
+        pnl_str = ""
+        if unrealized_total != 0:
+            pnl_color = Colors.BRIGHT_GREEN if unrealized_total > 0 else Colors.BRIGHT_RED
+            pnl_str = f" | {pnl_color}Unrealized: ${unrealized_total:+.2f}{Colors.RESET}"
+
         logger.info(f"{Colors.BRIGHT_CYAN}📊 POSITION STATUS (every 30s){Colors.RESET}")
         logger.info(
             f"   Tracked: {len(positions)} | API: {len(api_positions)} | "
             f"Pending: {len(pending_orders)} | "
-            f"Cash: ${cash:.2f} | Equity: ${equity:.2f}"
+            f"Cash: ${cash:.2f} | Equity: ${equity:.2f}{pnl_str}"
         )
 
-        # Log tracked positions with P&L
+        # Log tracked positions with P&L and win probability
         for market_key, position in positions.items():
             market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
             asset = position.market.asset if hasattr(position, 'market') else "???"
             side = position.side.value
 
             # Calculate unrealized P&L
-            current_price = None
+            current_market_price = None
             if market:
                 if position.side == Side.UP:
-                    current_price = market.best_bid
+                    current_market_price = market.best_bid
                 else:
-                    current_price = 1.0 - market.best_ask if market.best_ask else None
+                    current_market_price = 1.0 - market.best_ask if market.best_ask else None
 
-            if current_price and current_price > 0:
-                current_value = position.shares * current_price
+            # Get Chainlink price and calculate win probability
+            chainlink_price = self.signal_generator.get_price(asset) if hasattr(self, 'signal_generator') else None
+            target_price = market.target_price if market else None
+            win_prob_str = ""
+
+            if chainlink_price and target_price and market:
+                # Calculate real-time win probability
+                from .probability import calculate_true_probability
+                volatility = self.signal_generator.get_volatility(asset)
+                true_prob_up = calculate_true_probability(
+                    current_price=chainlink_price,
+                    target_price=target_price,
+                    time_remaining_sec=market.time_remaining,
+                    volatility_15min=volatility,
+                )
+                # Our win probability depends on our side
+                our_win_prob = true_prob_up if side == "UP" else (1 - true_prob_up)
+
+                # Color based on probability
+                if our_win_prob >= 0.7:
+                    prob_color = Colors.BRIGHT_GREEN
+                    prob_icon = "✅"
+                elif our_win_prob >= 0.5:
+                    prob_color = Colors.BRIGHT_YELLOW
+                    prob_icon = "⚖️"
+                else:
+                    prob_color = Colors.BRIGHT_RED
+                    prob_icon = "⚠️"
+
+                win_prob_str = f" | {prob_color}{prob_icon} Win: {our_win_prob:.0%}{Colors.RESET}"
+
+                # Add price context
+                price_diff = chainlink_price - target_price
+                price_direction = "above" if price_diff > 0 else "below"
+                win_prob_str += f" (${chainlink_price:,.0f} {price_direction} target)"
+
+            if current_market_price and current_market_price > 0:
+                current_value = position.shares * current_market_price
                 unrealized_pnl = current_value - position.cost_basis
-                pnl_pct = (current_price - position.entry_price) / position.entry_price
+                pnl_pct = (current_market_price - position.entry_price) / position.entry_price
 
                 # Color based on P&L
                 pnl_color = Colors.BRIGHT_GREEN if unrealized_pnl > 0 else Colors.BRIGHT_RED
@@ -2083,15 +2417,20 @@ class TradingBot:
                 # Time remaining
                 time_remaining = market.time_remaining if market else 0
 
+                # ML confidence if stored
+                ml_str = ""
+                if position.ml_confidence:
+                    ml_str = f" | ML: {position.ml_confidence:.0%}"
+
                 logger.info(
-                    f"   📍 {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} → "
-                    f"{current_price:.2f} | {pnl_color}P&L: ${unrealized_pnl:+.2f} ({pnl_pct:+.0%}){Colors.RESET} | "
-                    f"Time: {time_remaining:.0f}s"
+                    f"   📍 {asset} {side}: {position.shares:.1f} @ {position.entry_price:.2f} → "
+                    f"{current_market_price:.2f} | {pnl_color}P&L: ${unrealized_pnl:+.2f} ({pnl_pct:+.0%}){Colors.RESET} | "
+                    f"Time: {time_remaining:.0f}s{win_prob_str}{ml_str}"
                 )
             else:
                 logger.info(
                     f"   📍 {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} | "
-                    f"(no price data)"
+                    f"(no price data){win_prob_str}"
                 )
 
         # Log API-discovered positions (if any)

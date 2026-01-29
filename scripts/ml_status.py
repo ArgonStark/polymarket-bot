@@ -208,6 +208,7 @@ def print_recommendations():
 
     if data is None:
         recommendations.append("Start the bot to begin ML training")
+        recommendations.append("Or run: python scripts/sync_ml_from_trades.py to backfill from history")
     else:
         samples = data.get("training_samples", 0)
         predictions = data.get("predictions_made", 0)
@@ -216,6 +217,7 @@ def print_recommendations():
 
         if samples < 25:
             recommendations.append(f"Collect {25 - samples} more trades for ML filtering to activate")
+            recommendations.append("Tip: Run 'python scripts/sync_ml_from_trades.py' to backfill from history")
 
         if predictions >= 10 and accuracy < 0.45:
             recommendations.append("WARNING: Accuracy below 45% - consider pausing to analyze")
