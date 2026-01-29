@@ -1072,6 +1072,10 @@ class TradingBot:
                 # This bypasses internal position tracking which may fail
                 await self._sync_ml_from_polymarket()
 
+                # Sync positions from Polymarket API - clears stale positions
+                # that no longer exist (prevents blocking new trades)
+                await self._sync_positions_from_polymarket()
+
                 await asyncio.sleep(self.settlement_check_interval)
 
             except asyncio.CancelledError:
@@ -2000,6 +2004,66 @@ class TradingBot:
         except Exception as e:
             logger.error(f"ML sync from Polymarket failed: {e}")
 
+    async def _sync_positions_from_polymarket(self):
+        """
+        Sync internal position tracking with actual Polymarket positions.
+
+        Removes stale positions that no longer exist on Polymarket.
+        This prevents the bot from blocking new trades due to ghost positions.
+        """
+        if not self.client:
+            return
+
+        try:
+            # Get wallet address
+            wallet_address = self.client.get_address()
+            if not wallet_address:
+                return
+
+            # Initialize Data API
+            data_api = get_data_api()
+
+            # Get current positions from Polymarket
+            api_positions = data_api.get_positions(wallet_address, limit=100, size_threshold=0.1)
+
+            # Build set of condition IDs that actually have positions
+            api_condition_ids = set()
+            for pos in api_positions:
+                cid = pos.get("conditionId", "")
+                if cid:
+                    api_condition_ids.add(cid)
+
+            # Check internal positions against API
+            internal_positions = list(self.risk_manager.positions.keys())
+            cleared_count = 0
+
+            for market_key in internal_positions:
+                if market_key not in api_condition_ids:
+                    # Position exists internally but not on Polymarket - it's been settled
+                    position = self.risk_manager.positions.get(market_key)
+                    if position:
+                        asset = position.market.asset if hasattr(position, 'market') else "???"
+                        side = position.side.value if hasattr(position, 'side') else "???"
+
+                        logger.info(
+                            f"🧹 Clearing stale position: {asset} {side} | "
+                            f"Not found on Polymarket"
+                        )
+
+                        # Remove from risk manager (assume break-even if unknown)
+                        self.risk_manager.positions.pop(market_key, None)
+                        cleared_count += 1
+
+                        # Also clear any asset-level tracking
+                        if hasattr(self, '_api_positions') and asset in self._api_positions:
+                            del self._api_positions[asset]
+
+            if cleared_count > 0:
+                logger.info(f"🧹 Cleared {cleared_count} stale positions from tracking")
+
+        except Exception as e:
+            logger.debug(f"Position sync failed: {e}")
+
     async def _process_market(self, market: MarketState):
         """
         Process a single market for trading opportunities.
@@ -2291,18 +2355,12 @@ class TradingBot:
             asset = position.market.asset if hasattr(position, 'market') else "???"
             side = position.side.value
 
-            # Calculate unrealized P&L
-            current_market_price = None
-            if market:
-                if position.side == Side.UP:
-                    current_market_price = market.best_bid
-                else:
-                    current_market_price = 1.0 - market.best_ask if market.best_ask else None
-
             # Get Chainlink price and calculate win probability
             chainlink_price = self.signal_generator.get_price(asset) if hasattr(self, 'signal_generator') else None
             target_price = market.target_price if market else None
+            time_remaining = market.time_remaining if market else 0
             win_prob_str = ""
+            our_win_prob = 0.5  # Default
 
             if chainlink_price and target_price and market:
                 # Calculate real-time win probability
@@ -2335,26 +2393,46 @@ class TradingBot:
                 price_direction = "above" if price_diff > 0 else "below"
                 win_prob_str += f" (${chainlink_price:,.0f} {price_direction} target)"
 
-            if current_market_price and current_market_price > 0:
+            # Calculate P&L - use settlement price for expired markets
+            current_market_price = None
+            if market:
+                # For expired markets with known outcome, use settlement price
+                if time_remaining <= 0 and our_win_prob >= 0.99:
+                    # We're winning - settlement pays $1 per share
+                    current_market_price = 1.0
+                elif time_remaining <= 0 and our_win_prob <= 0.01:
+                    # We're losing - settlement pays $0
+                    current_market_price = 0.0
+                else:
+                    # Active market - use current market price
+                    if position.side == Side.UP:
+                        current_market_price = market.best_bid
+                    else:
+                        current_market_price = 1.0 - market.best_ask if market.best_ask else None
+
+            if current_market_price is not None and current_market_price >= 0:
                 current_value = position.shares * current_market_price
                 unrealized_pnl = current_value - position.cost_basis
-                pnl_pct = (current_market_price - position.entry_price) / position.entry_price
+                if position.entry_price > 0:
+                    pnl_pct = (current_market_price - position.entry_price) / position.entry_price
+                else:
+                    pnl_pct = 0
 
                 # Color based on P&L
                 pnl_color = Colors.BRIGHT_GREEN if unrealized_pnl > 0 else Colors.BRIGHT_RED
-
-                # Time remaining
-                time_remaining = market.time_remaining if market else 0
 
                 # ML confidence if stored
                 ml_str = ""
                 if position.ml_confidence:
                     ml_str = f" | ML: {position.ml_confidence:.0%}"
 
+                # Show settlement indicator for expired markets
+                settled_str = " [SETTLING]" if time_remaining <= 0 else ""
+
                 logger.info(
                     f"   📍 {asset} {side}: {position.shares:.1f} @ {position.entry_price:.2f} → "
                     f"{current_market_price:.2f} | {pnl_color}P&L: ${unrealized_pnl:+.2f} ({pnl_pct:+.0%}){Colors.RESET} | "
-                    f"Time: {time_remaining:.0f}s{win_prob_str}{ml_str}"
+                    f"Time: {time_remaining:.0f}s{settled_str}{win_prob_str}{ml_str}"
                 )
             else:
                 logger.info(

@@ -769,6 +769,30 @@ class GammaAPI:
             logger.debug(f"Failed to fetch market by condition_id {condition_id}: {e}")
             return None
 
+    def get_market_by_slug(self, slug: str) -> Optional[dict]:
+        """
+        Fetch a specific market by slug.
+
+        Args:
+            slug: Market slug (e.g., "btc-updown-15m-2024-01-29-1200")
+
+        Returns:
+            Market dict or None if not found
+        """
+        url = f"{self.base_url}/markets"
+        params = {"slug": slug}
+
+        try:
+            response = self._session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            markets = response.json()
+            if markets and len(markets) > 0:
+                return markets[0]
+            return None
+        except requests.RequestException as e:
+            logger.debug(f"Failed to fetch market by slug {slug}: {e}")
+            return None
+
     def get_market_prices(self, condition_id: str) -> Optional[dict]:
         """
         Fetch current prices for a market.
