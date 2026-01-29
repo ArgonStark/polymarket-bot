@@ -2,11 +2,8 @@
 """
 Manual ML Sync from Polymarket Trade History
 
-This script fetches your actual trades from Polymarket and syncs them
-with the ML model. Useful for:
-- Backfilling the ML model with historical trades
-- Debugging ML learning issues
-- Manual sync if automatic sync fails
+This script fetches your closed positions from Polymarket Data API
+and syncs them with the ML model.
 
 Usage:
     python scripts/sync_ml_from_trades.py [--limit 100]
@@ -14,18 +11,15 @@ Usage:
 
 import os
 import sys
-import time
 import argparse
 import logging
-from datetime import datetime, timezone
+import requests
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import BotConfig
 from src.execution import create_trading_client
-from src.execution.client import get_trades
-from src.data.gamma import GammaAPI
 from src.strategy.ml_predictor import get_ml_predictor
 from src.models import Side
 
@@ -34,98 +28,46 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
-def load_config() -> BotConfig:
-    """Load bot configuration."""
-    return BotConfig()
-
-
-def build_market_lookup(gamma_api: GammaAPI, hours_back: int = 24) -> dict:
+def get_closed_positions(wallet_address: str, limit: int = 100) -> list:
     """
-    Build a lookup table of condition_id -> market info for recent 15-min crypto markets.
-
-    This fetches markets by constructing slugs for recent time periods.
-    """
-    lookup = {}
-    now = int(time.time())
-
-    # Round down to current 15-min period
-    current_period = (now // 900) * 900
-
-    # Go back N hours (4 periods per hour)
-    periods_to_check = hours_back * 4
-
-    assets = ["btc", "eth", "sol", "xrp"]
-
-    print(f"Building market lookup (last {hours_back} hours)...")
-
-    for i in range(periods_to_check):
-        ts = current_period - (i * 900)
-
-        for asset in assets:
-            slug = f"{asset}-updown-15m-{ts}"
-
-            try:
-                # Use the existing _fetch_market_by_slug method pattern
-                import requests
-                url = f"{gamma_api.base_url}/markets"
-                params = {"slug": slug}
-                response = requests.get(url, params=params, timeout=5)
-
-                if response.status_code == 200:
-                    markets = response.json()
-                    if markets and len(markets) > 0:
-                        market = markets[0]
-                        condition_id = market.get("conditionId", "")
-                        if condition_id:
-                            # Check if resolved
-                            resolved = market.get("closed", False)
-                            winning_outcome = None
-
-                            if resolved:
-                                # Try to get winner from tokens
-                                tokens = market.get("tokens", [])
-                                for token in tokens:
-                                    if token.get("winner", False):
-                                        outcome_str = token.get("outcome", "").lower()
-                                        if "up" in outcome_str:
-                                            winning_outcome = "UP"
-                                        elif "down" in outcome_str:
-                                            winning_outcome = "DOWN"
-                                        break
-
-                            lookup[condition_id] = {
-                                "slug": slug,
-                                "asset": asset.upper(),
-                                "resolved": resolved,
-                                "winning_outcome": winning_outcome,
-                                "market_ts": ts,
-                            }
-            except Exception:
-                pass
-
-        # Progress indicator
-        if i % 20 == 0 and i > 0:
-            print(f"  Checked {i}/{periods_to_check} periods, found {len(lookup)} markets...")
-
-    print(f"  Found {len(lookup)} 15-min crypto markets\n")
-    return lookup
-
-
-def sync_trades_to_ml(limit: int = 100, dry_run: bool = False, hours_back: int = 24):
-    """
-    Sync trades from Polymarket to ML model.
+    Fetch closed positions from Polymarket Data API.
 
     Args:
-        limit: Maximum number of trades to fetch
+        wallet_address: User's wallet address
+        limit: Maximum positions to fetch
+
+    Returns:
+        List of closed position objects
+    """
+    url = "https://data-api.polymarket.com/closed-positions"
+    params = {
+        "user": wallet_address,
+        "limit": limit,
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logger.error(f"Failed to fetch closed positions: {e}")
+        return []
+
+
+def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
+    """
+    Sync closed positions from Polymarket to ML model.
+
+    Args:
+        limit: Maximum number of positions to fetch
         dry_run: If True, don't actually save to ML model
-        hours_back: Hours of market history to fetch for lookup
     """
     print("\n" + "=" * 60)
-    print("  POLYMARKET -> ML SYNC")
+    print("  POLYMARKET -> ML SYNC (Closed Positions)")
     print("=" * 60 + "\n")
 
-    # Load config and create clients
-    config = load_config()
+    # Load config and create client to get wallet address
+    config = BotConfig()
     client = create_trading_client(config)
 
     if not client:
@@ -133,63 +75,68 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False, hours_back: int =
         print("Make sure your POLYMARKET_API_KEY and POLYMARKET_PRIVATE_KEY are set")
         return
 
-    # Initialize ML predictor
-    ml_predictor = get_ml_predictor()
-    print(f"ML Model loaded: {ml_predictor.training_samples} existing samples")
-
-    # Initialize Gamma API
-    gamma_api = GammaAPI(config=config)
-
-    # Build lookup table of recent 15-min crypto markets
-    market_lookup = build_market_lookup(gamma_api, hours_back=hours_back)
-
-    # Fetch trades from Polymarket
-    print(f"Fetching last {limit} trades from Polymarket API...")
-    trades = get_trades(client, limit=limit)
-
-    if not trades:
-        print("No trades found")
+    # Get wallet address
+    wallet_address = client.get_address()
+    if not wallet_address:
+        print("ERROR: Could not get wallet address")
         return
 
-    print(f"Found {len(trades)} trades\n")
+    print(f"Wallet: {wallet_address}")
+
+    # Initialize ML predictor
+    ml_predictor = get_ml_predictor()
+    print(f"ML Model loaded: {ml_predictor.training_samples} existing samples\n")
+
+    # Fetch closed positions
+    print(f"Fetching closed positions from Polymarket Data API...")
+    positions = get_closed_positions(wallet_address, limit=limit)
+
+    if not positions:
+        print("No closed positions found")
+        return
+
+    print(f"Found {len(positions)} closed positions\n")
+
+    # Debug: show first few
+    print("Sample position structure:")
+    print("-" * 60)
+    if positions:
+        sample = positions[0]
+        for key in ["title", "slug", "outcome", "avgPrice", "totalBought", "realizedPnl"]:
+            if key in sample:
+                print(f"  {key}: {sample[key]}")
+    print("-" * 60 + "\n")
 
     # Track stats
     synced_count = 0
-    pending_count = 0
     non_crypto_count = 0
     skipped_count = 0
-    current_ts = int(time.time())
 
-    print("Processing trades...\n")
+    print("Processing positions...\n")
 
-    for i, trade in enumerate(trades):
+    for i, pos in enumerate(positions):
         try:
-            trade_id = trade.get("id", "")
-            condition_id = trade.get("market", "")
+            slug = pos.get("slug", "") or pos.get("eventSlug", "")
+            title = pos.get("title", "")
 
-            if not condition_id:
-                skipped_count += 1
-                continue
-
-            # Look up in our pre-built table
-            market_info = market_lookup.get(condition_id)
-
-            if not market_info:
+            # Check if this is a 15-min crypto market
+            if "updown-15m" not in slug.lower() and "15m" not in title.lower():
                 non_crypto_count += 1
                 continue
 
-            slug = market_info["slug"]
-            asset = market_info["asset"]
-            market_ts = market_info["market_ts"]
+            # Identify asset from slug
+            asset = None
+            for a in ["btc", "eth", "sol", "xrp"]:
+                if slug.lower().startswith(a) or a in slug.lower():
+                    asset = a.upper()
+                    break
 
-            # Check if market has settled (15 min + buffer)
-            settle_time = market_ts + 900
-            if current_ts < settle_time + 60:
-                pending_count += 1
+            if not asset:
+                skipped_count += 1
                 continue
 
-            # Determine trade side from outcome field
-            outcome = trade.get("outcome", "")
+            # Get outcome (Up/Down)
+            outcome = pos.get("outcome", "")
             if isinstance(outcome, str):
                 outcome_lower = outcome.lower()
                 if "up" in outcome_lower:
@@ -203,34 +150,28 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False, hours_back: int =
                 skipped_count += 1
                 continue
 
-            # Get winning outcome
-            winning_outcome = market_info.get("winning_outcome")
-
-            if not winning_outcome:
-                # Market not resolved yet
-                pending_count += 1
-                continue
-
-            # Determine if trade won
-            won = side.value == winning_outcome
+            # Determine if we won based on realizedPnl
+            realized_pnl = float(pos.get("realizedPnl", 0) or 0)
+            won = realized_pnl > 0
 
             # Get trade details
-            trade_price = float(trade.get("price", 0) or 0)
-            trade_size = float(trade.get("size", 0) or 0)
+            avg_price = float(pos.get("avgPrice", 0) or 0)
+            total_bought = float(pos.get("totalBought", 0) or 0)
 
-            if trade_price <= 0 or trade_size <= 0:
+            if avg_price <= 0 or total_bought <= 0:
                 skipped_count += 1
                 continue
 
-            # Display trade info
+            # Display position info
             result = "WIN" if won else "LOSS"
             result_color = "\033[92m" if won else "\033[91m"
             reset = "\033[0m"
+            pnl_str = f"${realized_pnl:+.2f}"
 
             print(
-                f"[{i+1:3d}] {asset:4s} {side.value:4s} @ {trade_price:.4f} | "
-                f"Size: {trade_size:8.2f} | {result_color}{result:4s}{reset} | "
-                f"Slug: {slug}"
+                f"[{i+1:3d}] {asset:4s} {side.value:4s} @ {avg_price:.4f} | "
+                f"Size: {total_bought:8.2f} | {result_color}{result:4s}{reset} | "
+                f"P&L: {pnl_str} | {slug[:40]}"
             )
 
             if not dry_run:
@@ -242,16 +183,16 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False, hours_back: int =
                         asset=asset,
                         target_price=0,
                         time_remaining=0,
-                        best_bid=trade_price,
-                        best_ask=trade_price,
+                        best_bid=avg_price,
+                        best_ask=avg_price,
                         bid_depth=0,
                         ask_depth=0,
                     ),
                     side=side,
                     _arb_type="none",
-                    recommended_price=trade_price,
-                    size_shares=trade_size,
-                    size_usd=trade_size * trade_price,
+                    recommended_price=avg_price,
+                    size_shares=total_bought,
+                    size_usd=total_bought * avg_price,
                     time_remaining=0,
                 )
 
@@ -265,7 +206,7 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False, hours_back: int =
             synced_count += 1
 
         except Exception as e:
-            logger.debug(f"Error processing trade: {e}")
+            logger.debug(f"Error processing position: {e}")
             skipped_count += 1
             continue
 
@@ -273,11 +214,10 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False, hours_back: int =
     print("\n" + "-" * 60)
     print("SYNC SUMMARY")
     print("-" * 60)
-    print(f"  Total trades fetched: {len(trades)}")
-    print(f"  Synced to ML:         {synced_count}")
-    print(f"  Pending settlement:   {pending_count}")
-    print(f"  Non-15min crypto:     {non_crypto_count}")
-    print(f"  Skipped/errors:       {skipped_count}")
+    print(f"  Total positions fetched: {len(positions)}")
+    print(f"  Synced to ML:            {synced_count}")
+    print(f"  Non-15min crypto:        {non_crypto_count}")
+    print(f"  Skipped/errors:          {skipped_count}")
 
     if not dry_run and synced_count > 0:
         print(f"\n  ML Model now has: {ml_predictor.training_samples} samples")
@@ -291,13 +231,12 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False, hours_back: int =
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sync Polymarket trades to ML model")
-    parser.add_argument("--limit", "-l", type=int, default=100, help="Max trades to fetch")
+    parser = argparse.ArgumentParser(description="Sync Polymarket closed positions to ML model")
+    parser.add_argument("--limit", "-l", type=int, default=500, help="Max positions to fetch")
     parser.add_argument("--dry-run", "-n", action="store_true", help="Don't save to ML")
-    parser.add_argument("--hours", "-H", type=int, default=48, help="Hours of market history")
 
     args = parser.parse_args()
-    sync_trades_to_ml(limit=args.limit, dry_run=args.dry_run, hours_back=args.hours)
+    sync_trades_to_ml(limit=args.limit, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
