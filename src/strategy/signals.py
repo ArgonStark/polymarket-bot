@@ -292,6 +292,59 @@ class SignalGenerator:
             self.config.volatility.get(asset.upper()),
         )
 
+    def get_price_range(self, asset: str) -> tuple[float, float]:
+        """
+        Get recent high/low price range for an asset.
+
+        Returns:
+            Tuple of (high, low) prices from recent price history.
+            Returns (0.0, 0.0) if no data available.
+        """
+        symbol = f"{asset.lower()}/usd"
+        history = self.price_histories.get(symbol, [])
+        if not history:
+            return (0.0, 0.0)
+
+        # Get prices from history (list of (timestamp, price) tuples)
+        prices = [p[1] for p in history if len(p) >= 2]
+        if not prices:
+            return (0.0, 0.0)
+
+        return (max(prices), min(prices))
+
+    def get_price_velocity(self, asset: str) -> float:
+        """
+        Get price velocity (rate of change) for an asset.
+
+        Returns:
+            Price change per second, normalized by price.
+            Positive = price increasing, negative = decreasing.
+            Returns 0.0 if insufficient data.
+        """
+        symbol = f"{asset.lower()}/usd"
+        history = self.price_histories.get(symbol, [])
+        if len(history) < 2:
+            return 0.0
+
+        # Get recent prices with timestamps
+        recent = history[-10:]  # Last 10 data points
+        if len(recent) < 2:
+            return 0.0
+
+        # Calculate price change over time
+        first_time, first_price = recent[0]
+        last_time, last_price = recent[-1]
+
+        time_diff = (last_time - first_time).total_seconds() if hasattr(last_time, 'total_seconds') else float(last_time - first_time)
+        if time_diff <= 0 or first_price <= 0:
+            return 0.0
+
+        # Velocity as percentage change per second
+        price_change = (last_price - first_price) / first_price
+        velocity = price_change / time_diff
+
+        return velocity
+
     def generate_signal(self, market: MarketState) -> Optional[Signal]:
         """
         Generate a trading signal for a market.

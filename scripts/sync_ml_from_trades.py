@@ -267,6 +267,12 @@ def sync_trades_to_ml(limit: int = 500, dry_run: bool = False, show_activity: bo
                     volatility=0.003,
                     price_momentum=0.0,
                     won=won,
+                    # Historical trades - no real-time price data available
+                    current_price=0.0,
+                    target_price=0.0,
+                    price_high=0.0,
+                    price_low=0.0,
+                    price_velocity=0.0,
                 )
 
             synced_count += 1
