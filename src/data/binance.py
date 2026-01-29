@@ -74,6 +74,7 @@ class BinanceFeed:
     _ws: Optional[websocket.WebSocketApp] = None
     _prices: dict[str, float] = field(default_factory=dict)
     _last_update: dict[str, datetime] = field(default_factory=dict)
+    _price_history: dict[str, list] = field(default_factory=dict)  # symbol -> [(timestamp, price), ...]
     _connected: bool = False
     _reconnect_delay: float = field(init=False)
     _max_reconnect_delay: float = field(init=False)
@@ -81,6 +82,7 @@ class BinanceFeed:
     _retry_count: int = 0
     _circuit_open: bool = False  # Circuit breaker state
     _shutdown: bool = False  # Graceful shutdown flag
+    _max_history_size: int = 100  # Max price history entries per symbol
 
     def __post_init__(self):
         """Initialize WebSocket settings from config."""
@@ -136,6 +138,50 @@ class BinanceFeed:
             return age
         return None
 
+    def get_price_history(self, asset: str, limit: int = 20) -> list:
+        """
+        Get recent price history for an asset.
+
+        Args:
+            asset: Asset symbol like "BTC"
+            limit: Maximum number of entries to return
+
+        Returns:
+            List of (timestamp, price) tuples, newest last
+        """
+        symbol = BINANCE_SYMBOLS.get(asset.upper())
+        if symbol and symbol in self._price_history:
+            return self._price_history[symbol][-limit:]
+        return []
+
+    def get_velocity(self, asset: str, window: int = 10) -> float:
+        """
+        Calculate price velocity (rate of change) for an asset.
+
+        Args:
+            asset: Asset symbol like "BTC"
+            window: Number of recent prices to use
+
+        Returns:
+            Velocity as percentage change per second.
+            Positive = price increasing, negative = decreasing.
+        """
+        history = self.get_price_history(asset, window)
+        if len(history) < 2:
+            return 0.0
+
+        first_time, first_price = history[0]
+        last_time, last_price = history[-1]
+
+        # Calculate time difference in seconds
+        time_diff = (last_time - first_time).total_seconds()
+        if time_diff <= 0 or first_price <= 0:
+            return 0.0
+
+        # Velocity as percentage change per second
+        price_change = (last_price - first_price) / first_price
+        return price_change / time_diff
+
     def _build_stream_url(self) -> str:
         """Build the combined stream URL for all assets."""
         # Use combined stream for all assets in one connection
@@ -186,6 +232,15 @@ class BinanceFeed:
                         timestamp = datetime.now(timezone.utc)
 
                     self._last_update[symbol] = timestamp
+
+                    # Update price history
+                    if symbol not in self._price_history:
+                        self._price_history[symbol] = []
+                    self._price_history[symbol].append((timestamp, price))
+
+                    # Keep only last N entries
+                    if len(self._price_history[symbol]) > self._max_history_size:
+                        self._price_history[symbol] = self._price_history[symbol][-self._max_history_size:]
 
                     # Create price object
                     binance_price = BinancePrice(
