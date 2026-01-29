@@ -918,6 +918,10 @@ class MLSignalPredictor:
 
         return (True, f"Accuracy OK: {accuracy:.0%}")
 
+    def save(self):
+        """Public method to save model to disk."""
+        self._save_model()
+
     def _save_model(self):
         """Save model to disk."""
         try:
