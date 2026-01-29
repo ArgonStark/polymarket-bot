@@ -150,6 +150,14 @@ def sync_trades_to_ml(limit: int = 500, dry_run: bool = False, show_activity: bo
 
     print(f"Found {len(closed)} total closed positions\n")
 
+    # Show sample slugs for debugging
+    print("Sample slugs from API (first 5):")
+    for pos in closed[:5]:
+        slug = pos.get("slug", "") or pos.get("eventSlug", "")
+        title = pos.get("title", "")
+        print(f"  slug={slug!r}  title={title!r}")
+    print()
+
     # Track stats
     synced_count = 0
     non_crypto_count = 0
@@ -163,17 +171,25 @@ def sync_trades_to_ml(limit: int = 500, dry_run: bool = False, show_activity: bo
         try:
             slug = pos.get("slug", "") or pos.get("eventSlug", "")
             title = pos.get("title", "")
+            slug_lower = slug.lower()
+            title_lower = title.lower()
 
             # Check if this is a 15-min crypto market
-            if "updown-15m" not in slug.lower() and "15m" not in title.lower():
+            # Patterns: "updown-15m", "15m", "15min", "15-min", "up-down-15m"
+            is_15min = any(p in slug_lower or p in title_lower for p in [
+                "updown-15m", "-15m-", "15min", "15-min", "15m"
+            ])
+
+            if not is_15min:
                 non_crypto_count += 1
                 continue
 
-            # Identify asset from slug
+            # Identify asset from slug or title
             asset = None
-            for a in ["btc", "eth", "sol", "xrp"]:
-                if slug.lower().startswith(a) or a in slug.lower():
-                    asset = a.upper()
+            for a in ["btc", "eth", "sol", "xrp", "bitcoin", "ethereum", "solana"]:
+                asset_name = a[:3].upper() if len(a) > 3 else a.upper()
+                if a in slug_lower or a in title_lower:
+                    asset = asset_name
                     break
 
             if not asset:
@@ -274,8 +290,15 @@ def sync_trades_to_ml(limit: int = 500, dry_run: bool = False, show_activity: bo
         print(f"  Wins:  {wins:3d} ({win_rate:.1f}%)")
         print(f"  Losses: {losses:3d} ({100-win_rate:.1f}%)")
 
-    if not dry_run and synced_count > 0:
-        print(f"\n  ML Model now has: {ml_predictor.training_samples} samples")
+    if not dry_run:
+        # Always save the model (even if 0 synced) to create the file
+        if synced_count > 0:
+            print(f"\n  ML Model now has: {ml_predictor.training_samples} samples")
+        else:
+            # Force save to create the file if it doesn't exist
+            ml_predictor.save()
+            print(f"\n  No 15-min crypto positions found to sync")
+            print(f"  Created empty ML model at: {ml_predictor.model_path}")
         print(f"  Model saved to: {ml_predictor.model_path}")
 
     if os.path.exists(ml_predictor.model_path):
