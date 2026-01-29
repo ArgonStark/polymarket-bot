@@ -67,8 +67,9 @@ class TradingConfig:
     )
 
     # Minimum time remaining before market close (seconds)
+    # 60s gives enough buffer for order execution and price movement
     min_time_remaining: float = field(
-        default_factory=lambda: float(os.getenv("MIN_TIME_REMAINING", "30"))
+        default_factory=lambda: float(os.getenv("MIN_TIME_REMAINING", "60"))
     )
 
     # Base position size in USD (smaller = more trades, less risk per trade)

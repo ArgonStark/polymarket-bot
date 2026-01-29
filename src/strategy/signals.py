@@ -483,24 +483,38 @@ class SignalGenerator:
         """
         Determine order action based on edge and urgency.
 
-        UPDATED: Now prefers LIMIT orders for reliable execution.
-        With high edge (35-50%), the small taker fee (~0.02%) is negligible.
-        Getting the fill matters more than saving on fees.
+        UPDATED: Conservative near expiry to avoid losses.
+        Getting stuck in a position with no time to recover is costly.
 
         Decision matrix:
-        - edge >= 15% AND time < 45s -> MARKET (urgent, guaranteed fill)
-        - edge >= 3% -> LIMIT (reliable execution, default choice)
+        - time < 60s: SKIP (too risky, not enough time for order to fill/profit)
+        - time < 90s AND edge < 10%: SKIP (need strong edge for short time)
+        - time < 90s AND edge >= 10%: MARKET (urgent, take the opportunity)
+        - time >= 90s AND edge >= 3%: LIMIT (normal trading)
         - Otherwise -> SKIP
         """
         trading = self.config.trading
 
-        # MARKET orders: Use only when we have high edge AND very limited time
-        # This guarantees execution when we need to get in before expiry
-        if edge >= trading.edge_for_market and time_remaining < 45:
+        # Very short time: Skip entirely (too risky)
+        if time_remaining < 60:
+            logger.debug(f"Skipping trade: only {time_remaining:.0f}s remaining (< 60s minimum)")
+            return OrderAction.SKIP
+
+        # Short time (60-90s): Require strong edge, use MARKET orders
+        if time_remaining < 90:
+            if edge >= 0.10:  # 10% edge minimum for short time trades
+                logger.debug(f"Short time trade: {time_remaining:.0f}s, edge={edge:.1%} - using MARKET")
+                return OrderAction.MARKET
+            else:
+                logger.debug(f"Skipping: {time_remaining:.0f}s remaining, edge {edge:.1%} < 10% required")
+                return OrderAction.SKIP
+
+        # Normal time (90s+): Standard logic
+        # MARKET orders: Use when we have high edge AND limited time
+        if edge >= trading.edge_for_market and time_remaining < 120:
             return OrderAction.MARKET
 
         # LIMIT orders: Default choice for reliable execution
-        # Will fill immediately if there's liquidity, or sit on book if not
         elif edge >= trading.min_edge:
             return OrderAction.LIMIT
 
