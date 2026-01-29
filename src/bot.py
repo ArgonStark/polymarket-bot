@@ -456,12 +456,63 @@ class TradingBot:
                     orders_to_remove.append(order_id)
 
                 elif order_info.status.value == "PARTIAL":
-                    # Partially filled - log progress
+                    # Partially filled - check if essentially complete
                     fill_pct = order_info.fill_pct * 100
-                    logger.info(
-                        f"⏳ ORDER PARTIAL: {asset} | "
-                        f"Filled: {fill_pct:.0f}% ({order_info.filled_size:.2f} shares)"
-                    )
+                    original_size = order_data.get("size", 0)
+
+                    # If 95%+ filled, treat as FILLED (blockchain confirmation pending)
+                    if fill_pct >= 95 or (original_size > 0 and order_info.filled_size >= original_size * 0.95):
+                        logger.info(
+                            f"✅ ORDER FILLED (via PARTIAL 100%): {asset} | "
+                            f"Shares: {order_info.filled_size:.2f} @ {order_info.price:.4f}"
+                        )
+
+                        if signal:
+                            # Record position with risk manager
+                            logger.info(f"📍 Recording position for {asset} {signal.side.value}")
+                            self.risk_manager.record_position_open(
+                                signal=signal,
+                                entry_price=order_info.price,
+                                shares=order_info.filled_size,
+                                ml_volatility=order_data.get("ml_volatility"),
+                                ml_momentum=order_data.get("ml_momentum"),
+                                ml_confidence=order_data.get("ml_confidence"),
+                                ml_arb_type=order_data.get("ml_arb_type"),
+                                ml_spread=order_data.get("ml_spread"),
+                                ml_bid_depth=order_data.get("ml_bid_depth"),
+                                ml_ask_depth=order_data.get("ml_ask_depth"),
+                                ml_price_trend=order_data.get("ml_price_trend"),
+                                ml_distance_from_target=order_data.get("ml_distance_from_target"),
+                                ml_binance_lead_pct=order_data.get("ml_binance_lead_pct"),
+                                ml_binance_confirmation=order_data.get("ml_binance_confirmation"),
+                                ml_trend_1h=order_data.get("ml_trend_1h"),
+                                ml_trend_4h=order_data.get("ml_trend_4h"),
+                                ml_trend_1d=order_data.get("ml_trend_1d"),
+                            )
+
+                            # Record in trade history
+                            trade_history = get_trade_history()
+                            current_price = self.signal_generator.get_price(signal.market.asset)
+                            trade_history.record_open(
+                                asset=asset,
+                                side=signal.side.value,
+                                entry_price=order_info.price,
+                                shares=order_info.filled_size,
+                                target_price=signal.market.target_price,
+                                chainlink_price=current_price,
+                                market_id=signal.market.condition_id,
+                                predicted_prob=order_data.get("ml_confidence"),
+                                arb_type=order_data.get("ml_arb_type") or "none",
+                                edge=signal.edge,
+                            )
+
+                        orders_to_remove.append(order_id)
+                    else:
+                        # Actually partial - log progress
+                        logger.info(
+                            f"⏳ ORDER PARTIAL: {asset} | "
+                            f"Filled: {fill_pct:.0f}% ({order_info.filled_size:.2f} shares)"
+                        )
 
                 elif order_info.status.value in ["CANCELLED", "EXPIRED", "REJECTED"]:
                     # Order failed - remove and allow retry
@@ -2051,11 +2102,16 @@ class TradingBot:
         unrealized_total = equity - cash
 
         # Always log header with summary
+        pnl_str = ""
+        if unrealized_total != 0:
+            pnl_color = Colors.BRIGHT_GREEN if unrealized_total > 0 else Colors.BRIGHT_RED
+            pnl_str = f" | {pnl_color}Unrealized: ${unrealized_total:+.2f}{Colors.RESET}"
+
         logger.info(f"{Colors.BRIGHT_CYAN}📊 POSITION STATUS (every 30s){Colors.RESET}")
         logger.info(
             f"   Tracked: {len(positions)} | API: {len(api_positions)} | "
             f"Pending: {len(pending_orders)} | "
-            f"Cash: ${cash:.2f} | Equity: ${equity:.2f}"
+            f"Cash: ${cash:.2f} | Equity: ${equity:.2f}{pnl_str}"
         )
 
         # Log tracked positions with P&L
