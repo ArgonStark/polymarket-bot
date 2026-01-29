@@ -1811,6 +1811,22 @@ class TradingBot:
                 size_usd=position.shares * position.entry_price,
                 time_remaining=market.time_remaining,
             )
+
+            # Log ML learning with prediction accuracy
+            ml_conf = position.ml_confidence
+            ml_prediction = "WIN" if ml_conf and ml_conf >= 0.5 else "LOSS" if ml_conf else None
+            actual_result = "WIN" if won else "LOSS"
+
+            if ml_prediction:
+                correct = ml_prediction == actual_result
+                correct_str = f"{Colors.BRIGHT_GREEN}✓ CORRECT{Colors.RESET}" if correct else f"{Colors.BRIGHT_RED}✗ WRONG{Colors.RESET}"
+                logger.info(
+                    f"🤖 ML EVAL: {market.asset} | "
+                    f"Predicted: {ml_prediction} ({ml_conf:.0%}) | Actual: {actual_result} | {correct_str}"
+                )
+            else:
+                logger.info(f"🤖 ML EVAL: {market.asset} | Actual: {actual_result} (learning mode - no prediction)")
+
             self.ml_predictor.record_outcome(
                 signal=fake_signal,
                 volatility=volatility,
@@ -2114,24 +2130,60 @@ class TradingBot:
             f"Cash: ${cash:.2f} | Equity: ${equity:.2f}{pnl_str}"
         )
 
-        # Log tracked positions with P&L
+        # Log tracked positions with P&L and win probability
         for market_key, position in positions.items():
             market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
             asset = position.market.asset if hasattr(position, 'market') else "???"
             side = position.side.value
 
             # Calculate unrealized P&L
-            current_price = None
+            current_market_price = None
             if market:
                 if position.side == Side.UP:
-                    current_price = market.best_bid
+                    current_market_price = market.best_bid
                 else:
-                    current_price = 1.0 - market.best_ask if market.best_ask else None
+                    current_market_price = 1.0 - market.best_ask if market.best_ask else None
 
-            if current_price and current_price > 0:
-                current_value = position.shares * current_price
+            # Get Chainlink price and calculate win probability
+            chainlink_price = self.signal_generator.get_price(asset) if hasattr(self, 'signal_generator') else None
+            target_price = market.target_price if market else None
+            win_prob_str = ""
+
+            if chainlink_price and target_price and market:
+                # Calculate real-time win probability
+                from .probability import calculate_true_probability
+                volatility = self.signal_generator.get_volatility(asset)
+                true_prob_up = calculate_true_probability(
+                    current_price=chainlink_price,
+                    target_price=target_price,
+                    time_remaining_sec=market.time_remaining,
+                    volatility_15min=volatility,
+                )
+                # Our win probability depends on our side
+                our_win_prob = true_prob_up if side == "UP" else (1 - true_prob_up)
+
+                # Color based on probability
+                if our_win_prob >= 0.7:
+                    prob_color = Colors.BRIGHT_GREEN
+                    prob_icon = "✅"
+                elif our_win_prob >= 0.5:
+                    prob_color = Colors.BRIGHT_YELLOW
+                    prob_icon = "⚖️"
+                else:
+                    prob_color = Colors.BRIGHT_RED
+                    prob_icon = "⚠️"
+
+                win_prob_str = f" | {prob_color}{prob_icon} Win: {our_win_prob:.0%}{Colors.RESET}"
+
+                # Add price context
+                price_diff = chainlink_price - target_price
+                price_direction = "above" if price_diff > 0 else "below"
+                win_prob_str += f" (${chainlink_price:,.0f} {price_direction} target)"
+
+            if current_market_price and current_market_price > 0:
+                current_value = position.shares * current_market_price
                 unrealized_pnl = current_value - position.cost_basis
-                pnl_pct = (current_price - position.entry_price) / position.entry_price
+                pnl_pct = (current_market_price - position.entry_price) / position.entry_price
 
                 # Color based on P&L
                 pnl_color = Colors.BRIGHT_GREEN if unrealized_pnl > 0 else Colors.BRIGHT_RED
@@ -2139,15 +2191,20 @@ class TradingBot:
                 # Time remaining
                 time_remaining = market.time_remaining if market else 0
 
+                # ML confidence if stored
+                ml_str = ""
+                if position.ml_confidence:
+                    ml_str = f" | ML: {position.ml_confidence:.0%}"
+
                 logger.info(
-                    f"   📍 {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} → "
-                    f"{current_price:.2f} | {pnl_color}P&L: ${unrealized_pnl:+.2f} ({pnl_pct:+.0%}){Colors.RESET} | "
-                    f"Time: {time_remaining:.0f}s"
+                    f"   📍 {asset} {side}: {position.shares:.1f} @ {position.entry_price:.2f} → "
+                    f"{current_market_price:.2f} | {pnl_color}P&L: ${unrealized_pnl:+.2f} ({pnl_pct:+.0%}){Colors.RESET} | "
+                    f"Time: {time_remaining:.0f}s{win_prob_str}{ml_str}"
                 )
             else:
                 logger.info(
                     f"   📍 {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} | "
-                    f"(no price data)"
+                    f"(no price data){win_prob_str}"
                 )
 
         # Log API-discovered positions (if any)
