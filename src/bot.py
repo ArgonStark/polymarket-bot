@@ -1506,6 +1506,12 @@ class TradingBot:
                 time_remaining=market.time_remaining,
             )
 
+            # Get price data for ML
+            current_price = self.signal_generator.get_price(market.asset) or 0.0
+            target_price = market.target_price or 0.0
+            price_high, price_low = self.signal_generator.get_price_range(market.asset)
+            price_velocity = self.signal_generator.get_price_velocity(market.asset)
+
             # Record with early exit flag
             self.ml_predictor.record_outcome(
                 signal=fake_signal,
@@ -1523,6 +1529,11 @@ class TradingBot:
                 trend_1h=trend_1h,
                 trend_4h=trend_4h,
                 trend_1d=trend_1d,
+                current_price=current_price,
+                target_price=target_price,
+                price_high=price_high,
+                price_low=price_low,
+                price_velocity=price_velocity,
             )
 
         # Clear asset cooldown so we can trade again
@@ -1843,6 +1854,12 @@ class TradingBot:
             else:
                 logger.info(f"🤖 ML EVAL: {market.asset} | Actual: {actual_result} (learning mode - no prediction)")
 
+            # Get price data for ML
+            current_price = self.signal_generator.get_price(market.asset) or 0.0
+            target_price = market.target_price or 0.0
+            price_high, price_low = self.signal_generator.get_price_range(market.asset)
+            price_velocity = self.signal_generator.get_price_velocity(market.asset)
+
             self.ml_predictor.record_outcome(
                 signal=fake_signal,
                 volatility=volatility,
@@ -1859,6 +1876,11 @@ class TradingBot:
                 trend_1h=trend_1h,
                 trend_4h=trend_4h,
                 trend_1d=trend_1d,
+                current_price=current_price,
+                target_price=target_price,
+                price_high=price_high,
+                price_low=price_low,
+                price_velocity=price_velocity,
             )
 
     async def _sync_ml_from_polymarket(self):
@@ -1979,12 +2001,18 @@ class TradingBot:
                         time_remaining=0,
                     )
 
-                    # Record to ML model
+                    # Record to ML model (historical trade - no real-time price data)
                     self.ml_predictor.record_outcome(
                         signal=fake_signal,
                         volatility=0.003,
                         price_momentum=0.0,
                         won=won,
+                        # Price features not available for historical trades
+                        current_price=0.0,
+                        target_price=0.0,
+                        price_high=0.0,
+                        price_low=0.0,
+                        price_velocity=0.0,
                     )
 
                     # Mark as synced

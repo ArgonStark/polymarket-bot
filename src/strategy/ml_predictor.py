@@ -47,6 +47,10 @@ class TradeFeatures:
     - binance_lead_pct: Binance price lead over Chainlink (faster indicator)
     - binance_confirmation: Confirmation signal type (STRONG, MEDIUM, WEAK, NONE)
     - trend_1h/4h/1d: Multi-timeframe trend context for better decision making
+    - price_normalized: Current asset price (normalized 0-1)
+    - price_above_target: Whether price is above target (binary)
+    - price_range_position: Where price sits in recent high/low range (0-1)
+    - price_velocity: How fast price is moving (magnitude)
     """
     # Core features
     edge: float  # Expected edge/profit margin
@@ -76,8 +80,14 @@ class TradeFeatures:
     trend_4h: float = 0.0   # 4-hour trend (-1 to +1)
     trend_1d: float = 0.0   # 1-day trend (-1 to +1)
 
+    # NEW: Price observation features (helps ML understand price context)
+    price_normalized: float = 0.0  # Current price normalized (0-1 scale per asset)
+    price_above_target: float = 0.0  # 1.0 if price >= target, 0.0 otherwise
+    price_range_position: float = 0.5  # Position in recent range (0=low, 1=high)
+    price_velocity: float = 0.0  # Speed of price movement (normalized)
+
     def to_vector(self) -> list[float]:
-        """Convert to feature vector for model (29 features total)."""
+        """Convert to feature vector for model (33 features total)."""
         # Normalize features to roughly 0-1 range
         vector = [
             # Core features (6)
@@ -119,6 +129,11 @@ class TradeFeatures:
             (self.trend_1h + 1) / 2,
             (self.trend_4h + 1) / 2,
             (self.trend_1d + 1) / 2,
+            # NEW: Price observation features (4)
+            min(max(self.price_normalized, 0.0), 1.0),  # Already 0-1
+            self.price_above_target,  # Binary 0 or 1
+            min(max(self.price_range_position, 0.0), 1.0),  # 0-1 range position
+            min(abs(self.price_velocity) * 10, 1.0),  # Velocity normalized (0.1 = 1.0)
         ]
         return vector
 
@@ -144,6 +159,10 @@ class TradeFeatures:
             "trend_1h": self.trend_1h,
             "trend_4h": self.trend_4h,
             "trend_1d": self.trend_1d,
+            "price_normalized": self.price_normalized,
+            "price_above_target": self.price_above_target,
+            "price_range_position": self.price_range_position,
+            "price_velocity": self.price_velocity,
         }
 
     @classmethod
@@ -169,6 +188,10 @@ class TradeFeatures:
             trend_1h=data.get("trend_1h", 0.0),
             trend_4h=data.get("trend_4h", 0.0),
             trend_1d=data.get("trend_1d", 0.0),
+            price_normalized=data.get("price_normalized", 0.0),
+            price_above_target=data.get("price_above_target", 0.0),
+            price_range_position=data.get("price_range_position", 0.5),
+            price_velocity=data.get("price_velocity", 0.0),
         )
 
 
@@ -183,7 +206,7 @@ class SimpleLogisticRegression:
     weights: list[float] = field(default_factory=list)
     bias: float = 0.0
     learning_rate: float = 0.1
-    n_features: int = 29  # Number of features in TradeFeatures.to_vector()
+    n_features: int = 33  # Number of features in TradeFeatures.to_vector()
 
     def __post_init__(self):
         if not self.weights:
@@ -643,6 +666,11 @@ class MLSignalPredictor:
         trend_1h: float = 0.0,
         trend_4h: float = 0.0,
         trend_1d: float = 0.0,
+        current_price: float = 0.0,
+        target_price: float = 0.0,
+        price_high: float = 0.0,
+        price_low: float = 0.0,
+        price_velocity: float = 0.0,
     ) -> TradeFeatures:
         """
         Extract features from a trading signal.
@@ -662,12 +690,38 @@ class MLSignalPredictor:
             trend_1h: 1-hour price trend (-1 to +1)
             trend_4h: 4-hour price trend (-1 to +1)
             trend_1d: 1-day price trend (-1 to +1)
+            current_price: Current asset price (e.g., BTC price in USD)
+            target_price: Target price for the market
+            price_high: Recent high price (for range calculation)
+            price_low: Recent low price (for range calculation)
+            price_velocity: Rate of price change (absolute)
         """
         now = datetime.now(timezone.utc)
 
         # Get arb_type from signal if stored there
         if hasattr(signal, '_arb_type') and signal._arb_type:
             arb_type = signal._arb_type
+
+        # Get prices from signal if not provided
+        if current_price == 0.0 and hasattr(signal, 'market'):
+            target_price = getattr(signal.market, 'target_price', 0.0)
+
+        # Calculate normalized price (0-1 scale based on asset)
+        # BTC: ~100k range, ETH: ~10k range, SOL: ~500 range, XRP: ~5 range
+        asset = signal.market.asset
+        price_scales = {"BTC": 150000, "ETH": 10000, "SOL": 500, "XRP": 10}
+        scale = price_scales.get(asset, 100000)
+        price_normalized = min(current_price / scale, 1.0) if current_price > 0 else 0.0
+
+        # Calculate price above target (binary)
+        price_above_target = 1.0 if current_price >= target_price and target_price > 0 else 0.0
+
+        # Calculate price range position (0 = at low, 1 = at high)
+        if price_high > price_low and price_low > 0:
+            price_range_position = (current_price - price_low) / (price_high - price_low)
+            price_range_position = max(0.0, min(1.0, price_range_position))
+        else:
+            price_range_position = 0.5  # Default to middle if no range data
 
         return TradeFeatures(
             edge=signal.edge,
@@ -676,7 +730,7 @@ class MLSignalPredictor:
             price_momentum=price_momentum,
             hour_of_day=now.hour,
             day_of_week=now.weekday(),
-            asset=signal.market.asset,
+            asset=asset,
             side=signal.side.value,
             arb_type=arb_type,
             spread=spread,
@@ -689,6 +743,10 @@ class MLSignalPredictor:
             trend_1h=trend_1h,
             trend_4h=trend_4h,
             trend_1d=trend_1d,
+            price_normalized=price_normalized,
+            price_above_target=price_above_target,
+            price_range_position=price_range_position,
+            price_velocity=price_velocity,
         )
 
     def _get_gradual_threshold(self) -> float:
@@ -809,6 +867,11 @@ class MLSignalPredictor:
         trend_1h: float = 0.0,
         trend_4h: float = 0.0,
         trend_1d: float = 0.0,
+        current_price: float = 0.0,
+        target_price: float = 0.0,
+        price_high: float = 0.0,
+        price_low: float = 0.0,
+        price_velocity: float = 0.0,
     ):
         """
         Record a trade outcome and update the model.
@@ -829,12 +892,18 @@ class MLSignalPredictor:
             trend_1h: 1-hour price trend (-1 to +1)
             trend_4h: 4-hour price trend (-1 to +1)
             trend_1d: 1-day price trend (-1 to +1)
+            current_price: Current asset price at trade time
+            target_price: Target price for the market
+            price_high: Recent high price
+            price_low: Recent low price
+            price_velocity: Rate of price change
         """
         features = self.extract_features(
             signal, volatility, price_momentum, arb_type,
             spread, bid_depth, ask_depth, price_trend, distance_from_target,
             binance_lead_pct, binance_confirmation,
-            trend_1h, trend_4h, trend_1d
+            trend_1h, trend_4h, trend_1d,
+            current_price, target_price, price_high, price_low, price_velocity
         )
         feature_vector = features.to_vector()
 
@@ -964,16 +1033,17 @@ class MLSignalPredictor:
                 # 11 -> 21: Added arb type and market features
                 # 21 -> 26: Added Binance confirmation features
                 # 26 -> 29: Added multi-timeframe trends (1h, 4h, 1d)
-                expected_features = 29
+                # 29 -> 33: Added price observation features (price_normalized, price_above_target, price_range_position, price_velocity)
+                expected_features = 33
                 import random
                 random.seed(42)
 
                 if len(old_weights) == 11:
                     logger.info(
-                        f"🤖 Migrating ML model from 11 to 29 features (adding arb + Binance + trends)..."
+                        f"🤖 Migrating ML model from 11 to 33 features (adding arb + Binance + trends + price)..."
                     )
                     # Extend weights with small random values for new features
-                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(18)]
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(22)]
                     model_data["weights"] = new_weights
                     # Reset training samples since feature set changed significantly
                     self.training_samples = max(0, data.get("training_samples", 0) // 2)
@@ -984,31 +1054,45 @@ class MLSignalPredictor:
                     )
                 elif len(old_weights) == 21:
                     logger.info(
-                        f"🤖 Migrating ML model from 21 to 29 features (adding Binance + trends)..."
+                        f"🤖 Migrating ML model from 21 to 33 features (adding Binance + trends + price)..."
                     )
-                    # Extend weights for Binance + trend features
-                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(8)]
+                    # Extend weights for Binance + trend + price features
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(12)]
                     model_data["weights"] = new_weights
                     # Keep most training data, slight reset since new features added
                     self.training_samples = max(0, int(data.get("training_samples", 0) * 0.75))
                     self.predictions_made = int(data.get("predictions_made", 0) * 0.75)
                     self.correct_predictions = int(data.get("correct_predictions", 0) * 0.75)
                     logger.info(
-                        f"🤖 Migration complete - model will retrain with Binance + trend features"
+                        f"🤖 Migration complete - model will retrain with Binance + trend + price features"
                     )
                 elif len(old_weights) == 26:
                     logger.info(
-                        f"🤖 Migrating ML model from 26 to 29 features (adding multi-timeframe trends)..."
+                        f"🤖 Migrating ML model from 26 to 33 features (adding trends + price)..."
                     )
-                    # Extend weights for trend features only (3 new: trend_1h, trend_4h, trend_1d)
-                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(3)]
+                    # Extend weights for trend + price features (7 new)
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(7)]
                     model_data["weights"] = new_weights
                     # Keep most training data since this is a minor addition
                     self.training_samples = max(0, int(data.get("training_samples", 0) * 0.9))
                     self.predictions_made = int(data.get("predictions_made", 0) * 0.9)
                     self.correct_predictions = int(data.get("correct_predictions", 0) * 0.9)
                     logger.info(
-                        f"🤖 Migration complete - model will retrain with multi-timeframe trend features"
+                        f"🤖 Migration complete - model will retrain with trend + price features"
+                    )
+                elif len(old_weights) == 29:
+                    logger.info(
+                        f"🤖 Migrating ML model from 29 to 33 features (adding price observation)..."
+                    )
+                    # Extend weights for price features only (4 new: price_normalized, price_above_target, price_range_position, price_velocity)
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(4)]
+                    model_data["weights"] = new_weights
+                    # Keep most training data since this is a minor addition
+                    self.training_samples = max(0, int(data.get("training_samples", 0) * 0.9))
+                    self.predictions_made = int(data.get("predictions_made", 0) * 0.9)
+                    self.correct_predictions = int(data.get("correct_predictions", 0) * 0.9)
+                    logger.info(
+                        f"🤖 Migration complete - model will retrain with price observation features"
                     )
                 else:
                     self.training_samples = data.get("training_samples", 0)

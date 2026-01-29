@@ -313,6 +313,106 @@ class WebSocketConfig:
 
 
 @dataclass
+class TrendProtectionConfig:
+    """Trend protection settings to avoid trading against strong market trends."""
+
+    # Master enable/disable switch
+    enabled: bool = field(
+        default_factory=lambda: os.getenv("TREND_PROTECTION_ENABLED", "true").lower() == "true"
+    )
+
+    # === Trend Alignment Filter ===
+    # Block trades against strong trends
+    max_opposite_trend_1d: float = field(
+        default_factory=lambda: float(os.getenv("MAX_OPPOSITE_TREND_1D", "0.25"))
+    )  # Block if 1d trend > 25% against signal
+
+    max_opposite_trend_1h: float = field(
+        default_factory=lambda: float(os.getenv("MAX_OPPOSITE_TREND_1H", "0.40"))
+    )  # Block if 1h trend > 40% against signal
+
+    # === Price Velocity Guard ===
+    # Skip trades when price moving too fast
+    velocity_guard_enabled: bool = field(
+        default_factory=lambda: os.getenv("VELOCITY_GUARD_ENABLED", "true").lower() == "true"
+    )
+
+    # Max velocity per asset (% per second) - skip if exceeded
+    velocity_btc: float = field(
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_BTC", "0.00017"))
+    )  # ~1% per minute
+
+    velocity_eth: float = field(
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_ETH", "0.00025"))
+    )  # ~1.5% per minute
+
+    velocity_sol: float = field(
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_SOL", "0.00033"))
+    )  # ~2% per minute
+
+    velocity_xrp: float = field(
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_XRP", "0.00030"))
+    )  # ~1.8% per minute
+
+    # === Multi-Timeframe Agreement ===
+    timeframe_agreement_enabled: bool = field(
+        default_factory=lambda: os.getenv("TIMEFRAME_AGREEMENT_ENABLED", "true").lower() == "true"
+    )
+
+    edge_boost_all_aligned: float = field(
+        default_factory=lambda: float(os.getenv("EDGE_BOOST_ALL_ALIGNED", "0.01"))
+    )  # +1% when all 3 timeframes agree
+
+    edge_penalty_mixed: float = field(
+        default_factory=lambda: float(os.getenv("EDGE_PENALTY_MIXED", "0.01"))
+    )  # -1% when signals mixed
+
+    # === Binance Momentum ===
+    binance_momentum_enabled: bool = field(
+        default_factory=lambda: os.getenv("BINANCE_MOMENTUM_ENABLED", "true").lower() == "true"
+    )
+
+    binance_velocity_threshold: float = field(
+        default_factory=lambda: float(os.getenv("BINANCE_VELOCITY_THRESHOLD", "0.001"))
+    )  # 0.1% per second
+
+    binance_momentum_boost: float = field(
+        default_factory=lambda: float(os.getenv("BINANCE_MOMENTUM_BOOST", "0.02"))
+    )  # +2% edge boost for strong momentum
+
+    # === Dynamic Edge Requirement ===
+    dynamic_edge_enabled: bool = field(
+        default_factory=lambda: os.getenv("DYNAMIC_EDGE_ENABLED", "true").lower() == "true"
+    )
+
+    dynamic_edge_min: float = field(
+        default_factory=lambda: float(os.getenv("DYNAMIC_EDGE_MIN", "0.015"))
+    )  # Never go below 1.5%
+
+    dynamic_edge_max: float = field(
+        default_factory=lambda: float(os.getenv("DYNAMIC_EDGE_MAX", "0.05"))
+    )  # Never exceed 5%
+
+    # === Consecutive Move Detection ===
+    consecutive_enabled: bool = field(
+        default_factory=lambda: os.getenv("CONSECUTIVE_ENABLED", "true").lower() == "true"
+    )
+
+    consecutive_min_moves: int = field(
+        default_factory=lambda: int(os.getenv("CONSECUTIVE_MIN_MOVES", "3"))
+    )  # Minimum moves to trigger boost
+
+    consecutive_boost_max: float = field(
+        default_factory=lambda: float(os.getenv("CONSECUTIVE_BOOST_MAX", "0.02"))
+    )  # Max +2% edge boost
+
+    def get_max_velocity(self, asset: str) -> float:
+        """Get maximum allowed velocity for an asset."""
+        asset_lower = asset.lower()
+        return getattr(self, f"velocity_{asset_lower}", 0.0003)
+
+
+@dataclass
 class EndpointsConfig:
     """API and WebSocket endpoints."""
 
@@ -373,6 +473,7 @@ class BotConfig:
     trading: TradingConfig = field(default_factory=TradingConfig)
     volatility: VolatilityConfig = field(default_factory=VolatilityConfig)
     websocket: WebSocketConfig = field(default_factory=WebSocketConfig)
+    trend_protection: TrendProtectionConfig = field(default_factory=TrendProtectionConfig)
     endpoints: EndpointsConfig = field(default_factory=EndpointsConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
 

@@ -32,6 +32,8 @@ from ..probability import (
 )
 from ..config import BotConfig
 from .arbitrage import ArbitrageDetector, select_best_opportunity
+from .trend_protection import TrendProtection, TrendProtectionConfig
+from ..data.binance import get_multi_timeframe_trends
 
 
 logger = logging.getLogger(__name__)
@@ -80,6 +82,12 @@ class SignalGenerator:
     # Arbitrage detector for pattern-based opportunities
     arb_detector: ArbitrageDetector = None
 
+    # Trend protection to avoid trading against strong trends
+    trend_protection: TrendProtection = None
+
+    # Reference to BinanceFeed for velocity calculations
+    binance_feed: object = None  # Will be set externally
+
     def __post_init__(self):
         """Initialize data structures."""
         if self.chainlink_prices is None:
@@ -97,6 +105,38 @@ class SignalGenerator:
                 self.volatilities[asset.lower()] = self.config.volatility.get(asset)
         if self.arb_detector is None:
             self.arb_detector = ArbitrageDetector(config=self.config)
+        if self.trend_protection is None:
+            self._init_trend_protection()
+
+    def _init_trend_protection(self):
+        """Initialize trend protection from config."""
+        tp_config = self.config.trend_protection
+        trend_config = TrendProtectionConfig(
+            enabled=tp_config.enabled,
+            max_opposite_trend_1d=tp_config.max_opposite_trend_1d,
+            max_opposite_trend_1h=tp_config.max_opposite_trend_1h,
+            velocity_guard_enabled=tp_config.velocity_guard_enabled,
+            max_velocity={
+                "BTC": tp_config.velocity_btc,
+                "ETH": tp_config.velocity_eth,
+                "SOL": tp_config.velocity_sol,
+                "XRP": tp_config.velocity_xrp,
+            },
+            timeframe_agreement_enabled=tp_config.timeframe_agreement_enabled,
+            edge_boost_all_aligned=tp_config.edge_boost_all_aligned,
+            edge_penalty_mixed=tp_config.edge_penalty_mixed,
+            binance_momentum_enabled=tp_config.binance_momentum_enabled,
+            binance_velocity_threshold=tp_config.binance_velocity_threshold,
+            binance_velocity_boost=tp_config.binance_momentum_boost,
+            binance_momentum_boost=tp_config.binance_momentum_boost,
+            dynamic_edge_enabled=tp_config.dynamic_edge_enabled,
+            dynamic_edge_min=tp_config.dynamic_edge_min,
+            dynamic_edge_max=tp_config.dynamic_edge_max,
+            consecutive_enabled=tp_config.consecutive_enabled,
+            consecutive_min_moves=tp_config.consecutive_min_moves,
+            consecutive_boost_max=tp_config.consecutive_boost_max,
+        )
+        self.trend_protection = TrendProtection(trend_config)
 
     def update_price(self, symbol: str, price: float):
         """
@@ -111,10 +151,11 @@ class SignalGenerator:
 
         self.chainlink_prices[symbol_lower] = price
 
-        # Update price history
+        # Update price history with timestamp
+        now = datetime.now(timezone.utc)
         if symbol_lower not in self.price_histories:
             self.price_histories[symbol_lower] = []
-        self.price_histories[symbol_lower].append(price)
+        self.price_histories[symbol_lower].append((now, price))
 
         # Keep only last 100 prices
         if len(self.price_histories[symbol_lower]) > 100:
@@ -123,8 +164,10 @@ class SignalGenerator:
         # Update volatility estimate periodically
         if len(self.price_histories[symbol_lower]) >= 5:
             asset = symbol_lower.split("/")[0]
+            # Extract just the prices for volatility calculation
+            prices_only = [p[1] for p in self.price_histories[symbol_lower]]
             self.volatilities[asset] = estimate_volatility(
-                self.price_histories[symbol_lower],
+                prices_only,
                 window=20,
                 default_vol=self.config.volatility.get(asset.upper()),
             )
@@ -292,6 +335,82 @@ class SignalGenerator:
             self.config.volatility.get(asset.upper()),
         )
 
+    def get_price_range(self, asset: str) -> tuple[float, float]:
+        """
+        Get recent high/low price range for an asset.
+
+        Returns:
+            Tuple of (high, low) prices from recent price history.
+            Returns (0.0, 0.0) if no data available.
+        """
+        symbol = f"{asset.lower()}/usd"
+        history = self.price_histories.get(symbol, [])
+        if not history:
+            return (0.0, 0.0)
+
+        # Get prices from history (handles both tuple and raw float formats)
+        prices = []
+        for p in history:
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                prices.append(p[1])
+            elif isinstance(p, (int, float)):
+                prices.append(float(p))
+
+        if not prices:
+            return (0.0, 0.0)
+
+        return (max(prices), min(prices))
+
+    def get_price_velocity(self, asset: str) -> float:
+        """
+        Get price velocity (rate of change) for an asset.
+
+        Returns:
+            Price change per second, normalized by price.
+            Positive = price increasing, negative = decreasing.
+            Returns 0.0 if insufficient data.
+        """
+        symbol = f"{asset.lower()}/usd"
+        history = self.price_histories.get(symbol, [])
+        if len(history) < 2:
+            return 0.0
+
+        # Get recent prices with timestamps
+        recent = history[-10:]  # Last 10 data points
+        if len(recent) < 2:
+            return 0.0
+
+        # Handle both tuple format (timestamp, price) and raw float format
+        first_entry = recent[0]
+        last_entry = recent[-1]
+
+        if isinstance(first_entry, (list, tuple)) and len(first_entry) >= 2:
+            # Tuple format: (timestamp, price)
+            first_time, first_price = first_entry[0], first_entry[1]
+            last_time, last_price = last_entry[0], last_entry[1]
+
+            # Calculate time difference
+            if hasattr(first_time, 'timestamp') and hasattr(last_time, 'timestamp'):
+                time_diff = last_time.timestamp() - first_time.timestamp()
+            elif hasattr(first_time, 'total_seconds'):
+                time_diff = (last_time - first_time).total_seconds()
+            else:
+                time_diff = float(last_time - first_time)
+        else:
+            # Raw float format - assume ~0.5 second intervals
+            first_price = float(first_entry)
+            last_price = float(last_entry)
+            time_diff = (len(recent) - 1) * 0.5
+
+        if time_diff <= 0 or first_price <= 0:
+            return 0.0
+
+        # Velocity as percentage change per second
+        price_change = (last_price - first_price) / first_price
+        velocity = price_change / time_diff
+
+        return velocity
+
     def generate_signal(self, market: MarketState) -> Optional[Signal]:
         """
         Generate a trading signal for a market.
@@ -434,6 +553,47 @@ class SignalGenerator:
                     f"Current ${current_price:,.2f} vs target ${market.target_price:,.2f}"
                 ),
             )
+
+        # === TREND PROTECTION CHECK ===
+        # Evaluate trade against trend protection rules
+        if self.config.trend_protection.enabled:
+            trend_result = self._evaluate_trend_protection(
+                signal_side=side,
+                asset=market.asset,
+                current_price=current_price,
+                target_price=market.target_price,
+                edge=edge,
+                binance_conf=binance_conf,
+            )
+
+            if not trend_result.should_trade:
+                logger.info(
+                    f"🛡️ TREND PROTECTION BLOCKED [{market.asset}]: "
+                    f"{side.value} signal blocked | {trend_result.reason}"
+                )
+                return Signal(
+                    market=market,
+                    side=Side.NONE,
+                    edge=edge,
+                    true_prob=true_prob,
+                    market_prob=market_prob,
+                    recommended_action=OrderAction.SKIP,
+                    recommended_price=0.0,
+                    size_usd=0.0,
+                    size_shares=0.0,
+                    chainlink_price=current_price,
+                    time_remaining=time_remaining,
+                    reasoning=f"[TREND PROTECTION] {trend_result.reason}",
+                )
+
+            # Apply edge adjustments from trend protection
+            if trend_result.edge_adjustment != 0:
+                logger.debug(
+                    f"TREND PROTECTION [{market.asset}]: Edge adjusted "
+                    f"{edge:.1%} -> {trend_result.adjusted_edge:.1%} "
+                    f"({trend_result.reason})"
+                )
+                edge = trend_result.adjusted_edge
 
         # Determine order action based on edge and time
         action = self._determine_action(edge, time_remaining)
@@ -711,3 +871,70 @@ class SignalGenerator:
         # Clear any active leg for this market
         self.arb_detector.clear_leg(market_id)
         self.arb_detector.clear_market_history(market_id)
+
+    def _evaluate_trend_protection(
+        self,
+        signal_side: Side,
+        asset: str,
+        current_price: float,
+        target_price: float,
+        edge: float,
+        binance_conf: dict,
+    ):
+        """
+        Evaluate trade against trend protection rules.
+
+        Args:
+            signal_side: The side we want to trade (UP or DOWN)
+            asset: Asset symbol (BTC, ETH, etc.)
+            current_price: Current Chainlink price
+            target_price: Market target price
+            edge: Calculated edge
+            binance_conf: Binance confirmation data
+
+        Returns:
+            TrendProtectionResult with decision and adjusted edge
+        """
+        from .trend_protection import TrendProtectionResult
+
+        # Get price history for the asset
+        symbol = f"{asset.lower()}/usd"
+        price_history = self.price_histories.get(symbol, [])
+
+        # Get multi-timeframe trends from Binance
+        try:
+            trends = get_multi_timeframe_trends(asset)
+        except Exception as e:
+            logger.debug(f"Failed to get trends for {asset}: {e}")
+            trends = {"trend_1h": 0.0, "trend_4h": 0.0, "trend_1d": 0.0}
+
+        # Get Binance velocity
+        binance_velocity = 0.0
+        if self.binance_feed is not None:
+            try:
+                binance_velocity = self.binance_feed.get_velocity(asset)
+            except Exception:
+                pass
+
+        # Get Chainlink velocity
+        chainlink_velocity = self.get_price_velocity(asset)
+
+        # Get Binance price
+        binance_price = binance_conf.get("binance_price")
+
+        # Evaluate using trend protection
+        result = self.trend_protection.evaluate_trade(
+            signal_side=signal_side.value,
+            asset=asset.upper(),
+            current_price=current_price,
+            target_price=target_price,
+            base_edge=edge,
+            base_min_edge=self.config.trading.min_edge,
+            price_history=price_history,
+            trends=trends,
+            binance_price=binance_price,
+            binance_velocity=binance_velocity,
+            chainlink_velocity=chainlink_velocity,
+        )
+
+        return result
