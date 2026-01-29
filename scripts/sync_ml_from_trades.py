@@ -2,18 +2,22 @@
 """
 Manual ML Sync from Polymarket Trade History
 
-This script fetches your closed positions from Polymarket Data API
-and syncs them with the ML model.
+This script fetches your trade history from Polymarket Data API and syncs
+it with the ML model. It uses all three endpoints:
+- /positions - current open positions
+- /activity - all trade activity (buys/sells)
+- /closed-positions - completed trades with P&L
+
+The ML learns from closed positions where win/loss is determined by realizedPnl.
 
 Usage:
-    python scripts/sync_ml_from_trades.py [--limit 100]
+    python scripts/sync_ml_from_trades.py [--limit 500] [--dry-run]
 """
 
 import os
 import sys
 import argparse
 import logging
-import requests
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.config import BotConfig
 from src.execution import create_trading_client
 from src.strategy.ml_predictor import get_ml_predictor
+from src.data.polymarket_data import get_data_api
 from src.models import Side
 
 # Set up logging
@@ -28,43 +33,18 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
-def get_closed_positions(wallet_address: str, limit: int = 100) -> list:
+def sync_trades_to_ml(limit: int = 500, dry_run: bool = False, show_activity: bool = False):
     """
-    Fetch closed positions from Polymarket Data API.
+    Sync trades from Polymarket to ML model using all three APIs.
 
     Args:
-        wallet_address: User's wallet address
-        limit: Maximum positions to fetch
-
-    Returns:
-        List of closed position objects
-    """
-    url = "https://data-api.polymarket.com/closed-positions"
-    params = {
-        "user": wallet_address,
-        "limit": limit,
-    }
-
-    try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        logger.error(f"Failed to fetch closed positions: {e}")
-        return []
-
-
-def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
-    """
-    Sync closed positions from Polymarket to ML model.
-
-    Args:
-        limit: Maximum number of positions to fetch
+        limit: Maximum number of items to fetch per endpoint
         dry_run: If True, don't actually save to ML model
+        show_activity: If True, also show recent trade activity
     """
-    print("\n" + "=" * 60)
-    print("  POLYMARKET -> ML SYNC (Closed Positions)")
-    print("=" * 60 + "\n")
+    print("\n" + "=" * 70)
+    print("  POLYMARKET -> ML SYNC (Full Trade History)")
+    print("=" * 70 + "\n")
 
     # Load config and create client to get wallet address
     config = BotConfig()
@@ -72,7 +52,7 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
 
     if not client:
         print("ERROR: Failed to create trading client")
-        print("Make sure your POLYMARKET_API_KEY and POLYMARKET_PRIVATE_KEY are set")
+        print("Make sure your environment variables are set (PK, etc.)")
         return
 
     # Get wallet address
@@ -83,38 +63,103 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
 
     print(f"Wallet: {wallet_address}")
 
-    # Initialize ML predictor
+    # Initialize ML predictor and Data API
     ml_predictor = get_ml_predictor()
+    data_api = get_data_api()
     print(f"ML Model loaded: {ml_predictor.training_samples} existing samples\n")
 
-    # Fetch closed positions
-    print(f"Fetching closed positions from Polymarket Data API...")
-    positions = get_closed_positions(wallet_address, limit=limit)
+    # ==================== CURRENT POSITIONS ====================
+    print("-" * 70)
+    print("1. CURRENT POSITIONS (Open)")
+    print("-" * 70)
 
-    if not positions:
+    positions = data_api.get_positions(wallet_address, limit=limit)
+    crypto_positions = []
+
+    for pos in positions:
+        slug = pos.get("slug", "") or pos.get("eventSlug", "")
+        if "updown-15m" in slug.lower() or "15m" in pos.get("title", "").lower():
+            crypto_positions.append(pos)
+
+    if crypto_positions:
+        print(f"Found {len(crypto_positions)} open 15-min crypto positions:\n")
+        for pos in crypto_positions[:10]:  # Show max 10
+            asset = pos.get("asset", "")[:8]
+            outcome = pos.get("outcome", "")
+            size = float(pos.get("size", 0) or 0)
+            avg_price = float(pos.get("avgPrice", 0) or 0)
+            cur_price = float(pos.get("curPrice", 0) or 0)
+            cash_pnl = float(pos.get("cashPnl", 0) or 0)
+            pnl_color = "\033[92m" if cash_pnl >= 0 else "\033[91m"
+            reset = "\033[0m"
+            print(
+                f"  {outcome:5s} | Size: {size:8.2f} | Avg: {avg_price:.4f} | "
+                f"Cur: {cur_price:.4f} | {pnl_color}P&L: ${cash_pnl:+.2f}{reset}"
+            )
+        if len(crypto_positions) > 10:
+            print(f"  ... and {len(crypto_positions) - 10} more")
+    else:
+        print("No open 15-min crypto positions")
+    print()
+
+    # ==================== TRADE ACTIVITY ====================
+    if show_activity:
+        print("-" * 70)
+        print("2. RECENT TRADE ACTIVITY")
+        print("-" * 70)
+
+        activity = data_api.get_all_activity(wallet_address, activity_type="TRADE", max_items=limit)
+        crypto_activity = []
+
+        for act in activity:
+            slug = act.get("slug", "") or act.get("eventSlug", "")
+            if "updown-15m" in slug.lower() or "15m" in act.get("title", "").lower():
+                crypto_activity.append(act)
+
+        if crypto_activity:
+            print(f"Found {len(crypto_activity)} 15-min crypto trades:\n")
+            for act in crypto_activity[:15]:  # Show max 15
+                side = act.get("side", "")
+                outcome = act.get("outcome", "")
+                size = float(act.get("size", 0) or 0)
+                price = float(act.get("price", 0) or 0)
+                usdc = float(act.get("usdcSize", 0) or 0)
+                timestamp = act.get("timestamp", "")[:19]
+                side_color = "\033[92m" if side == "BUY" else "\033[91m"
+                reset = "\033[0m"
+                print(
+                    f"  {timestamp} | {side_color}{side:4s}{reset} {outcome:5s} | "
+                    f"Size: {size:8.2f} @ {price:.4f} | ${usdc:.2f}"
+                )
+            if len(crypto_activity) > 15:
+                print(f"  ... and {len(crypto_activity) - 15} more")
+        else:
+            print("No recent 15-min crypto trade activity")
+        print()
+
+    # ==================== CLOSED POSITIONS (ML SYNC) ====================
+    print("-" * 70)
+    print("3. CLOSED POSITIONS (Completed Trades for ML)")
+    print("-" * 70)
+
+    closed = data_api.get_all_closed_positions(wallet_address, max_positions=limit)
+
+    if not closed:
         print("No closed positions found")
         return
 
-    print(f"Found {len(positions)} closed positions\n")
-
-    # Debug: show first few
-    print("Sample position structure:")
-    print("-" * 60)
-    if positions:
-        sample = positions[0]
-        for key in ["title", "slug", "outcome", "avgPrice", "totalBought", "realizedPnl"]:
-            if key in sample:
-                print(f"  {key}: {sample[key]}")
-    print("-" * 60 + "\n")
+    print(f"Found {len(closed)} total closed positions\n")
 
     # Track stats
     synced_count = 0
     non_crypto_count = 0
     skipped_count = 0
+    wins = 0
+    losses = 0
 
-    print("Processing positions...\n")
+    print("Processing 15-min crypto positions...\n")
 
-    for i, pos in enumerate(positions):
+    for i, pos in enumerate(closed):
         try:
             slug = pos.get("slug", "") or pos.get("eventSlug", "")
             title = pos.get("title", "")
@@ -169,10 +214,15 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
             pnl_str = f"${realized_pnl:+.2f}"
 
             print(
-                f"[{i+1:3d}] {asset:4s} {side.value:4s} @ {avg_price:.4f} | "
+                f"[{synced_count+1:3d}] {asset:4s} {side.value:4s} @ {avg_price:.4f} | "
                 f"Size: {total_bought:8.2f} | {result_color}{result:4s}{reset} | "
-                f"P&L: {pnl_str} | {slug[:40]}"
+                f"P&L: {pnl_str}"
             )
+
+            if won:
+                wins += 1
+            else:
+                losses += 1
 
             if not dry_run:
                 from types import SimpleNamespace
@@ -211,13 +261,18 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
             continue
 
     # Summary
-    print("\n" + "-" * 60)
+    print("\n" + "=" * 70)
     print("SYNC SUMMARY")
-    print("-" * 60)
-    print(f"  Total positions fetched: {len(positions)}")
-    print(f"  Synced to ML:            {synced_count}")
-    print(f"  Non-15min crypto:        {non_crypto_count}")
+    print("=" * 70)
+    print(f"  Total closed positions:  {len(closed)}")
+    print(f"  15-min crypto synced:    {synced_count}")
+    print(f"  Non-crypto positions:    {non_crypto_count}")
     print(f"  Skipped/errors:          {skipped_count}")
+    print()
+    if synced_count > 0:
+        win_rate = wins / synced_count * 100
+        print(f"  Wins:  {wins:3d} ({win_rate:.1f}%)")
+        print(f"  Losses: {losses:3d} ({100-win_rate:.1f}%)")
 
     if not dry_run and synced_count > 0:
         print(f"\n  ML Model now has: {ml_predictor.training_samples} samples")
@@ -227,16 +282,28 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
         size = os.path.getsize(ml_predictor.model_path)
         print(f"  Model file size: {size:,} bytes")
 
-    print("\n" + "=" * 60 + "\n")
+    print("\n" + "=" * 70 + "\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sync Polymarket closed positions to ML model")
-    parser.add_argument("--limit", "-l", type=int, default=500, help="Max positions to fetch")
-    parser.add_argument("--dry-run", "-n", action="store_true", help="Don't save to ML")
+    parser = argparse.ArgumentParser(
+        description="Sync Polymarket trade history to ML model"
+    )
+    parser.add_argument(
+        "--limit", "-l", type=int, default=500,
+        help="Max items to fetch per endpoint (default: 500)"
+    )
+    parser.add_argument(
+        "--dry-run", "-n", action="store_true",
+        help="Preview without saving to ML model"
+    )
+    parser.add_argument(
+        "--activity", "-a", action="store_true",
+        help="Also show recent trade activity"
+    )
 
     args = parser.parse_args()
-    sync_trades_to_ml(limit=args.limit, dry_run=args.dry_run)
+    sync_trades_to_ml(limit=args.limit, dry_run=args.dry_run, show_activity=args.activity)
 
 
 if __name__ == "__main__":
