@@ -614,6 +614,11 @@ class MLSignalPredictor:
             self.model_path = os.path.join(project_root, "ml_model.json")
         self._load_model()
 
+        # Create the model file if it doesn't exist
+        if not os.path.exists(self.model_path):
+            self._save_model()
+            logger.info(f"🤖 Created new ML model at: {self.model_path}")
+
         # Initialize hybrid predictor
         if self.use_hybrid and self.hybrid_predictor is None:
             self.hybrid_predictor = HybridPredictor()
