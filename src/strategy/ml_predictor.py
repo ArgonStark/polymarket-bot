@@ -759,10 +759,6 @@ class MLSignalPredictor:
         # Get current threshold based on training samples
         threshold = self._get_gradual_threshold()
 
-        # Learning mode - allow all trades to collect training data
-        if threshold == 0.0:
-            return (True, 0.5, f"Learning mode ({self.training_samples}/25 samples)")
-
         # Extract features and predict
         features = self.extract_features(
             signal, volatility, price_momentum, arb_type,
