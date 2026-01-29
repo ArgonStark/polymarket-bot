@@ -18,6 +18,7 @@ import json
 import time
 import argparse
 import logging
+import requests
 from datetime import datetime, timezone
 
 # Add project root to path
@@ -41,6 +42,57 @@ logger = logging.getLogger(__name__)
 def load_config() -> BotConfig:
     """Load bot configuration."""
     return BotConfig()
+
+
+def get_market_info(condition_id: str, gamma_api: GammaAPI, cache: dict) -> dict:
+    """
+    Get market info from condition ID, with caching.
+
+    Returns dict with: slug, asset, resolved, winning_outcome
+    """
+    if condition_id in cache:
+        return cache[condition_id]
+
+    try:
+        market = gamma_api.get_market_by_id(condition_id)
+        if market:
+            slug = market.get("slug", "")
+
+            # Extract asset from slug (e.g., btc-updown-15m-1234567890)
+            asset = None
+            for a in ["btc", "eth", "sol", "xrp"]:
+                if slug.lower().startswith(a):
+                    asset = a.upper()
+                    break
+
+            # Check if resolved
+            resolved = market.get("resolved", False)
+            winning_outcome = None
+
+            if resolved:
+                tokens = market.get("tokens", [])
+                for token in tokens:
+                    if token.get("winner", False):
+                        outcome_str = token.get("outcome", "").lower()
+                        if "up" in outcome_str or "yes" in outcome_str:
+                            winning_outcome = "UP"
+                        elif "down" in outcome_str or "no" in outcome_str:
+                            winning_outcome = "DOWN"
+                        break
+
+            info = {
+                "slug": slug,
+                "asset": asset,
+                "resolved": resolved,
+                "winning_outcome": winning_outcome,
+            }
+            cache[condition_id] = info
+            return info
+    except Exception as e:
+        logger.debug(f"Error fetching market {condition_id}: {e}")
+
+    cache[condition_id] = None
+    return None
 
 
 def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
@@ -68,7 +120,7 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
     ml_predictor = get_ml_predictor()
     print(f"ML Model loaded: {ml_predictor.training_samples} existing samples")
 
-    # Initialize Gamma API for market resolution checks
+    # Initialize Gamma API for market lookups
     gamma_api = GammaAPI(config=config)
 
     # Fetch trades from Polymarket
@@ -81,6 +133,18 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
 
     print(f"Found {len(trades)} trades\n")
 
+    # Debug: show first few trades structure
+    print("DEBUG: Sample trade structure (first 3 trades):")
+    print("-" * 60)
+    for i, trade in enumerate(trades[:3]):
+        print(f"\nTrade {i+1} keys: {list(trade.keys())}")
+        # Print key fields
+        for key in ["id", "market", "asset_id", "outcome", "side", "price", "size", "status", "match_time"]:
+            if key in trade:
+                print(f"  {key}: {trade[key]}")
+        print()
+    print("-" * 60 + "\n")
+
     # Track synced trades
     synced_count = 0
     skipped_count = 0
@@ -88,76 +152,80 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
     non_crypto_count = 0
     current_ts = int(time.time())
 
+    # Cache for market info lookups
+    market_cache = {}
+
+    print("Processing trades (looking up markets)...\n")
+
     # Process each trade
     for i, trade in enumerate(trades):
         try:
-            trade_id = trade.get("id") or trade.get("trade_id") or str(trade.get("matchTime", ""))
-            market_slug = trade.get("marketSlug", "") or trade.get("market_slug", "")
+            trade_id = trade.get("id", "")
+            condition_id = trade.get("market", "")  # This is the condition ID
+
+            if not condition_id:
+                skipped_count += 1
+                continue
+
+            # Look up market info
+            market_info = get_market_info(condition_id, gamma_api, market_cache)
+
+            if not market_info:
+                skipped_count += 1
+                continue
+
+            slug = market_info.get("slug", "")
+            asset = market_info.get("asset")
 
             # Check if this is a 15-min crypto market
-            if "updown-15m" not in market_slug.lower():
+            if "updown-15m" not in slug.lower():
                 non_crypto_count += 1
                 continue
 
-            # Extract market timestamp from slug
+            if not asset:
+                skipped_count += 1
+                continue
+
+            # Extract market timestamp from slug (e.g., btc-updown-15m-1234567890)
             market_ts = None
             try:
-                parts = market_slug.split("-")
+                parts = slug.split("-")
                 if len(parts) >= 4:
                     market_ts = int(parts[-1])
             except (ValueError, IndexError):
+                skipped_count += 1
                 continue
 
             if not market_ts:
+                skipped_count += 1
                 continue
 
-            # Check if market has settled
+            # Check if market has settled (15 min = 900 seconds after start)
             settle_time = market_ts + 900
-            if current_ts < settle_time + 30:
+            if current_ts < settle_time + 60:  # Wait 60s after settle
                 pending_count += 1
                 continue
 
-            # Identify asset
-            asset = None
-            for a in ["btc", "eth", "sol", "xrp"]:
-                if market_slug.lower().startswith(a):
-                    asset = a.upper()
-                    break
-
-            if not asset:
-                continue
-
-            # Determine trade side
-            outcome = trade.get("outcome", "") or trade.get("side", "")
+            # Determine trade side from outcome field
+            outcome = trade.get("outcome", "")
             if isinstance(outcome, str):
                 outcome_lower = outcome.lower()
-                if "up" in outcome_lower or "yes" in outcome_lower:
+                if "up" in outcome_lower:
                     side = Side.UP
-                elif "down" in outcome_lower or "no" in outcome_lower:
+                elif "down" in outcome_lower:
                     side = Side.DOWN
                 else:
+                    skipped_count += 1
                     continue
             else:
+                skipped_count += 1
                 continue
 
-            # Get market resolution
-            condition_id = trade.get("conditionId", "") or trade.get("condition_id", "")
-            resolution = None
-            if condition_id:
-                resolution = gamma_api.get_market_resolution(condition_id)
-
-            winning_outcome = None
-            if resolution and resolution.get("resolved"):
-                winning_outcome = resolution.get("winning_outcome")
-            else:
-                # Try to determine from price
-                target_price = gamma_api.fetch_price_to_beat(asset, market_ts)
-                if target_price:
-                    # We need to know the settlement price
-                    # For now, assume API will eventually have it
-                    pass
+            # Get winning outcome
+            winning_outcome = market_info.get("winning_outcome")
 
             if not winning_outcome:
+                # Market not resolved yet
                 pending_count += 1
                 continue
 
@@ -169,6 +237,7 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
             trade_size = float(trade.get("size", 0) or 0)
 
             if trade_price <= 0 or trade_size <= 0:
+                skipped_count += 1
                 continue
 
             # Display trade info
@@ -179,7 +248,7 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
             print(
                 f"[{i+1:3d}] {asset:4s} {side.value:4s} @ {trade_price:.4f} | "
                 f"Size: {trade_size:8.2f} | {result_color}{result:4s}{reset} | "
-                f"Slug: {market_slug}"
+                f"Slug: {slug}"
             )
 
             if not dry_run:
@@ -217,6 +286,7 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
 
         except Exception as e:
             logger.debug(f"Error processing trade: {e}")
+            skipped_count += 1
             continue
 
     # Summary
@@ -227,9 +297,9 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
     print(f"  Synced to ML:         {synced_count}")
     print(f"  Pending settlement:   {pending_count}")
     print(f"  Non-15min crypto:     {non_crypto_count}")
-    print(f"  Skipped/errors:       {len(trades) - synced_count - pending_count - non_crypto_count}")
+    print(f"  Skipped/errors:       {skipped_count}")
 
-    if not dry_run:
+    if not dry_run and synced_count > 0:
         print(f"\n  ML Model now has: {ml_predictor.training_samples} samples")
         print(f"  Model saved to: {ml_predictor.model_path}")
 
@@ -237,7 +307,7 @@ def sync_trades_to_ml(limit: int = 100, dry_run: bool = False):
     if os.path.exists(ml_predictor.model_path):
         size = os.path.getsize(ml_predictor.model_path)
         print(f"  Model file size: {size:,} bytes")
-    else:
+    elif synced_count > 0:
         print("  WARNING: Model file was not created!")
 
     print("\n" + "=" * 60 + "\n")
