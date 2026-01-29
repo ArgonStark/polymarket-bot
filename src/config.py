@@ -83,13 +83,13 @@ class TradingConfig:
 
     # Maximum concurrent positions (higher = parallel trading)
     max_concurrent_positions: int = field(
-        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "4"))
+        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "8"))
     )
 
     # Cooldown between trades for SAME asset (seconds)
     # Lower = faster trading, but risk of duplicate orders
     order_cooldown_seconds: int = field(
-        default_factory=lambda: int(os.getenv("ORDER_COOLDOWN_SECONDS", "15"))
+        default_factory=lambda: int(os.getenv("ORDER_COOLDOWN_SECONDS", "5"))
     )
 
     # Asset priority - higher priority assets get checked first

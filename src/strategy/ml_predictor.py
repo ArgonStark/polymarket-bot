@@ -685,24 +685,24 @@ class MLSignalPredictor:
 
         Uses a gradual ramp-up to collect more diverse training data
         before applying strict filtering:
-        - 0-10 samples: Learning mode (allow all)
-        - 10-20 samples: 50% threshold
-        - 20-30 samples: 55% threshold
-        - 30+ samples: 60% threshold
+        - 0-25 samples: Learning mode (allow all) - extended for more exploration
+        - 25-40 samples: 45% threshold (very lenient)
+        - 40-60 samples: 50% threshold (lenient)
+        - 60+ samples: 55% threshold (moderate)
 
         Returns:
             Current confidence threshold (0.0 to 1.0)
         """
         samples = self.training_samples
 
-        if samples < 10:
-            return 0.0  # Learning mode - allow all
-        elif samples < 20:
-            return 0.50  # Early filtering - 50%
-        elif samples < 30:
-            return 0.55  # Medium filtering - 55%
+        if samples < 25:
+            return 0.0  # Learning mode - allow all (extended from 10 to 25)
+        elif samples < 40:
+            return 0.45  # Early filtering - 45% (lowered from 50%)
+        elif samples < 60:
+            return 0.50  # Medium filtering - 50% (lowered from 55%)
         else:
-            return 0.60  # Full filtering - 60%
+            return 0.55  # Full filtering - 55% (lowered from 60%)
 
     def should_trade(
         self,
@@ -724,11 +724,11 @@ class MLSignalPredictor:
         """
         Decide if we should take this trade based on ML prediction.
 
-        Uses gradual threshold ramp-up:
-        - 0-10 samples: Learning mode (allow all)
-        - 10-20 samples: 50% threshold
-        - 20-30 samples: 55% threshold
-        - 30+ samples: 60% threshold
+        Uses gradual threshold ramp-up (lenient settings for more trades):
+        - 0-25 samples: Learning mode (allow all)
+        - 25-40 samples: 45% threshold
+        - 40-60 samples: 50% threshold
+        - 60+ samples: 55% threshold
 
         Args:
             signal: Trading signal
