@@ -540,10 +540,10 @@ class TradingBot:
                     if signal:
                         market_id = signal.market.condition_id
 
-                        # Cancel if market is expiring soon
-                        if signal.market.time_remaining < 30:
+                        # Cancel if market is expiring soon (60s buffer for safety)
+                        if signal.market.time_remaining < 60:
                             should_cancel = True
-                            cancel_reason = "market expiring"
+                            cancel_reason = f"market expiring ({signal.market.time_remaining:.0f}s left)"
 
                         # Cancel if market is in expiring/settled queue (already expired)
                         elif market_id in self.expiring_markets or market_id in self.settled_markets:
