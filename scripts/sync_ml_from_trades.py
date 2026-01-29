@@ -54,6 +54,7 @@ def get_market_info(condition_id: str, gamma_api: GammaAPI, cache: dict) -> dict
         return cache[condition_id]
 
     try:
+        # Use query parameter filtering (gamma_api.get_market_by_id now uses this)
         market = gamma_api.get_market_by_id(condition_id)
         if market:
             slug = market.get("slug", "")
@@ -88,8 +89,11 @@ def get_market_info(condition_id: str, gamma_api: GammaAPI, cache: dict) -> dict
             }
             cache[condition_id] = info
             return info
+        else:
+            # API returned empty - cache as None to avoid repeated calls
+            logger.debug(f"No market found for condition_id: {condition_id[:16]}...")
     except Exception as e:
-        logger.debug(f"Error fetching market {condition_id}: {e}")
+        logger.debug(f"Error fetching market {condition_id[:16]}...: {e}")
 
     cache[condition_id] = None
     return None
