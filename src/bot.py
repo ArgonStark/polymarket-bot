@@ -19,6 +19,7 @@ from .data import (
     BinanceFeed,
     fetch_all_historical_prices,
     prepopulate_price_histories,
+    get_data_api,
 )
 from .data.binance import BinancePrice
 from .execution import create_trading_client, OrderExecutor
@@ -1858,18 +1859,146 @@ class TradingBot:
 
     async def _sync_ml_from_polymarket(self):
         """
-        Sync ML model with actual trades from Polymarket API.
+        Sync ML model with actual trades from Polymarket Data API.
 
-        NOTE: This feature is temporarily disabled.
-        The Gamma API /markets/{id} endpoint doesn't accept the condition ID
-        format returned by the CLOB trades API (returns 422 errors).
+        Uses three endpoints:
+        - /positions - current open positions
+        - /activity - all trade activity
+        - /closed-positions - completed trades with P&L
 
-        ML learning will happen through the normal position tracking flow.
-        Use scripts/sync_ml_from_trades.py for manual backfilling.
+        The ML learns from closed positions where we know the outcome (win/loss).
         """
-        # DISABLED: Gamma API returns 422 errors for condition IDs from trades
-        # The 'market' field in trade data uses a different format than Gamma expects
-        pass
+        if not self.client or not self.ml_predictor:
+            return
+
+        # Rate limit: only sync every 5 minutes
+        now = datetime.now(timezone.utc)
+        if not hasattr(self, '_last_ml_sync_time'):
+            self._last_ml_sync_time = None
+
+        if self._last_ml_sync_time and (now - self._last_ml_sync_time).total_seconds() < 300:
+            return
+
+        self._last_ml_sync_time = now
+
+        try:
+            # Get wallet address
+            wallet_address = self.client.get_address()
+            if not wallet_address:
+                logger.warning("Could not get wallet address for ML sync")
+                return
+
+            # Initialize Data API
+            data_api = get_data_api()
+
+            # Track what we've already synced (using condition_id + outcome as key)
+            if not hasattr(self, '_synced_positions'):
+                self._synced_positions = set()
+
+            # Fetch closed positions (completed trades with realized P&L)
+            closed_positions = data_api.get_all_closed_positions(wallet_address, max_positions=200)
+
+            if not closed_positions:
+                logger.debug("No closed positions found for ML sync")
+                return
+
+            synced_count = 0
+            for pos in closed_positions:
+                try:
+                    # Create unique key for this position
+                    condition_id = pos.get("conditionId", "")
+                    outcome = pos.get("outcome", "")
+                    pos_key = f"{condition_id}:{outcome}"
+
+                    # Skip if already synced
+                    if pos_key in self._synced_positions:
+                        continue
+
+                    # Check if this is a 15-min crypto market
+                    slug = pos.get("slug", "") or pos.get("eventSlug", "")
+                    title = pos.get("title", "")
+
+                    if "updown-15m" not in slug.lower() and "15m" not in title.lower():
+                        continue
+
+                    # Identify asset
+                    asset = None
+                    for a in ["btc", "eth", "sol", "xrp"]:
+                        if slug.lower().startswith(a) or a in slug.lower():
+                            asset = a.upper()
+                            break
+
+                    if not asset:
+                        continue
+
+                    # Get outcome (Up/Down)
+                    if isinstance(outcome, str):
+                        outcome_lower = outcome.lower()
+                        if "up" in outcome_lower:
+                            side = Side.UP
+                        elif "down" in outcome_lower:
+                            side = Side.DOWN
+                        else:
+                            continue
+                    else:
+                        continue
+
+                    # Determine win/loss from realizedPnl
+                    realized_pnl = float(pos.get("realizedPnl", 0) or 0)
+                    won = realized_pnl > 0
+
+                    # Get trade details
+                    avg_price = float(pos.get("avgPrice", 0) or 0)
+                    total_bought = float(pos.get("totalBought", 0) or 0)
+
+                    if avg_price <= 0 or total_bought <= 0:
+                        continue
+
+                    # Create mock signal for ML recording
+                    from types import SimpleNamespace
+                    fake_signal = SimpleNamespace(
+                        edge=0.0,
+                        market=SimpleNamespace(
+                            asset=asset,
+                            target_price=0,
+                            time_remaining=0,
+                            best_bid=avg_price,
+                            best_ask=avg_price,
+                            bid_depth=0,
+                            ask_depth=0,
+                        ),
+                        side=side,
+                        _arb_type="none",
+                        recommended_price=avg_price,
+                        size_shares=total_bought,
+                        size_usd=total_bought * avg_price,
+                        time_remaining=0,
+                    )
+
+                    # Record to ML model
+                    self.ml_predictor.record_outcome(
+                        signal=fake_signal,
+                        volatility=0.003,
+                        price_momentum=0.0,
+                        won=won,
+                    )
+
+                    # Mark as synced
+                    self._synced_positions.add(pos_key)
+                    synced_count += 1
+
+                except Exception as e:
+                    logger.debug(f"Error processing position for ML sync: {e}")
+                    continue
+
+            if synced_count > 0:
+                logger.info(
+                    f"🤖 ML synced {synced_count} trades from Polymarket | "
+                    f"Total samples: {self.ml_predictor.training_samples}"
+                )
+
+        except Exception as e:
+            logger.error(f"ML sync from Polymarket failed: {e}")
 
     async def _process_market(self, market: MarketState):
         """
