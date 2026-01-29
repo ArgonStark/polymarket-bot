@@ -165,7 +165,13 @@ class SignalGenerator:
         if len(self.price_histories[symbol_lower]) >= 5:
             asset = symbol_lower.split("/")[0]
             # Extract just the prices for volatility calculation
-            prices_only = [p[1] for p in self.price_histories[symbol_lower]]
+            # Handle both tuple format (timestamp, price) and raw float format
+            prices_only = []
+            for p in self.price_histories[symbol_lower]:
+                if isinstance(p, (list, tuple)) and len(p) >= 2:
+                    prices_only.append(p[1])
+                elif isinstance(p, (int, float)):
+                    prices_only.append(float(p))
             self.volatilities[asset] = estimate_volatility(
                 prices_only,
                 window=20,
