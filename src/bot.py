@@ -1072,6 +1072,10 @@ class TradingBot:
                 # This bypasses internal position tracking which may fail
                 await self._sync_ml_from_polymarket()
 
+                # Sync positions from Polymarket API - clears stale positions
+                # that no longer exist (prevents blocking new trades)
+                await self._sync_positions_from_polymarket()
+
                 await asyncio.sleep(self.settlement_check_interval)
 
             except asyncio.CancelledError:
@@ -1999,6 +2003,66 @@ class TradingBot:
 
         except Exception as e:
             logger.error(f"ML sync from Polymarket failed: {e}")
+
+    async def _sync_positions_from_polymarket(self):
+        """
+        Sync internal position tracking with actual Polymarket positions.
+
+        Removes stale positions that no longer exist on Polymarket.
+        This prevents the bot from blocking new trades due to ghost positions.
+        """
+        if not self.client:
+            return
+
+        try:
+            # Get wallet address
+            wallet_address = self.client.get_address()
+            if not wallet_address:
+                return
+
+            # Initialize Data API
+            data_api = get_data_api()
+
+            # Get current positions from Polymarket
+            api_positions = data_api.get_positions(wallet_address, limit=100, size_threshold=0.1)
+
+            # Build set of condition IDs that actually have positions
+            api_condition_ids = set()
+            for pos in api_positions:
+                cid = pos.get("conditionId", "")
+                if cid:
+                    api_condition_ids.add(cid)
+
+            # Check internal positions against API
+            internal_positions = list(self.risk_manager.positions.keys())
+            cleared_count = 0
+
+            for market_key in internal_positions:
+                if market_key not in api_condition_ids:
+                    # Position exists internally but not on Polymarket - it's been settled
+                    position = self.risk_manager.positions.get(market_key)
+                    if position:
+                        asset = position.market.asset if hasattr(position, 'market') else "???"
+                        side = position.side.value if hasattr(position, 'side') else "???"
+
+                        logger.info(
+                            f"🧹 Clearing stale position: {asset} {side} | "
+                            f"Not found on Polymarket"
+                        )
+
+                        # Remove from risk manager (assume break-even if unknown)
+                        self.risk_manager.positions.pop(market_key, None)
+                        cleared_count += 1
+
+                        # Also clear any asset-level tracking
+                        if hasattr(self, '_api_positions') and asset in self._api_positions:
+                            del self._api_positions[asset]
+
+            if cleared_count > 0:
+                logger.info(f"🧹 Cleared {cleared_count} stale positions from tracking")
+
+        except Exception as e:
+            logger.debug(f"Position sync failed: {e}")
 
     async def _process_market(self, market: MarketState):
         """
