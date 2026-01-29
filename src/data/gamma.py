@@ -744,20 +744,29 @@ class GammaAPI:
         """
         Fetch a specific market by condition ID.
 
+        Uses query parameter filtering instead of path parameter,
+        as the Gamma API /markets/{id} endpoint expects a different format.
+
         Args:
             condition_id: Market condition ID
 
         Returns:
             Market dict or None if not found
         """
-        url = f"{self.base_url}/markets/{condition_id}"
+        # Use query parameter instead of path parameter
+        # The Gamma API /markets/{id} expects internal IDs, not condition IDs
+        url = f"{self.base_url}/markets"
+        params = {"condition_id": condition_id}
 
         try:
-            response = self._session.get(url, timeout=10)
+            response = self._session.get(url, params=params, timeout=10)
             response.raise_for_status()
-            return response.json()
+            markets = response.json()
+            if markets and len(markets) > 0:
+                return markets[0]
+            return None
         except requests.RequestException as e:
-            logger.error(f"Failed to fetch market {condition_id}: {e}")
+            logger.debug(f"Failed to fetch market by condition_id {condition_id}: {e}")
             return None
 
     def get_market_prices(self, condition_id: str) -> Optional[dict]:
