@@ -1856,6 +1856,60 @@ class TradingBot:
                 trend_1d=trend_1d,
             )
 
+    def _get_market_info_for_sync(self, condition_id: str) -> dict:
+        """
+        Get market info from condition ID for ML sync, with caching.
+
+        Returns dict with: slug, asset, resolved, winning_outcome
+        """
+        # Use a simple cache to avoid repeated API calls
+        if not hasattr(self, '_market_info_cache'):
+            self._market_info_cache = {}
+
+        if condition_id in self._market_info_cache:
+            return self._market_info_cache[condition_id]
+
+        try:
+            market = self.gamma_api.get_market_by_id(condition_id)
+            if market:
+                slug = market.get("slug", "")
+
+                # Extract asset from slug (e.g., btc-updown-15m-1234567890)
+                asset = None
+                for a in ["btc", "eth", "sol", "xrp"]:
+                    if slug.lower().startswith(a):
+                        asset = a.upper()
+                        break
+
+                # Check if resolved
+                resolved = market.get("resolved", False)
+                winning_outcome = None
+
+                if resolved:
+                    tokens = market.get("tokens", [])
+                    for token in tokens:
+                        if token.get("winner", False):
+                            outcome_str = token.get("outcome", "").lower()
+                            if "up" in outcome_str or "yes" in outcome_str:
+                                winning_outcome = "UP"
+                            elif "down" in outcome_str or "no" in outcome_str:
+                                winning_outcome = "DOWN"
+                            break
+
+                info = {
+                    "slug": slug,
+                    "asset": asset,
+                    "resolved": resolved,
+                    "winning_outcome": winning_outcome,
+                }
+                self._market_info_cache[condition_id] = info
+                return info
+        except Exception as e:
+            logger.debug(f"Error fetching market {condition_id}: {e}")
+
+        self._market_info_cache[condition_id] = None
+        return None
+
     async def _sync_ml_from_polymarket(self):
         """
         Sync ML model with actual trades from Polymarket API.
@@ -1865,8 +1919,8 @@ class TradingBot:
 
         The process:
         1. Fetch trade history from Polymarket CLOB API
-        2. For each 15-min crypto trade, check if the market has settled
-        3. Record outcomes to ML for learning
+        2. For each 15-min crypto trade, look up market info via Gamma API
+        3. Check if the market has settled and record outcomes to ML
 
         This runs periodically alongside normal settlement processing.
         """
@@ -1894,34 +1948,46 @@ class TradingBot:
             import time
             current_ts = int(time.time())
             synced_count = 0
-            skipped_count = 0
 
             for trade in trades:
                 try:
                     # Get trade details
-                    trade_id = trade.get("id") or trade.get("trade_id") or str(trade.get("matchTime", ""))
+                    trade_id = trade.get("id", "")
                     if not trade_id:
                         continue
 
                     # Skip if already synced
                     if trade_id in self._ml_synced_trades:
-                        skipped_count += 1
                         continue
 
-                    # Get market info from trade
-                    market_slug = trade.get("marketSlug", "") or trade.get("market_slug", "")
-                    asset_id = trade.get("assetId") or trade.get("asset_id") or ""
+                    # Get condition ID from trade (the "market" field)
+                    condition_id = trade.get("market", "")
+                    if not condition_id:
+                        self._ml_synced_trades.add(trade_id)
+                        continue
+
+                    # Look up market info via Gamma API
+                    market_info = self._get_market_info_for_sync(condition_id)
+                    if not market_info:
+                        self._ml_synced_trades.add(trade_id)
+                        continue
+
+                    slug = market_info.get("slug", "")
+                    asset = market_info.get("asset")
 
                     # Check if this is a 15-min crypto market
-                    # Slug format: btc-updown-15m-{timestamp}
-                    if "updown-15m" not in market_slug.lower():
-                        self._ml_synced_trades.add(trade_id)  # Don't check again
+                    if "updown-15m" not in slug.lower():
+                        self._ml_synced_trades.add(trade_id)
+                        continue
+
+                    if not asset:
+                        self._ml_synced_trades.add(trade_id)
                         continue
 
                     # Extract market start timestamp from slug
                     market_ts = None
                     try:
-                        parts = market_slug.split("-")
+                        parts = slug.split("-")
                         if len(parts) >= 4:
                             market_ts = int(parts[-1])
                     except (ValueError, IndexError):
@@ -1933,62 +1999,36 @@ class TradingBot:
 
                     # Check if market has settled (15 min = 900 seconds after start)
                     settle_time = market_ts + 900
-                    if current_ts < settle_time + 30:  # Wait 30s after settle for resolution
-                        # Not settled yet - don't sync
+                    if current_ts < settle_time + 60:  # Wait 60s after settle
+                        # Not settled yet - don't sync yet
                         continue
 
-                    # Identify asset from slug
-                    asset = None
-                    for a in ["btc", "eth", "sol", "xrp"]:
-                        if market_slug.lower().startswith(a):
-                            asset = a.upper()
-                            break
-
-                    if not asset:
-                        self._ml_synced_trades.add(trade_id)
-                        continue
-
-                    # Determine trade side from outcome
-                    outcome = trade.get("outcome", "") or trade.get("side", "")
+                    # Determine trade side from outcome field
+                    outcome = trade.get("outcome", "")
                     if isinstance(outcome, str):
                         outcome_lower = outcome.lower()
-                        if "up" in outcome_lower or "yes" in outcome_lower:
+                        if "up" in outcome_lower:
                             side = Side.UP
-                        elif "down" in outcome_lower or "no" in outcome_lower:
+                        elif "down" in outcome_lower:
                             side = Side.DOWN
                         else:
-                            # Try to determine from token
                             self._ml_synced_trades.add(trade_id)
                             continue
                     else:
                         self._ml_synced_trades.add(trade_id)
                         continue
 
-                    # Get market resolution - determine if trade won
-                    # For 15-min markets: price >= target = UP wins
-                    resolution = self.gamma_api.get_market_resolution(
-                        trade.get("conditionId", "") or trade.get("condition_id", "")
-                    )
-
-                    winning_outcome = None
-                    if resolution and resolution.get("resolved"):
-                        winning_outcome = resolution.get("winning_outcome")
-                    else:
-                        # Try local determination using Chainlink price
-                        chainlink_price = self.signal_generator.get_price(asset)
-                        # We need the target price - try to get from slug timestamp
-                        target_price = self.gamma_api.fetch_price_to_beat(asset, market_ts)
-                        if chainlink_price and target_price:
-                            winning_outcome = "UP" if chainlink_price >= target_price else "DOWN"
+                    # Get winning outcome from market info
+                    winning_outcome = market_info.get("winning_outcome")
 
                     if not winning_outcome:
-                        # Can't determine outcome yet - don't sync
+                        # Market not resolved yet - don't sync yet
                         continue
 
                     # Determine if this trade won
                     won = side.value == winning_outcome
 
-                    # Get trade price and size for feature extraction
+                    # Get trade price and size
                     trade_price = float(trade.get("price", 0) or 0)
                     trade_size = float(trade.get("size", 0) or 0)
 
@@ -2002,16 +2042,12 @@ class TradingBot:
                     # Build a minimal signal for ML recording
                     from types import SimpleNamespace
 
-                    # Try to get additional features
-                    target_price = self.gamma_api.fetch_price_to_beat(asset, market_ts) or 0
-                    chainlink_price = self.signal_generator.get_price(asset) or target_price
-
                     fake_signal = SimpleNamespace(
-                        edge=0.0,  # We don't know the original edge
+                        edge=0.0,
                         market=SimpleNamespace(
                             asset=asset,
-                            target_price=target_price,
-                            time_remaining=0,  # Already settled
+                            target_price=0,
+                            time_remaining=0,
                             best_bid=trade_price,
                             best_ask=trade_price,
                             bid_depth=0,
