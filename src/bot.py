@@ -215,6 +215,17 @@ class TradingBot:
         # This allows the bot to make better decisions immediately
         await self._fetch_historical_prices()
 
+        # Initial ML sync from Polymarket API - backfill from trade history
+        # This ensures ML model learns from all past trades immediately on startup
+        if self.ml_predictor and self.client:
+            logger.info("🤖 Syncing ML model from Polymarket trade history...")
+            await self._sync_ml_from_polymarket(force=True)
+            stats = self.ml_predictor.get_model_stats()
+            logger.info(
+                f"🤖 ML Model: {stats['training_samples']} samples | "
+                f"Mode: {'ACTIVE' if stats['is_active'] else 'LEARNING'}"
+            )
+
         logger.info("Trading bot initialized successfully")
         return True
 
@@ -1908,7 +1919,7 @@ class TradingBot:
                 price_velocity=price_velocity,
             )
 
-    async def _sync_ml_from_polymarket(self):
+    async def _sync_ml_from_polymarket(self, force: bool = False):
         """
         Sync ML model with actual trades from Polymarket Data API.
 
@@ -1918,16 +1929,19 @@ class TradingBot:
         - /closed-positions - completed trades with P&L
 
         The ML learns from closed positions where we know the outcome (win/loss).
+
+        Args:
+            force: If True, bypass rate limiting (used on startup)
         """
         if not self.client or not self.ml_predictor:
             return
 
-        # Rate limit: only sync every 5 minutes
+        # Rate limit: only sync every 5 minutes (unless forced)
         now = datetime.now(timezone.utc)
         if not hasattr(self, '_last_ml_sync_time'):
             self._last_ml_sync_time = None
 
-        if self._last_ml_sync_time and (now - self._last_ml_sync_time).total_seconds() < 300:
+        if not force and self._last_ml_sync_time and (now - self._last_ml_sync_time).total_seconds() < 300:
             return
 
         self._last_ml_sync_time = now
@@ -1950,8 +1964,10 @@ class TradingBot:
             closed_positions = data_api.get_all_closed_positions(wallet_address, max_positions=200)
 
             if not closed_positions:
-                logger.debug("No closed positions found for ML sync")
+                logger.info("🤖 No closed positions found in Polymarket history")
                 return
+
+            logger.debug(f"Found {len(closed_positions)} total closed positions to scan")
 
             synced_count = 0
             for pos in closed_positions:
@@ -1968,15 +1984,30 @@ class TradingBot:
                     # Check if this is a 15-min crypto market
                     slug = pos.get("slug", "") or pos.get("eventSlug", "")
                     title = pos.get("title", "")
+                    slug_lower = slug.lower()
+                    title_lower = title.lower()
 
-                    if "updown-15m" not in slug.lower() and "15m" not in title.lower():
+                    # Comprehensive 15-min crypto market detection
+                    # Patterns: "updown-15m", "15m", "15min", "15-min", "up-down-15m"
+                    is_15min = any(p in slug_lower or p in title_lower for p in [
+                        "updown-15m", "-15m-", "15min", "15-min", "15m",
+                        "up-down-15m", "updown15m", "crypto-15"
+                    ])
+
+                    if not is_15min:
                         continue
 
-                    # Identify asset
+                    # Identify asset from slug or title
                     asset = None
-                    for a in ["btc", "eth", "sol", "xrp"]:
-                        if slug.lower().startswith(a) or a in slug.lower():
-                            asset = a.upper()
+                    asset_patterns = {
+                        "btc": "BTC", "bitcoin": "BTC",
+                        "eth": "ETH", "ethereum": "ETH",
+                        "sol": "SOL", "solana": "SOL",
+                        "xrp": "XRP", "ripple": "XRP",
+                    }
+                    for pattern, asset_name in asset_patterns.items():
+                        if pattern in slug_lower or pattern in title_lower:
+                            asset = asset_name
                             break
 
                     if not asset:

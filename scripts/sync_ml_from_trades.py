@@ -175,9 +175,10 @@ def sync_trades_to_ml(limit: int = 500, dry_run: bool = False, show_activity: bo
             title_lower = title.lower()
 
             # Check if this is a 15-min crypto market
-            # Patterns: "updown-15m", "15m", "15min", "15-min", "up-down-15m"
+            # Comprehensive patterns: "updown-15m", "15m", "15min", "15-min", etc.
             is_15min = any(p in slug_lower or p in title_lower for p in [
-                "updown-15m", "-15m-", "15min", "15-min", "15m"
+                "updown-15m", "-15m-", "15min", "15-min", "15m",
+                "up-down-15m", "updown15m", "crypto-15"
             ])
 
             if not is_15min:
@@ -186,9 +187,14 @@ def sync_trades_to_ml(limit: int = 500, dry_run: bool = False, show_activity: bo
 
             # Identify asset from slug or title
             asset = None
-            for a in ["btc", "eth", "sol", "xrp", "bitcoin", "ethereum", "solana"]:
-                asset_name = a[:3].upper() if len(a) > 3 else a.upper()
-                if a in slug_lower or a in title_lower:
+            asset_patterns = {
+                "btc": "BTC", "bitcoin": "BTC",
+                "eth": "ETH", "ethereum": "ETH",
+                "sol": "SOL", "solana": "SOL",
+                "xrp": "XRP", "ripple": "XRP",
+            }
+            for pattern, asset_name in asset_patterns.items():
+                if pattern in slug_lower or pattern in title_lower:
                     asset = asset_name
                     break
 
