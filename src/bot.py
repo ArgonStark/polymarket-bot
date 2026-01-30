@@ -1728,6 +1728,16 @@ class TradingBot:
         else:
             logger.debug(f"No position in {market.asset}, nothing to settle")
 
+        # ALWAYS record ML observation from expired markets (even without positions)
+        # This gives the ML model more training data by observing outcomes
+        if winning_outcome and resolution_price and self.ml_predictor:
+            self._record_ml_observation_from_expired_market(
+                market=market,
+                winning_outcome=winning_outcome,
+                resolution_price=resolution_price,
+                had_position=has_position,
+            )
+
         return True  # Settlement successful
 
     def _determine_outcome_locally(self, market: MarketState) -> tuple[Optional[str], Optional[float]]:
@@ -1759,6 +1769,121 @@ class TradingBot:
             return ("UP", current_price)
         else:
             return ("DOWN", current_price)
+
+    def _record_ml_observation_from_expired_market(
+        self,
+        market: MarketState,
+        winning_outcome: str,
+        resolution_price: float,
+        had_position: bool,
+    ):
+        """
+        Record ML training data from an expired market (observational learning).
+
+        This allows the ML model to learn from ALL expired markets, not just
+        the ones we traded. By observing outcomes, the model can learn patterns
+        without risking money.
+
+        Records two observations:
+        1. The winning side (UP or DOWN) - what would have won
+        2. The losing side - what would have lost
+
+        Args:
+            market: The expired market
+            winning_outcome: "UP" or "DOWN" - which side won
+            resolution_price: The final price at settlement
+            had_position: Whether we had a position (skip if already recorded)
+        """
+        # Skip if we already recorded this via position close
+        if had_position:
+            return
+
+        # Skip if ML predictor not available
+        if not self.ml_predictor:
+            return
+
+        try:
+            from types import SimpleNamespace
+            from .models import Side
+
+            # Get current market data for feature extraction
+            volatility = self.signal_generator.get_volatility(market.asset)
+            current_price = resolution_price
+
+            # Calculate how far price ended from target
+            target_price = market.target_price
+            distance_from_target = 0.0
+            if target_price and target_price > 0:
+                distance_from_target = (current_price - target_price) / target_price
+
+            # Get Binance trends if available
+            trend_1h, trend_4h, trend_1d = 0.0, 0.0, 0.0
+            try:
+                from .data.binance import get_multi_timeframe_trends
+                trends = get_multi_timeframe_trends(market.asset)
+                trend_1h = trends.get("trend_1h", 0.0)
+                trend_4h = trends.get("trend_4h", 0.0)
+                trend_1d = trends.get("trend_1d", 0.0)
+            except Exception:
+                pass
+
+            # Calculate price momentum based on outcome
+            # If UP won, price was trending up; if DOWN won, price was trending down
+            price_momentum = distance_from_target * 10  # Amplify for better signal
+            price_momentum = max(-1, min(1, price_momentum))
+
+            # Record BOTH sides for balanced learning:
+            # 1. Record the winning side as a WIN
+            # 2. Record the losing side as a LOSS
+            for side_value in ["UP", "DOWN"]:
+                side = Side.UP if side_value == "UP" else Side.DOWN
+                won = (side_value == winning_outcome)
+
+                # Create a fake signal for ML recording
+                fake_signal = SimpleNamespace(
+                    market=market,
+                    side=side,
+                    edge=0.0,  # Unknown edge for observation
+                    recommended_price=market.best_bid if side == Side.UP else market.best_ask,
+                    size_shares=0,
+                    size_usd=0,
+                    time_remaining=0,
+                    _arb_type="observation",  # Mark as observational data
+                )
+
+                # Record to ML model
+                self.ml_predictor.record_outcome(
+                    signal=fake_signal,
+                    volatility=volatility,
+                    price_momentum=price_momentum if side == Side.UP else -price_momentum,
+                    won=won,
+                    arb_type="observation",
+                    spread=market.best_ask - market.best_bid if market.best_ask and market.best_bid else 0.0,
+                    bid_depth=market.bid_depth,
+                    ask_depth=market.ask_depth,
+                    price_trend=price_momentum,
+                    distance_from_target=distance_from_target,
+                    binance_lead_pct=0.0,
+                    binance_confirmation="NONE",
+                    trend_1h=trend_1h,
+                    trend_4h=trend_4h,
+                    trend_1d=trend_1d,
+                    current_price=current_price,
+                    target_price=target_price,
+                    price_high=current_price * 1.005,
+                    price_low=current_price * 0.995,
+                    price_velocity=abs(price_momentum) * 0.001,
+                )
+
+            logger.info(
+                f"🤖 ML OBSERVATION: {market.asset} | "
+                f"Winner: {winning_outcome} | "
+                f"Price: ${resolution_price:,.2f} vs Target: ${target_price:,.2f} | "
+                f"+2 training samples"
+            )
+
+        except Exception as e:
+            logger.debug(f"Error recording ML observation: {e}")
 
     async def _close_position_on_settlement(
         self,
