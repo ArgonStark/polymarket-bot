@@ -142,7 +142,7 @@ class TradingBot:
         self.market_discovery_interval = 15.0  # Discover new markets every 15s
         self.balance_sync_interval = 30.0  # Sync balance every 30s
         self.orders_sync_interval = 60.0  # Sync open orders every 60s
-        self.period_transition_delay = 5.0  # Seconds to wait after period boundary for price data
+        self.period_transition_delay = 15.0  # Seconds to wait after period boundary for price data
         self.position_log_interval = 30.0  # Log position status every 30s
         self.last_position_log = None  # Track last position log time
 
@@ -1142,6 +1142,10 @@ class TradingBot:
             # Wait period complete - clear old markets and reset transition state
             logger.info("Period transition complete - refreshing markets with new prices")
             self._period_transition_wait_until = None
+
+            # CRITICAL: Clear stale target price cache to force fresh API fetches
+            # This prevents trading on wrong target prices from previous periods
+            self.gamma_api.clear_stale_price_cache(current_period_ts)
 
             # Clear markets from old period (they should be in expiring/settled by now)
             async with self._markets_lock:
@@ -2157,6 +2161,25 @@ class TradingBot:
         binance_price = self.signal_generator.get_binance_price(market.asset)
         chainlink_price = self.signal_generator.get_price(market.asset)
 
+        # CRITICAL: Validate target price before trading
+        # After period transitions, the API may return stale target prices
+        if chainlink_price and market.target_price:
+            target_deviation = abs(chainlink_price - market.target_price) / market.target_price
+            # For a 15-min market, target price should be within ~5% of current price
+            # (crypto can move, but >5% in 15 mins is very unusual and suggests stale data)
+            max_deviation = 0.05  # 5% max deviation
+            if target_deviation > max_deviation:
+                stale_key = f"{market.condition_id}:stale_target"
+                if stale_key not in self._logged_rejections:
+                    self._logged_rejections.add(stale_key)
+                    logger.warning(
+                        f"⚠️ [{market.asset}] STALE TARGET PRICE DETECTED! "
+                        f"Target ${market.target_price:,.2f} deviates {target_deviation:.1%} "
+                        f"from Chainlink ${chainlink_price:,.2f} (max {max_deviation:.0%}). "
+                        f"Skipping trades until target price updates."
+                    )
+                return
+
         # Binance is optional - used for confirmation signal boost, not required
         # The signal generator handles missing Binance data gracefully
 
@@ -2650,6 +2673,37 @@ class TradingBot:
         # Get current price for logging
         current_price = self.signal_generator.get_price(signal.market.asset)
         target = signal.market.target_price
+
+        # FINAL SAFETY CHECK: Validate target price at execution time
+        # This catches any stale target prices that slipped through earlier checks
+        if current_price and target:
+            deviation = abs(current_price - target) / target
+            # Calculate how long into the current period we are
+            current_ts = int(now.timestamp())
+            period_start = (current_ts // 900) * 900
+            seconds_into_period = current_ts - period_start
+
+            # In the first 60 seconds of a period, be extra strict about target price
+            # The target should be VERY close to current price at period start
+            if seconds_into_period < 60:
+                max_deviation = 0.02  # Only 2% deviation allowed in first 60 seconds
+                if deviation > max_deviation:
+                    logger.warning(
+                        f"⚠️ [{asset}] BLOCKING TRADE - Target price ${target:,.2f} "
+                        f"deviates {deviation:.1%} from Chainlink ${current_price:,.2f} "
+                        f"({seconds_into_period}s into period). Likely stale price from previous period."
+                    )
+                    return
+            else:
+                # After 60 seconds, use 5% threshold
+                max_deviation = 0.05
+                if deviation > max_deviation:
+                    logger.warning(
+                        f"⚠️ [{asset}] BLOCKING TRADE - Target price ${target:,.2f} "
+                        f"deviates {deviation:.1%} from Chainlink ${current_price:,.2f}. "
+                        f"Target price may be stale."
+                    )
+                    return
 
         # Log positions BEFORE trade
         api_pos_count = len(self._api_positions) if hasattr(self, '_api_positions') else 0
