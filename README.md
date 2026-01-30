@@ -1,5 +1,7 @@
 # Polymarket 15-Minute Crypto Arbitrage Bot
 
+**Made by Argon Stark**
+
 An autonomous trading bot for Polymarket's 15-minute cryptocurrency prediction markets. Exploits temporal arbitrage between real-time Chainlink oracle prices and lagging market odds.
 
 ## Strategy Overview
