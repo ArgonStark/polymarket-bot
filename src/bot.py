@@ -2395,48 +2395,72 @@ class TradingBot:
             # Create mock signal for ML recording
             from types import SimpleNamespace
 
-            # Per-asset volatility
-            asset_volatility = {
-                "BTC": 0.0035, "ETH": 0.0045,
-                "SOL": 0.0070, "XRP": 0.0060,
-            }.get(asset, 0.005)
+            # ============================================================
+            # ENHANCED FEATURE EXTRACTION (same as learn_from_trader.py)
+            # ============================================================
 
-            # Estimate momentum from result
-            if won:
-                price_momentum = 0.3 if side == Side.UP else -0.3
-            else:
-                price_momentum = -0.2 if side == Side.UP else 0.2
+            # 1. Entry price deviation from 0.50 (market mid-point)
+            price_deviation = avg_price - 0.50
+
+            # 2. Estimate edge based on entry price and outcome
+            estimated_edge = (1.0 - avg_price) if won else (avg_price - 1.0)
+            estimated_edge = max(0.01, min(0.50, abs(estimated_edge)))
+
+            # 3. Position sizing (normalize by typical size)
+            position_size_normalized = min(total_bought / 100, 1.0)
+
+            # 4. Price momentum inference
+            inferred_momentum = 0.2 if (side == Side.UP and won) or (side == Side.DOWN and not won) else -0.2
+
+            # 5. Infer volatility from entry price
+            inferred_volatility = 0.5 - abs(price_deviation)
+            inferred_volatility = max(0.01, inferred_volatility * 0.1)
+
+            # 6. Distance from fair value (0.50)
+            distance_from_fair = abs(price_deviation)
 
             fake_signal = SimpleNamespace(
-                edge=0.05 if won else 0.02,  # Estimate edge from result
+                edge=estimated_edge,
                 market=SimpleNamespace(
                     asset=asset,
-                    target_price=avg_price,
-                    time_remaining=300,  # Estimate
+                    condition_id="",
+                    target_price=1.0,
+                    time_remaining=450,
                     best_bid=avg_price - 0.01,
                     best_ask=avg_price + 0.01,
-                    bid_depth=10000,
-                    ask_depth=10000,
+                    bid_depth=1000 * position_size_normalized,
+                    ask_depth=1000 * position_size_normalized,
                 ),
                 side=side,
-                _arb_type="none",
+                _arb_type="synced",
                 recommended_price=avg_price,
                 size_shares=total_bought,
                 size_usd=total_bought * avg_price,
-                time_remaining=300,
+                time_remaining=450,
             )
 
-            # Record to ML model
+            # Record to ML model with enhanced features
             self.ml_predictor.record_outcome(
                 signal=fake_signal,
-                volatility=asset_volatility,
-                price_momentum=price_momentum,
+                volatility=inferred_volatility,
+                price_momentum=inferred_momentum,
                 won=won,
+                arb_type="synced",
+                spread=0.02,
+                bid_depth=1000 * position_size_normalized,
+                ask_depth=1000 * position_size_normalized,
+                price_trend=inferred_momentum * 0.5,
+                distance_from_target=distance_from_fair,
+                binance_lead_pct=inferred_momentum * 0.005,
+                binance_confirmation="MEDIUM" if abs(inferred_momentum) > 0.1 else "NONE",
+                trend_1h=inferred_momentum * 0.3,
+                trend_4h=inferred_momentum * 0.2,
+                trend_1d=inferred_momentum * 0.1,
                 current_price=avg_price,
-                target_price=avg_price,
-                price_high=avg_price * 1.005,
-                price_low=avg_price * 0.995,
-                price_velocity=price_momentum * 0.001,
+                target_price=0.50,
+                price_high=avg_price + inferred_volatility,
+                price_low=avg_price - inferred_volatility,
+                price_velocity=abs(inferred_momentum) * 0.01,
             )
 
             # Mark as synced
@@ -2587,46 +2611,73 @@ class TradingBot:
                 # Skip for now, will be captured by closed-positions or redeem
                 return "crypto"
 
-            # Record the trade
-            asset_volatility = {
-                "BTC": 0.0035, "ETH": 0.0045,
-                "SOL": 0.0070, "XRP": 0.0060,
-            }.get(asset, 0.005)
-
-            price_momentum = 0.3 if won else -0.2
-            if side == Side.DOWN:
-                price_momentum = -price_momentum
-
+            # ============================================================
+            # ENHANCED FEATURE EXTRACTION (same as learn_from_trader.py)
+            # ============================================================
             from types import SimpleNamespace
+
+            # 1. Entry price deviation from 0.50 (market mid-point)
+            price_deviation = price - 0.50
+
+            # 2. Estimate edge based on entry price and outcome
+            estimated_edge = (1.0 - price) if won else (price - 1.0)
+            estimated_edge = max(0.01, min(0.50, abs(estimated_edge)))
+
+            # 3. Position sizing (normalize by typical size)
+            position_size_normalized = min(size / 100, 1.0)
+
+            # 4. Price momentum inference
+            inferred_momentum = 0.2 if (side == Side.UP and won) or (side == Side.DOWN and not won) else -0.2
+
+            # 5. Infer volatility from entry price
+            inferred_volatility = 0.5 - abs(price_deviation)
+            inferred_volatility = max(0.01, inferred_volatility * 0.1)
+
+            # 6. Distance from fair value (0.50)
+            distance_from_fair = abs(price_deviation)
+
             fake_signal = SimpleNamespace(
-                edge=0.05 if won else 0.02,
+                edge=estimated_edge,
                 market=SimpleNamespace(
                     asset=asset,
-                    target_price=price,
-                    time_remaining=300,
+                    condition_id="",
+                    target_price=1.0,
+                    time_remaining=450,
                     best_bid=price - 0.01,
                     best_ask=price + 0.01,
-                    bid_depth=10000,
-                    ask_depth=10000,
+                    bid_depth=1000 * position_size_normalized,
+                    ask_depth=1000 * position_size_normalized,
                 ),
                 side=side,
-                _arb_type="none",
+                _arb_type="synced",
                 recommended_price=price,
                 size_shares=size,
                 size_usd=size * price,
-                time_remaining=300,
+                time_remaining=450,
             )
 
+            # Record to ML model with enhanced features
             self.ml_predictor.record_outcome(
                 signal=fake_signal,
-                volatility=asset_volatility,
-                price_momentum=price_momentum,
+                volatility=inferred_volatility,
+                price_momentum=inferred_momentum,
                 won=won,
+                arb_type="synced",
+                spread=0.02,
+                bid_depth=1000 * position_size_normalized,
+                ask_depth=1000 * position_size_normalized,
+                price_trend=inferred_momentum * 0.5,
+                distance_from_target=distance_from_fair,
+                binance_lead_pct=inferred_momentum * 0.005,
+                binance_confirmation="MEDIUM" if abs(inferred_momentum) > 0.1 else "NONE",
+                trend_1h=inferred_momentum * 0.3,
+                trend_4h=inferred_momentum * 0.2,
+                trend_1d=inferred_momentum * 0.1,
                 current_price=price,
-                target_price=price,
-                price_high=price * 1.005,
-                price_low=price * 0.995,
-                price_velocity=price_momentum * 0.001,
+                target_price=0.50,
+                price_high=price + inferred_volatility,
+                price_low=price - inferred_volatility,
+                price_velocity=abs(inferred_momentum) * 0.01,
             )
 
             self._synced_trades.add(trade_key)

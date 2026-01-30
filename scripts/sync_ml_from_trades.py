@@ -164,6 +164,7 @@ def sync_trades_to_ml(limit: int = 500, dry_run: bool = False, show_activity: bo
     skipped_count = 0
     wins = 0
     losses = 0
+    total_pnl = 0.0
 
     print("Processing 15-min crypto positions...\n")
 
@@ -245,64 +246,76 @@ def sync_trades_to_ml(limit: int = 500, dry_run: bool = False, show_activity: bo
                 wins += 1
             else:
                 losses += 1
+            total_pnl += realized_pnl
 
             if not dry_run:
                 from types import SimpleNamespace
 
-                # Per-asset volatility (based on actual 15-minute volatility)
-                asset_volatility = {
-                    "BTC": 0.0035,  # ~0.35% per 15 min
-                    "ETH": 0.0045,  # ~0.45% per 15 min
-                    "SOL": 0.0070,  # ~0.70% per 15 min
-                    "XRP": 0.0060,  # ~0.60% per 15 min
-                }.get(asset, 0.005)
+                # ============================================================
+                # ENHANCED FEATURE EXTRACTION (same as learn_from_trader.py)
+                # ============================================================
 
-                # Estimate edge from result (winning trades had positive edge)
-                # This gives the model a hint about what worked
-                estimated_edge = 0.05 if won else 0.02
+                # 1. Entry price deviation from 0.50 (market mid-point)
+                price_deviation = avg_price - 0.50
 
-                # For historical trades, estimate price context based on result
-                # If we won on UP, price likely went up (positive momentum)
-                # If we won on DOWN, price likely went down (negative momentum)
-                if won:
-                    price_momentum = 0.3 if side == Side.UP else -0.3
-                else:
-                    price_momentum = -0.2 if side == Side.UP else 0.2
+                # 2. Estimate edge based on entry price and outcome
+                estimated_edge = (1.0 - avg_price) if won else (avg_price - 1.0)
+                estimated_edge = max(0.01, min(0.50, abs(estimated_edge)))
 
-                # Estimate time remaining based on typical trading patterns
-                # Most trades happen with 200-500 seconds remaining
-                estimated_time_remaining = 300
+                # 3. Position sizing (normalize by typical size)
+                position_size_normalized = min(total_bought / 100, 1.0)
+
+                # 4. Price momentum inference
+                inferred_momentum = 0.2 if (side == Side.UP and won) or (side == Side.DOWN and not won) else -0.2
+
+                # 5. Infer volatility from entry price
+                inferred_volatility = 0.5 - abs(price_deviation)
+                inferred_volatility = max(0.01, inferred_volatility * 0.1)
+
+                # 6. Distance from fair value (0.50)
+                distance_from_fair = abs(price_deviation)
 
                 fake_signal = SimpleNamespace(
                     edge=estimated_edge,
                     market=SimpleNamespace(
                         asset=asset,
-                        target_price=avg_price,  # Use avg_price as estimate
-                        time_remaining=estimated_time_remaining,
+                        condition_id="",
+                        target_price=1.0,
+                        time_remaining=450,
                         best_bid=avg_price - 0.01,
                         best_ask=avg_price + 0.01,
-                        bid_depth=10000,  # Typical depth estimate
-                        ask_depth=10000,
+                        bid_depth=1000 * position_size_normalized,
+                        ask_depth=1000 * position_size_normalized,
                     ),
                     side=side,
-                    _arb_type="none",  # Unknown for historical
+                    _arb_type="synced",
                     recommended_price=avg_price,
                     size_shares=total_bought,
                     size_usd=total_bought * avg_price,
-                    time_remaining=estimated_time_remaining,
+                    time_remaining=450,
                 )
 
                 ml_predictor.record_outcome(
                     signal=fake_signal,
-                    volatility=asset_volatility,  # Use correct per-asset volatility
-                    price_momentum=price_momentum,
+                    volatility=inferred_volatility,
+                    price_momentum=inferred_momentum,
                     won=won,
-                    # Historical trades - use estimates based on trade data
+                    arb_type="synced",
+                    spread=0.02,
+                    bid_depth=1000 * position_size_normalized,
+                    ask_depth=1000 * position_size_normalized,
+                    price_trend=inferred_momentum * 0.5,
+                    distance_from_target=distance_from_fair,
+                    binance_lead_pct=inferred_momentum * 0.005,
+                    binance_confirmation="MEDIUM" if abs(inferred_momentum) > 0.1 else "NONE",
+                    trend_1h=inferred_momentum * 0.3,
+                    trend_4h=inferred_momentum * 0.2,
+                    trend_1d=inferred_momentum * 0.1,
                     current_price=avg_price,
-                    target_price=avg_price,  # Best estimate
-                    price_high=avg_price * 1.005,  # Estimate 0.5% range
-                    price_low=avg_price * 0.995,
-                    price_velocity=price_momentum * 0.001,  # Derived from momentum
+                    target_price=0.50,
+                    price_high=avg_price + inferred_volatility,
+                    price_low=avg_price - inferred_volatility,
+                    price_velocity=abs(inferred_momentum) * 0.01,
                 )
 
             synced_count += 1
@@ -323,8 +336,16 @@ def sync_trades_to_ml(limit: int = 500, dry_run: bool = False, show_activity: bo
     print()
     if synced_count > 0:
         win_rate = wins / synced_count * 100
+        avg_pnl = total_pnl / synced_count
+
+        # Color for profit
+        pnl_color = "\033[92m" if total_pnl >= 0 else "\033[91m"
+        reset = "\033[0m"
+
         print(f"  Wins:  {wins:3d} ({win_rate:.1f}%)")
         print(f"  Losses: {losses:3d} ({100-win_rate:.1f}%)")
+        print(f"  {pnl_color}Total Profit: ${total_pnl:+,.2f}{reset}")
+        print(f"  Avg P&L/trade: ${avg_pnl:+.2f}")
 
     if not dry_run:
         # Always save the model (even if 0 synced) to create the file
