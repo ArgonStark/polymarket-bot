@@ -1782,16 +1782,22 @@ class TradingBot:
             payout = 0.0
             pnl = -position.cost_basis
 
-        # Color the result
+        # Color and format the result
         result_color = Colors.BRIGHT_GREEN if won else Colors.BRIGHT_RED
         result_emoji = "🎉" if won else "💔"
-        logger.info(
-            f"{result_color}{result_emoji} POSITION CLOSED: {market.asset} {position_side} | "
-            f"{'WIN' if won else 'LOSS'} | "
-            f"Shares: {position.shares:.2f} | "
-            f"Entry: {position.entry_price:.4f} | "
-            f"P&L: ${pnl:+.2f}{Colors.RESET}"
-        )
+        result_text = "WIN" if won else "LOSS"
+        side_arrow = "▲" if position_side == "UP" else "▼"
+
+        # Calculate ROI
+        roi = (pnl / position.cost_basis * 100) if position.cost_basis > 0 else 0
+
+        # Box format for position close
+        logger.info(f"{result_color}╔══════════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        logger.info(f"{result_color}║  {result_emoji} POSITION CLOSED: {result_text:4}                                        ║{Colors.RESET}")
+        logger.info(f"{result_color}╠══════════════════════════════════════════════════════════════════╣{Colors.RESET}")
+        logger.info(f"{result_color}║{Colors.RESET}  Asset: {market.asset:4} {side_arrow}  │  Shares: {position.shares:>8.2f}  │  Entry: {position.entry_price:.4f}     {result_color}║{Colors.RESET}")
+        logger.info(f"{result_color}║{Colors.RESET}  P&L: {result_color}${pnl:>+10.2f}{Colors.RESET}  │  ROI: {result_color}{roi:>+7.1f}%{Colors.RESET}  │  Cost: ${position.cost_basis:.2f}     {result_color}║{Colors.RESET}")
+        logger.info(f"{result_color}╚══════════════════════════════════════════════════════════════════╝{Colors.RESET}")
 
         # Record with risk manager
         self.risk_manager.record_position_close(
@@ -2595,126 +2601,151 @@ class TradingBot:
         cash = self.risk_manager.current_bankroll
         unrealized_total = equity - cash
 
-        # Always log header with summary
-        pnl_str = ""
-        if unrealized_total != 0:
-            pnl_color = Colors.BRIGHT_GREEN if unrealized_total > 0 else Colors.BRIGHT_RED
-            pnl_str = f" | {pnl_color}Unrealized: ${unrealized_total:+.2f}{Colors.RESET}"
+        # Format P&L
+        if unrealized_total > 0:
+            pnl_color = Colors.BRIGHT_GREEN
+            pnl_icon = "📈"
+        elif unrealized_total < 0:
+            pnl_color = Colors.BRIGHT_RED
+            pnl_icon = "📉"
+        else:
+            pnl_color = Colors.DIM
+            pnl_icon = "➖"
 
-        logger.info(f"{Colors.BRIGHT_CYAN}📊 POSITION STATUS (every 30s){Colors.RESET}")
+        # Box header
+        box_width = 64
+        logger.info(f"{Colors.BRIGHT_CYAN}┌{'─' * box_width}┐{Colors.RESET}")
+        logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  📊 POSITION STATUS                                              {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+        logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * box_width}┤{Colors.RESET}")
+
+        # Account summary line
         logger.info(
-            f"   Tracked: {len(positions)} | API: {len(api_positions)} | "
-            f"Pending: {len(pending_orders)} | "
-            f"Cash: ${cash:.2f} | Equity: ${equity:.2f}{pnl_str}"
+            f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  💰 Cash: {Colors.BRIGHT_WHITE}${cash:>10.2f}{Colors.RESET}  │  "
+            f"💎 Equity: {Colors.BRIGHT_WHITE}${equity:>10.2f}{Colors.RESET}  │  "
+            f"{pnl_icon} P&L: {pnl_color}${unrealized_total:>+9.2f}{Colors.RESET}  {Colors.BRIGHT_CYAN}│{Colors.RESET}"
         )
 
+        # Counts summary
+        pos_count = len(positions)
+        api_count = len(api_positions)
+        pending_count = len(pending_orders)
+        logger.info(
+            f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  📦 Positions: {Colors.BRIGHT_YELLOW}{pos_count}{Colors.RESET}  │  "
+            f"🔗 API: {Colors.BRIGHT_YELLOW}{api_count}{Colors.RESET}  │  "
+            f"⏳ Pending: {Colors.BRIGHT_YELLOW}{pending_count}{Colors.RESET}                       {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+        )
+        logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * box_width}┤{Colors.RESET}")
+
         # Log tracked positions with P&L and win probability
-        for market_key, position in positions.items():
-            market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
-            asset = position.market.asset if hasattr(position, 'market') else "???"
-            side = position.side.value
+        if positions:
+            for market_key, position in positions.items():
+                market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
+                asset = position.market.asset if hasattr(position, 'market') else "???"
+                side = position.side.value
 
-            # Get Chainlink price and calculate win probability
-            chainlink_price = self.signal_generator.get_price(asset) if hasattr(self, 'signal_generator') else None
-            target_price = market.target_price if market else None
-            time_remaining = market.time_remaining if market else 0
-            win_prob_str = ""
-            our_win_prob = 0.5  # Default
+                # Get Chainlink price and calculate win probability
+                chainlink_price = self.signal_generator.get_price(asset) if hasattr(self, 'signal_generator') else None
+                target_price = market.target_price if market else None
+                time_remaining = market.time_remaining if market else 0
+                our_win_prob = 0.5  # Default
 
-            if chainlink_price and target_price and market:
-                # Calculate real-time win probability
-                from .probability import calculate_true_probability
-                volatility = self.signal_generator.get_volatility(asset)
-                true_prob_up = calculate_true_probability(
-                    current_price=chainlink_price,
-                    target_price=target_price,
-                    time_remaining_sec=market.time_remaining,
-                    volatility_15min=volatility,
-                )
-                # Our win probability depends on our side
-                our_win_prob = true_prob_up if side == "UP" else (1 - true_prob_up)
+                if chainlink_price and target_price and market:
+                    # Calculate real-time win probability
+                    from .probability import calculate_true_probability
+                    volatility = self.signal_generator.get_volatility(asset)
+                    true_prob_up = calculate_true_probability(
+                        current_price=chainlink_price,
+                        target_price=target_price,
+                        time_remaining_sec=market.time_remaining,
+                        volatility_15min=volatility,
+                    )
+                    # Our win probability depends on our side
+                    our_win_prob = true_prob_up if side == "UP" else (1 - true_prob_up)
 
-                # Color based on probability
+                # Color and icon based on probability
                 if our_win_prob >= 0.7:
                     prob_color = Colors.BRIGHT_GREEN
-                    prob_icon = "✅"
+                    prob_icon = "🟢"
                 elif our_win_prob >= 0.5:
                     prob_color = Colors.BRIGHT_YELLOW
-                    prob_icon = "⚖️"
+                    prob_icon = "🟡"
                 else:
                     prob_color = Colors.BRIGHT_RED
-                    prob_icon = "⚠️"
+                    prob_icon = "🔴"
 
-                win_prob_str = f" | {prob_color}{prob_icon} Win: {our_win_prob:.0%}{Colors.RESET}"
-
-                # Add price context
-                price_diff = chainlink_price - target_price
-                price_direction = "above" if price_diff > 0 else "below"
-                win_prob_str += f" (${chainlink_price:,.0f} {price_direction} target)"
-
-            # Calculate P&L - use settlement price for expired markets
-            current_market_price = None
-            if market:
-                # For expired markets with known outcome, use settlement price
-                if time_remaining <= 0 and our_win_prob >= 0.99:
-                    # We're winning - settlement pays $1 per share
-                    current_market_price = 1.0
-                elif time_remaining <= 0 and our_win_prob <= 0.01:
-                    # We're losing - settlement pays $0
-                    current_market_price = 0.0
-                else:
-                    # Active market - use current market price
-                    if position.side == Side.UP:
-                        current_market_price = market.best_bid
+                # Calculate P&L - use settlement price for expired markets
+                current_market_price = None
+                if market:
+                    if time_remaining <= 0 and our_win_prob >= 0.99:
+                        current_market_price = 1.0
+                    elif time_remaining <= 0 and our_win_prob <= 0.01:
+                        current_market_price = 0.0
                     else:
-                        current_market_price = 1.0 - market.best_ask if market.best_ask else None
+                        if position.side == Side.UP:
+                            current_market_price = market.best_bid
+                        else:
+                            current_market_price = 1.0 - market.best_ask if market.best_ask else None
 
-            if current_market_price is not None and current_market_price >= 0:
-                current_value = position.shares * current_market_price
-                unrealized_pnl = current_value - position.cost_basis
-                if position.entry_price > 0:
-                    pnl_pct = (current_market_price - position.entry_price) / position.entry_price
+                if current_market_price is not None and current_market_price >= 0:
+                    unrealized_pnl = (current_market_price - position.entry_price) * position.shares
+                    pnl_pct = ((current_market_price - position.entry_price) / position.entry_price * 100) if position.entry_price > 0 else 0
+                    pnl_color = Colors.BRIGHT_GREEN if unrealized_pnl > 0 else Colors.BRIGHT_RED
+
+                    # Format time remaining
+                    if time_remaining > 60:
+                        time_str = f"{int(time_remaining // 60)}m {int(time_remaining % 60)}s"
+                    else:
+                        time_str = f"{int(time_remaining)}s"
+
+                    # Settlement indicator
+                    status_str = "⏰ SETTLING" if time_remaining <= 0 else f"⏱️  {time_str}"
+
+                    # Side arrow
+                    side_arrow = "▲" if side == "UP" else "▼"
+                    side_color = Colors.BRIGHT_GREEN if side == "UP" else Colors.BRIGHT_RED
+
+                    logger.info(
+                        f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {side_color}{side_arrow} {asset:4}{Colors.RESET} │ "
+                        f"{position.shares:>6.1f} @ {position.entry_price:.3f} → {current_market_price:.3f} │ "
+                        f"{pnl_color}{unrealized_pnl:>+7.2f} ({pnl_pct:>+5.0f}%){Colors.RESET} │ "
+                        f"{prob_color}{prob_icon} {our_win_prob:>3.0%}{Colors.RESET} │ {status_str}  {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+                    )
                 else:
-                    pnl_pct = 0
+                    side_arrow = "▲" if side == "UP" else "▼"
+                    side_color = Colors.BRIGHT_GREEN if side == "UP" else Colors.BRIGHT_RED
+                    logger.info(
+                        f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {side_color}{side_arrow} {asset:4}{Colors.RESET} │ "
+                        f"{position.shares:>6.1f} @ {position.entry_price:.3f}        │ "
+                        f"{'(no price)':^16} │ "
+                        f"{prob_color}{prob_icon} {our_win_prob:>3.0%}{Colors.RESET} │ ...      {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+                    )
+        else:
+            logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {Colors.DIM}No active positions{Colors.RESET}                                            {Colors.BRIGHT_CYAN}│{Colors.RESET}")
 
-                # Color based on P&L
-                pnl_color = Colors.BRIGHT_GREEN if unrealized_pnl > 0 else Colors.BRIGHT_RED
-
-                # ML confidence if stored
-                ml_str = ""
-                if position.ml_confidence:
-                    ml_str = f" | ML: {position.ml_confidence:.0%}"
-
-                # Show settlement indicator for expired markets
-                settled_str = " [SETTLING]" if time_remaining <= 0 else ""
-
+        # Log API-discovered positions (if any not already tracked)
+        tracked_assets = [p.market.asset for p in positions.values() if hasattr(p, 'market')]
+        untracked_api = {k: v for k, v in api_positions.items() if k not in tracked_assets}
+        if untracked_api:
+            logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * 64}┤{Colors.RESET}")
+            logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  🔗 API Positions (untracked):                                   {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+            for asset, pos_info in untracked_api.items():
                 logger.info(
-                    f"   📍 {asset} {side}: {position.shares:.1f} @ {position.entry_price:.2f} → "
-                    f"{current_market_price:.2f} | {pnl_color}P&L: ${unrealized_pnl:+.2f} ({pnl_pct:+.0%}){Colors.RESET} | "
-                    f"Time: {time_remaining:.0f}s{settled_str}{win_prob_str}{ml_str}"
-                )
-            else:
-                logger.info(
-                    f"   📍 {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} | "
-                    f"(no price data){win_prob_str}"
-                )
-
-        # Log API-discovered positions (if any)
-        for asset, pos_info in api_positions.items():
-            # Check if already logged as tracked position
-            tracked_assets = [p.market.asset for p in positions.values() if hasattr(p, 'market')]
-            if asset not in tracked_assets:
-                logger.info(
-                    f"   🔍 {asset} (API): {pos_info.get('size', 0):.1f} shares @ "
-                    f"${pos_info.get('price', 0):.2f} | Market: {pos_info.get('market', 'unknown')}"
+                    f"{Colors.BRIGHT_CYAN}│{Colors.RESET}     {asset}: {pos_info.get('size', 0):.1f} shares @ "
+                    f"${pos_info.get('price', 0):.2f}                                {Colors.BRIGHT_CYAN}│{Colors.RESET}"
                 )
 
         # Log pending orders
-        for order_id, order_data in pending_orders.items():
-            asset = order_data.get("asset", "???")
-            side = order_data.get("side", "???")
-            size = order_data.get("size", 0)
-            logger.info(f"   ⏳ {asset} {side}: PENDING | {size:.1f} shares | Order: {order_id[:8]}...")
+        if pending_orders:
+            logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * 64}┤{Colors.RESET}")
+            logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  ⏳ Pending Orders:                                               {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+            for order_id, order_data in pending_orders.items():
+                asset = order_data.get("asset", "???")
+                side = order_data.get("side", "???")
+                size = order_data.get("size", 0)
+                logger.info(
+                    f"{Colors.BRIGHT_CYAN}│{Colors.RESET}     {asset} {side}: {size:.1f} shares │ "
+                    f"Order: {order_id[:12]}...                   {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+                )
 
         # Log active cooldowns
         active_cooldowns = []
@@ -2725,7 +2756,12 @@ class TradingBot:
                 active_cooldowns.append(f"{asset}:{remaining:.0f}s")
 
         if active_cooldowns:
-            logger.info(f"   ⏱️  Cooldowns: {', '.join(active_cooldowns)}")
+            logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * 64}┤{Colors.RESET}")
+            cooldown_str = ", ".join(active_cooldowns)
+            logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  ⏱️  Cooldowns: {cooldown_str:<48}{Colors.BRIGHT_CYAN}│{Colors.RESET}")
+
+        # Box footer
+        logger.info(f"{Colors.BRIGHT_CYAN}└{'─' * 64}┘{Colors.RESET}")
 
     def _has_active_position(self, asset: str) -> bool:
         """
