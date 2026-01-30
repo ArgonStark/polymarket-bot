@@ -6,10 +6,10 @@ Fetches their 15-min crypto trades and feeds WIN/LOSS outcomes to the ML model.
 This lets your ML learn from successful traders instead of your own trades.
 
 Usage:
-    python scripts/learn_from_trader.py <wallet_address> [--limit 500] [--dry-run]
+    python scripts/learn_from_trader.py <wallet_address> [--limit 5000] [--dry-run]
 
 Example:
-    python scripts/learn_from_trader.py 0x1234...abcd --limit 200
+    python scripts/learn_from_trader.py 0x1234...abcd --limit 5000
 """
 
 import os
@@ -23,13 +23,13 @@ from src.strategy.ml_predictor import get_ml_predictor
 from src.models import Side
 
 
-def learn_from_trader(wallet: str, limit: int = 500, dry_run: bool = False):
+def learn_from_trader(wallet: str, limit: int = 5000, dry_run: bool = False):
     """
     Fetch a trader's 15-min crypto trades and train ML on their outcomes.
 
     Args:
         wallet: Trader's wallet address (0x...)
-        limit: Max trades to fetch
+        limit: Max trades to fetch (default 5000 for more training data)
         dry_run: If True, show what would be learned without saving
     """
     print("\n" + "=" * 70)
@@ -38,6 +38,7 @@ def learn_from_trader(wallet: str, limit: int = 500, dry_run: bool = False):
     print("=" * 70 + "\n")
 
     print(f"Wallet: {wallet}")
+    print(f"Limit: {limit} trades")
     print(f"Mode: {'DRY RUN (no changes)' if dry_run else 'LIVE (will update ML)'}\n")
 
     data_api = get_data_api()
@@ -46,9 +47,11 @@ def learn_from_trader(wallet: str, limit: int = 500, dry_run: bool = False):
     initial_samples = ml_predictor.training_samples
     print(f"ML Model: {initial_samples} existing samples\n")
 
-    # Fetch closed positions
-    print("Fetching trader's closed positions...")
+    # Fetch closed positions with progress
+    print(f"Fetching trader's closed positions (up to {limit})...")
+    print("This may take a while for large datasets...\n")
     closed = data_api.get_all_closed_positions(wallet, max_positions=limit)
+    print(f"✓ Fetched {len(closed)} positions\n")
 
     if not closed:
         print("❌ No closed positions found for this wallet")
@@ -61,6 +64,7 @@ def learn_from_trader(wallet: str, limit: int = 500, dry_run: bool = False):
     wins = 0
     losses = 0
     skipped = 0
+    total_pnl = 0.0
 
     print("-" * 70)
     print("Processing 15-min crypto trades...")
@@ -108,65 +112,96 @@ def learn_from_trader(wallet: str, limit: int = 500, dry_run: bool = False):
                 skipped += 1
                 continue
 
+            # Extract meaningful features from available data
+            # 1. Entry price deviation from 0.50 (market mid-point)
+            #    - Price < 0.50 means betting on underdog
+            #    - Price > 0.50 means betting on favorite
+            price_deviation = avg_price - 0.50  # -0.5 to +0.5
+
+            # 2. Estimate edge based on entry price
+            #    - If won at low price, had good edge
+            #    - If lost at high price, had bad edge
+            estimated_edge = (1.0 - avg_price) if won else (avg_price - 1.0)
+            estimated_edge = max(0.01, min(0.50, abs(estimated_edge)))
+
+            # 3. Position sizing (normalize by typical size)
+            position_size_normalized = min(size / 100, 1.0)
+
+            # 4. Price momentum inference
+            #    - UP winners likely had upward momentum
+            #    - DOWN winners likely had downward momentum
+            inferred_momentum = 0.2 if (side == Side.UP and won) or (side == Side.DOWN and not won) else -0.2
+
+            # 5. Infer volatility from entry price
+            #    - Prices near 0.50 suggest high uncertainty/volatility
+            #    - Prices near 0 or 1 suggest low volatility
+            inferred_volatility = 0.5 - abs(price_deviation)  # 0 to 0.5
+            inferred_volatility = max(0.01, inferred_volatility * 0.1)
+
+            # 6. Distance from fair value (0.50)
+            distance_from_fair = abs(price_deviation)
+
             # Create a fake signal/market for ML recording
             fake_market = SimpleNamespace(
                 asset=asset,
                 condition_id=pos.get("conditionId", ""),
-                time_remaining=0,
-                target_price=avg_price,  # Approximate
+                time_remaining=450,  # Mid-market assumption
+                target_price=1.0,  # Normalized
                 best_bid=avg_price - 0.01,
                 best_ask=avg_price + 0.01,
-                bid_depth=1000,
-                ask_depth=1000,
+                bid_depth=1000 * position_size_normalized,
+                ask_depth=1000 * position_size_normalized,
             )
 
             fake_signal = SimpleNamespace(
                 market=fake_market,
                 side=side,
-                edge=0.05 if won else 0.02,  # Approximate edge
+                edge=estimated_edge,
                 recommended_price=avg_price,
                 size_shares=size,
                 size_usd=size * avg_price,
-                time_remaining=450,  # Mid-market
-                _arb_type="learned",  # Mark as learned from trader
+                time_remaining=450,
+                _arb_type="learned",
             )
 
-            # Display
+            # Display (show first 20 and every 100th for large datasets)
             result = "WIN" if won else "LOSS"
             color = "\033[92m" if won else "\033[91m"
             reset = "\033[0m"
             emoji = "▲" if side == Side.UP else "▼"
 
-            print(f"  [{synced_count+1:3d}] {asset} {emoji} {side.value:4} @ {avg_price:.4f} | {color}{result:4}{reset} | ${pnl:+.2f}")
+            if synced_count < 20 or synced_count % 100 == 0:
+                print(f"  [{synced_count+1:4d}] {asset} {emoji} {side.value:4} @ {avg_price:.4f} | {color}{result:4}{reset} | ${pnl:+.2f} | edge:{estimated_edge:.0%}")
 
             if won:
                 wins += 1
             else:
                 losses += 1
+            total_pnl += pnl
 
-            # Record to ML model
+            # Record to ML model with enhanced features
             if not dry_run:
                 ml_predictor.record_outcome(
                     signal=fake_signal,
-                    volatility=0.01,  # Default volatility
-                    price_momentum=0.1 if won else -0.1,
+                    volatility=inferred_volatility,
+                    price_momentum=inferred_momentum,
                     won=won,
                     arb_type="learned",
                     spread=0.02,
-                    bid_depth=1000,
-                    ask_depth=1000,
-                    price_trend=0.1 if side == Side.UP else -0.1,
-                    distance_from_target=0.0,
-                    binance_lead_pct=0.0,
-                    binance_confirmation="NONE",
-                    trend_1h=0.0,
-                    trend_4h=0.0,
-                    trend_1d=0.0,
+                    bid_depth=1000 * position_size_normalized,
+                    ask_depth=1000 * position_size_normalized,
+                    price_trend=inferred_momentum * 0.5,
+                    distance_from_target=distance_from_fair,
+                    binance_lead_pct=inferred_momentum * 0.005,
+                    binance_confirmation="MEDIUM" if abs(inferred_momentum) > 0.1 else "NONE",
+                    trend_1h=inferred_momentum * 0.3,
+                    trend_4h=inferred_momentum * 0.2,
+                    trend_1d=inferred_momentum * 0.1,
                     current_price=avg_price,
-                    target_price=avg_price,
-                    price_high=avg_price * 1.01,
-                    price_low=avg_price * 0.99,
-                    price_velocity=0.001,
+                    target_price=0.50,  # Fair value
+                    price_high=avg_price + inferred_volatility,
+                    price_low=avg_price - inferred_volatility,
+                    price_velocity=abs(inferred_momentum) * 0.01,
                 )
 
             synced_count += 1
@@ -183,9 +218,17 @@ def learn_from_trader(wallet: str, limit: int = 500, dry_run: bool = False):
 
     if synced_count > 0:
         win_rate = wins / synced_count * 100
+        avg_pnl = total_pnl / synced_count
+
+        # Color for profit
+        pnl_color = "\033[92m" if total_pnl >= 0 else "\033[91m"
+        reset = "\033[0m"
+
         print(f"\n  Trades processed: {synced_count}")
         print(f"  Wins: {wins} | Losses: {losses}")
         print(f"  Win rate: {win_rate:.1f}%")
+        print(f"  {pnl_color}Total Profit: ${total_pnl:+,.2f}{reset}")
+        print(f"  Avg P&L/trade: ${avg_pnl:+.2f}")
         print(f"  Skipped: {skipped}")
 
         if not dry_run:
@@ -203,7 +246,7 @@ def learn_from_trader(wallet: str, limit: int = 500, dry_run: bool = False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Learn from a successful Polymarket trader")
     parser.add_argument("wallet", help="Trader's wallet address (0x...)")
-    parser.add_argument("--limit", type=int, default=500, help="Max trades to fetch (default: 500)")
+    parser.add_argument("--limit", type=int, default=5000, help="Max trades to fetch (default: 5000)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be learned without saving")
 
     args = parser.parse_args()
