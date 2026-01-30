@@ -24,12 +24,33 @@ from ..config import BotConfig
 logger = logging.getLogger(__name__)
 
 # Binance symbol mapping for Polymarket's crypto_prices topic
-# Polymarket uses lowercase concatenated format: "btcusdt", "ethusdt", etc.
+# Handle various formats that Polymarket might use
 BINANCE_SYMBOL_MAP = {
+    # Standard format: lowercase concatenated
     "btcusdt": "BTC",
     "ethusdt": "ETH",
     "solusdt": "SOL",
     "xrpusdt": "XRP",
+    # Uppercase format
+    "BTCUSDT": "BTC",
+    "ETHUSDT": "ETH",
+    "SOLUSDT": "SOL",
+    "XRPUSDT": "XRP",
+    # Slash format
+    "btc/usdt": "BTC",
+    "eth/usdt": "ETH",
+    "sol/usdt": "SOL",
+    "xrp/usdt": "XRP",
+    # Dash format
+    "btc-usdt": "BTC",
+    "eth-usdt": "ETH",
+    "sol-usdt": "SOL",
+    "xrp-usdt": "XRP",
+    # Just the asset (in case Polymarket only sends base asset)
+    "btc": "BTC",
+    "eth": "ETH",
+    "sol": "SOL",
+    "xrp": "XRP",
 }
 
 
@@ -53,6 +74,7 @@ class ChainlinkFeed:
     _binance_timestamps: dict[str, datetime] = field(default_factory=dict)
     _price_history: dict[str, PriceHistory] = field(default_factory=dict)
     _connected: bool = False
+    _binance_feed_confirmed: bool = False  # Track if we've received any Binance prices
     _reconnect_delay: float = field(init=False)
     _max_reconnect_delay: float = field(init=False)
     _max_retries: int = field(init=False)
@@ -125,19 +147,19 @@ class ChainlinkFeed:
         self._retry_count = 0  # Reset retry count on successful connection
 
         # Subscribe to both Chainlink and Binance crypto prices
-        # Note: filters must be valid JSON (array or object), not comma-separated string
+        # Note: filters must be actual arrays/objects (not JSON strings) - json.dumps handles serialization
         subscribe_msg = {
             "action": "subscribe",
             "subscriptions": [
                 {
                     "topic": self.config.endpoints.chainlink_topic,
                     "type": "*",
-                    "filters": "",  # All symbols
+                    "filters": [],  # All symbols (empty array, not empty string)
                 },
                 {
                     "topic": "crypto_prices",  # Binance prices via Polymarket
                     "type": "update",
-                    "filters": '["btcusdt","ethusdt","solusdt","xrpusdt"]',  # JSON array format
+                    "filters": ["btcusdt", "ethusdt", "solusdt", "xrpusdt"],  # Actual array, not JSON string
                 }
             ],
         }
@@ -197,14 +219,38 @@ class ChainlinkFeed:
 
             # Handle Binance prices (via Polymarket's crypto_prices topic)
             elif topic == "crypto_prices":
+                # Try multiple payload structures - Polymarket API may vary
                 payload = data.get("payload", {})
-                binance_symbol = payload.get("symbol")  # e.g., "btcusdt"
-                price = payload.get("value") or payload.get("price")
-                timestamp_ms = payload.get("timestamp")
+
+                # If payload is empty, the data might be at the top level
+                if not payload:
+                    payload = data
+
+                # Try various field names for symbol
+                binance_symbol = (
+                    payload.get("symbol") or
+                    payload.get("s") or
+                    payload.get("pair") or
+                    data.get("symbol")
+                )
+
+                # Try various field names for price
+                price = (
+                    payload.get("value") or
+                    payload.get("price") or
+                    payload.get("c") or  # Binance "close" price
+                    payload.get("last") or
+                    data.get("value") or
+                    data.get("price")
+                )
+
+                timestamp_ms = payload.get("timestamp") or payload.get("E") or data.get("timestamp")
 
                 if binance_symbol and price is not None:
-                    # Map Binance symbol to asset
-                    asset = BINANCE_SYMBOL_MAP.get(binance_symbol.lower())
+                    # Map Binance symbol to asset (handle various formats)
+                    symbol_lower = str(binance_symbol).lower().replace("/", "").replace("-", "")
+                    asset = BINANCE_SYMBOL_MAP.get(symbol_lower)
+
                     if asset:
                         self._binance_prices[asset] = float(price)
 
@@ -217,7 +263,18 @@ class ChainlinkFeed:
                             timestamp = datetime.now(timezone.utc)
                         self._binance_timestamps[asset] = timestamp
 
+                        # Log confirmation when we first receive Binance prices
+                        if not self._binance_feed_confirmed:
+                            self._binance_feed_confirmed = True
+                            logger.info(f"✅ Binance price feed active: {asset} = ${float(price):,.2f}")
+
                         logger.debug(f"Binance: {asset} = ${float(price):,.2f}")
+                    else:
+                        # Log unknown symbols for debugging
+                        logger.debug(f"Binance unknown symbol: {binance_symbol}")
+                else:
+                    # Log malformed messages for debugging
+                    logger.debug(f"Binance malformed message: symbol={binance_symbol}, price={price}, data_keys={list(data.keys())}")
 
             elif data.get("type") == "subscribed":
                 logger.info(f"Successfully subscribed: {data}")

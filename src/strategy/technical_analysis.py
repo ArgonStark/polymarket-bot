@@ -597,11 +597,15 @@ class SmartTrendFollower:
     """
     Smart trend-following strategy for 15-minute markets.
 
-    Key Logic:
-    - Analyzes multi-timeframe trends
-    - If trend is UP and price < target → BET YES (will cross up)
-    - If trend is DOWN and price > target → BET NO (will cross down)
-    - Only trades WITH the trend, never against it
+    Key Logic (BOOST ONLY - no blocking):
+    - Analyzes multi-timeframe trends (1m, 5m, 15m, 1h)
+    - BOOSTS trades that align with the trend
+    - ALLOWS trades against trend (no boost, reduced confidence)
+    - Does NOT block trades - that's handled by TrendProtection (1h/4h/1d)
+
+    NOTE: This system uses short-term analysis (1m-1h) while TrendProtection
+    uses longer-term analysis (1h-1d). They can show different trends!
+    To avoid contradictions, this system only boosts, never blocks.
     """
 
     def __init__(self):
@@ -673,13 +677,14 @@ class SmartTrendFollower:
                     technical_signal=tech_signal,
                 )
             else:
-                # Original says DOWN but trend is UP - BLOCK
+                # Original says DOWN but short-term trend is UP - allow but no boost
+                # (TrendProtection handles long-term blocking)
                 return SmartTradingDecision(
-                    should_trade=False,
-                    side="NONE",
+                    should_trade=True,
+                    side=original_side,
                     edge_boost=0.0,
-                    confidence=0.0,
-                    reason=f"BLOCKED: Original=DOWN but trend is UP ({tech_signal.trend_score:.2f})",
+                    confidence=0.3,
+                    reason=f"Short-term UP trend ({tech_signal.trend_score:.2f}) - no boost for DOWN",
                     technical_signal=tech_signal,
                 )
 
@@ -697,34 +702,36 @@ class SmartTrendFollower:
                     technical_signal=tech_signal,
                 )
             else:
-                # Original says UP but trend is DOWN - BLOCK
+                # Original says UP but short-term trend is DOWN - allow but no boost
+                # (TrendProtection handles long-term blocking)
                 return SmartTradingDecision(
-                    should_trade=False,
-                    side="NONE",
+                    should_trade=True,
+                    side=original_side,
                     edge_boost=0.0,
-                    confidence=0.0,
-                    reason=f"BLOCKED: Original=UP but trend is DOWN ({tech_signal.trend_score:.2f})",
+                    confidence=0.3,
+                    reason=f"Short-term DOWN trend ({tech_signal.trend_score:.2f}) - no boost for UP",
                     technical_signal=tech_signal,
                 )
 
-        # Scenario 3: Trading AGAINST the trend - BLOCK or reduce confidence
+        # Scenario 3: Trading AGAINST the trend - allow but reduce confidence (no boost)
+        # Note: TrendProtection handles long-term blocking, we only handle short-term boosts
         if trend_is_bullish and original_side == "DOWN":
             return SmartTradingDecision(
-                should_trade=False,
-                side="NONE",
+                should_trade=True,
+                side=original_side,
                 edge_boost=0.0,
-                confidence=0.0,
-                reason=f"BLOCKED: Betting DOWN against UP trend ({tech_signal.trend_score:.2f})",
+                confidence=0.3,
+                reason=f"Against short-term UP trend ({tech_signal.trend_score:.2f}) - no boost",
                 technical_signal=tech_signal,
             )
 
         if trend_is_bearish and original_side == "UP":
             return SmartTradingDecision(
-                should_trade=False,
-                side="NONE",
+                should_trade=True,
+                side=original_side,
                 edge_boost=0.0,
-                confidence=0.0,
-                reason=f"BLOCKED: Betting UP against DOWN trend ({tech_signal.trend_score:.2f})",
+                confidence=0.3,
+                reason=f"Against short-term DOWN trend ({tech_signal.trend_score:.2f}) - no boost",
                 technical_signal=tech_signal,
             )
 
