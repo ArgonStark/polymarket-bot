@@ -120,6 +120,10 @@ class TradingBot:
         self._order_check_interval = 5.0  # Check pending orders every 5 seconds
         self.last_order_check = None
 
+        # Thread-safe locks for concurrent access to shared dictionaries
+        self._pending_orders_lock = asyncio.Lock()
+        self._last_order_time_lock = asyncio.Lock()
+
         # Timing trackers
         self.last_market_refresh = None
         self.last_settlement_check = None

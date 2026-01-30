@@ -277,12 +277,14 @@ class SimpleNeuralNetwork:
     Simple 2-layer neural network for online learning.
     More powerful than logistic regression, adapts to new patterns.
 
-    Architecture: Input(11) -> Hidden(16) -> Output(1)
+    Architecture: Input(33) -> Hidden(32) -> Output(1)
     Uses ReLU activation and online gradient descent.
+
+    FIXED: Now uses all 33 features from TradeFeatures.to_vector()
     """
-    input_size: int = 11  # Simplified features for trader model
-    hidden_size: int = 16
-    learning_rate: float = 0.05
+    input_size: int = 33  # Full feature vector (matching TradeFeatures.to_vector())
+    hidden_size: int = 32  # Larger hidden layer for more features
+    learning_rate: float = 0.03  # Slightly lower for stability
 
     # Weights
     weights_ih: list[list[float]] = field(default_factory=list)  # Input -> Hidden
@@ -537,43 +539,39 @@ class HybridPredictor:
         Args:
             signal: Trading signal
             market: Market state
-            full_features: Full 29-feature vector (used as fallback)
+            full_features: Full 33-feature vector
 
         Returns:
             Combined probability estimate
         """
-        # Extract simple features for both models (same format)
-        simple_features = self.trader_model.extract_simple_features(signal, market)
+        # Use full 33-feature vector for adaptive model (neural network)
+        # This ensures the model learns from ALL available information
 
-        # Get base prediction from trader model
+        # Get base prediction from trader model (uses 11 simple features)
         if self.trader_model.is_loaded:
+            simple_features = self.trader_model.extract_simple_features(signal, market)
             base_prob = self.trader_model.predict_proba(simple_features)
         else:
             base_prob = 0.5
 
-        # Get adaptive prediction using SAME features as trader model
-        # This ensures both models learn the same patterns
-        adaptive_prob = self.adaptive_model.predict_proba(simple_features)
+        # Get adaptive prediction using FULL 33-feature vector
+        # The neural network now has input_size=33 to handle this
+        adaptive_prob = self.adaptive_model.predict_proba(full_features)
 
         # Combine predictions
         if self.trader_model.is_loaded:
             combined = self.base_weight * base_prob + (1 - self.base_weight) * adaptive_prob
         else:
-            # If no trader model, use only adaptive
+            # If no trader model, use only adaptive (with full features)
             combined = adaptive_prob
 
         return combined
 
     def update(self, features: list[float], outcome: int, signal=None, market=None):
         """Update adaptive model with new outcome."""
-        # Only update adaptive model (trader model is static)
-        # Use same feature format as prediction for consistency
-        if signal is not None and market is not None:
-            adaptive_features = self.trader_model.extract_simple_features(signal, market)
-        else:
-            # Fallback to first 11 features if signal/market not provided
-            adaptive_features = features[:11] if len(features) >= 11 else features
-        self.adaptive_model.update(adaptive_features, outcome)
+        # Update adaptive model with FULL 33-feature vector
+        # This ensures training and prediction use the same feature space
+        self.adaptive_model.update(features, outcome)
         self.training_samples += 1
 
     def to_dict(self) -> dict:
