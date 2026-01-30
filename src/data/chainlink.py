@@ -147,19 +147,21 @@ class ChainlinkFeed:
         self._retry_count = 0  # Reset retry count on successful connection
 
         # Subscribe to both Chainlink and Binance crypto prices
-        # Note: filters must be actual arrays/objects (not JSON strings) - json.dumps handles serialization
+        # Per Polymarket docs: https://docs.polymarket.com/developers/RTDS/RTDS-crypto-prices
+        # - Binance filters: comma-separated string (e.g., "btcusdt,ethusdt,solusdt,xrpusdt")
+        # - Chainlink filters: omit or empty string for all symbols
         subscribe_msg = {
             "action": "subscribe",
             "subscriptions": [
                 {
                     "topic": self.config.endpoints.chainlink_topic,
                     "type": "*",
-                    "filters": [],  # All symbols (empty array, not empty string)
+                    # No filters = subscribe to all Chainlink symbols
                 },
                 {
                     "topic": "crypto_prices",  # Binance prices via Polymarket
                     "type": "update",
-                    "filters": ["btcusdt", "ethusdt", "solusdt", "xrpusdt"],  # Actual array, not JSON string
+                    "filters": "btcusdt,ethusdt,solusdt,xrpusdt",  # Comma-separated string per docs
                 }
             ],
         }
