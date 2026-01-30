@@ -89,14 +89,16 @@ class TradeFeatures:
     def to_vector(self) -> list[float]:
         """Convert to feature vector for model (33 features total)."""
         # Normalize features to roughly 0-1 range
+        # NOTE: hour_of_day and day_of_week are set to neutral (0.5) because
+        # they don't predict crypto price direction - they're just noise.
         vector = [
             # Core features (6)
             max(0.0, min(self.edge * 10, 1.0)),  # edge 0.1 -> 1.0, clamp negatives to 0
             min(self.time_remaining / 900, 1.0),  # 900s -> 1.0
             min(self.volatility * 100, 1.0),  # 0.01 -> 1.0
             (self.price_momentum + 1) / 2,  # -1,1 -> 0,1
-            self.hour_of_day / 24,
-            self.day_of_week / 7,
+            0.5,  # hour_of_day - NEUTRALIZED (doesn't predict price direction)
+            0.5,  # day_of_week - NEUTRALIZED (doesn't predict price direction)
             # Asset one-hot (4)
             1.0 if self.asset == "BTC" else 0.0,
             1.0 if self.asset == "ETH" else 0.0,
@@ -518,12 +520,17 @@ class HybridPredictor:
     1. Random Forest (pre-trained on successful trader)
     2. Neural Network (online learning from your trades)
 
-    The combination provides stable base predictions while
-    adapting to current market conditions.
+    IMPORTANT: The Random Forest uses features that predict "did the trader
+    make money" but NOT "will the price go up or down". Features like hour,
+    day, bet size don't predict price direction.
+
+    We use ADAPTIVE WEIGHTING that reduces RF influence over time as the
+    Neural Network learns from actual trade outcomes.
     """
 
-    # Base model weight (0.7 = 70% base, 30% adaptive)
-    base_weight: float = 0.7
+    # Base model weight - NOW ADAPTIVE (see _get_adaptive_weight)
+    # Starting at 0.5 (50/50) since RF features are questionable
+    base_weight: float = 0.5
 
     # Models
     trader_model: TraderModelLoader = field(default_factory=TraderModelLoader)
@@ -534,6 +541,32 @@ class HybridPredictor:
     correct_predictions: int = 0
     training_samples: int = 0
 
+    def _get_adaptive_weight(self) -> float:
+        """
+        Get adaptive weight for base (Random Forest) model.
+
+        The RF model uses features that don't predict price direction well
+        (hour, day, bet size). As we collect more training data, we should
+        rely more on the Neural Network which learns from actual outcomes.
+
+        Returns:
+            Weight for base model (0.0 to 0.5)
+        """
+        samples = self.training_samples
+
+        if samples < 20:
+            # Very early: 50% RF, 50% NN (equal weight, both uncertain)
+            return 0.5
+        elif samples < 50:
+            # Early: 40% RF, 60% NN (NN starting to learn)
+            return 0.4
+        elif samples < 100:
+            # Medium: 30% RF, 70% NN (NN has meaningful data)
+            return 0.3
+        else:
+            # Mature: 20% RF, 80% NN (trust learned patterns)
+            return 0.2
+
     def predict_proba(self, signal, market, full_features: list[float]) -> float:
         """
         Predict win probability using hybrid approach.
@@ -541,13 +574,13 @@ class HybridPredictor:
         Args:
             signal: Trading signal
             market: Market state
-            full_features: Full 33-feature vector
+            full_features: Full feature vector
 
         Returns:
             Combined probability estimate
         """
-        # Use full 33-feature vector for adaptive model (neural network)
-        # This ensures the model learns from ALL available information
+        # Get adaptive weight based on training samples
+        rf_weight = self._get_adaptive_weight()
 
         # Get base prediction from trader model (uses 11 simple features)
         if self.trader_model.is_loaded:
@@ -556,15 +589,14 @@ class HybridPredictor:
         else:
             base_prob = 0.5
 
-        # Get adaptive prediction using FULL 33-feature vector
-        # The neural network now has input_size=33 to handle this
+        # Get adaptive prediction using full feature vector
         adaptive_prob = self.adaptive_model.predict_proba(full_features)
 
-        # Combine predictions
+        # Combine predictions with adaptive weighting
         if self.trader_model.is_loaded:
-            combined = self.base_weight * base_prob + (1 - self.base_weight) * adaptive_prob
+            combined = rf_weight * base_prob + (1 - rf_weight) * adaptive_prob
         else:
-            # If no trader model, use only adaptive (with full features)
+            # If no trader model, use only adaptive
             combined = adaptive_prob
 
         return combined
@@ -755,24 +787,27 @@ class MLSignalPredictor:
 
         Uses a gradual ramp-up to collect more diverse training data
         before applying strict filtering:
-        - 0-50 samples: Learning mode (allow all) - extended for API sync learning
-        - 50-75 samples: 35% threshold (very lenient)
-        - 75-100 samples: 40% threshold (lenient)
-        - 100+ samples: 45% threshold (moderate)
+        - 0-30 samples: Learning mode (allow all) - reduced for faster learning
+        - 30-50 samples: 50% threshold (coin flip minimum)
+        - 50-75 samples: 52% threshold (slight edge required)
+        - 75+ samples: 55% threshold (meaningful edge required)
+
+        IMPORTANT: A threshold below 50% means trading when the model
+        predicts you'll LOSE more often than win. That's irrational.
 
         Returns:
             Current confidence threshold (0.0 to 1.0)
         """
         samples = self.training_samples
 
-        if samples < 50:
-            return 0.0  # Learning mode - allow all (extended for API sync)
+        if samples < 30:
+            return 0.0  # Learning mode - allow all (reduced window)
+        elif samples < 50:
+            return 0.50  # Minimum: don't trade if model predicts loss
         elif samples < 75:
-            return 0.35  # Early filtering - 35%
-        elif samples < 100:
-            return 0.40  # Medium filtering - 40%
+            return 0.52  # Require slight predicted edge
         else:
-            return 0.45  # Full filtering - 45%
+            return 0.55  # Require meaningful predicted edge
 
     def should_trade(
         self,
@@ -790,18 +825,21 @@ class MLSignalPredictor:
         trend_1h: float = 0.0,
         trend_4h: float = 0.0,
         trend_1d: float = 0.0,
+        current_price: float = 0.0,
+        target_price: float = 0.0,
     ) -> tuple[bool, float, str]:
         """
         Decide if we should take this trade based on ML prediction.
 
-        Uses gradual threshold ramp-up (lenient settings for more trades):
-        - 0-50 samples: Learning mode (allow all)
-        - 50-75 samples: 35% threshold
-        - 75-100 samples: 40% threshold
-        - 100+ samples: 45% threshold
+        Uses gradual threshold ramp-up:
+        - 0-30 samples: Learning mode (allow all)
+        - 30-50 samples: 50% threshold (minimum: don't predict loss)
+        - 50-75 samples: 52% threshold (slight edge)
+        - 75+ samples: 55% threshold (meaningful edge)
 
-        Strong signals bypass ML filtering:
-        - STRONG Binance confirmation with arbitrage signal
+        SANITY CHECKS (applied before ML):
+        - Don't bet DOWN if price is already significantly above target
+        - Don't bet UP if price is already significantly below target
 
         Args:
             signal: Trading signal
@@ -818,10 +856,39 @@ class MLSignalPredictor:
             trend_1h: 1-hour price trend (-1 to +1)
             trend_4h: 4-hour price trend (-1 to +1)
             trend_1d: 1-day price trend (-1 to +1)
+            current_price: Current asset price (e.g., from Chainlink)
+            target_price: Target price for the market
 
         Returns:
             Tuple of (should_trade, confidence, reason)
         """
+        # Get market from signal
+        market = getattr(signal, 'market', None)
+        side = getattr(signal, 'side', None)
+        side_value = side.value if side else "UNKNOWN"
+
+        # Try to get prices from market if not provided
+        if current_price == 0.0 and market:
+            current_price = getattr(market, 'current_price', 0.0)
+        if target_price == 0.0 and market:
+            target_price = getattr(market, 'target_price', 0.0)
+
+        # ============================================================
+        # SANITY CHECK: Block trades where price already crossed target
+        # ============================================================
+        if current_price > 0 and target_price > 0:
+            price_above_target_pct = (current_price - target_price) / target_price * 100
+
+            # Block DOWN bets if price is already significantly above target
+            # (price needs to DROP to win, but it's already above - bad bet)
+            if side_value == "DOWN" and price_above_target_pct > 0.15:
+                return (False, 0.0, f"SANITY BLOCK: Price ${current_price:,.0f} is {price_above_target_pct:.2f}% ABOVE target ${target_price:,.0f} - DOWN bet would likely lose")
+
+            # Block UP bets if price is already significantly below target
+            # (price needs to STAY ABOVE to win, but it's already below - bad bet)
+            if side_value == "UP" and price_above_target_pct < -0.15:
+                return (False, 0.0, f"SANITY BLOCK: Price ${current_price:,.0f} is {abs(price_above_target_pct):.2f}% BELOW target ${target_price:,.0f} - UP bet would likely lose")
+
         # Get current threshold based on training samples
         threshold = self._get_gradual_threshold()
 
@@ -836,8 +903,6 @@ class MLSignalPredictor:
 
         # Use hybrid predictor if available, otherwise use logistic regression
         if self.use_hybrid and self.hybrid_predictor is not None:
-            # Get market from signal for hybrid predictor
-            market = getattr(signal, 'market', None)
             confidence = self.hybrid_predictor.predict_proba(signal, market, feature_vector)
             model_type = "Hybrid" if self.hybrid_predictor.trader_model.is_loaded else "NN"
         else:
@@ -848,15 +913,9 @@ class MLSignalPredictor:
         arb_info = f" [ARB: {arb_type}]" if arb_type != "none" else ""
         bn_info = f" [BN: {binance_confirmation}]" if binance_confirmation != "NONE" else ""
 
-        # Strong signal bypass: STRONG Binance confirmation with arbitrage
-        # These are high-quality signals that shouldn't be blocked by ML
-        is_strong_signal = (
-            binance_confirmation == "STRONG" and
-            arb_type in ("asymmetric", "binary_arb")
-        )
-
-        if is_strong_signal:
-            return (True, confidence, f"{model_type} BYPASS (strong signal): {confidence:.0%}{arb_info}{bn_info}")
+        # NOTE: Removed "strong signal bypass" - ML predictions should ALWAYS be respected
+        # A 40% confidence means the model predicts you'll LOSE 60% of the time
+        # Bypassing that because of "strong signal" is irrational
 
         if confidence < threshold:
             return (False, confidence, f"{model_type} rejected: {confidence:.0%} < {threshold:.0%}{arb_info}{bn_info}")
@@ -1281,4 +1340,7 @@ def extract_ml_features_from_market(
         "trend_1h": trend_1h,
         "trend_4h": trend_4h,
         "trend_1d": trend_1d,
+        # NEW: Pass current and target price for sanity checks
+        "current_price": current_price or 0.0,
+        "target_price": market.target_price if market else 0.0,
     }
