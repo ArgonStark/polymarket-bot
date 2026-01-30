@@ -1972,9 +1972,44 @@ class TradingBot:
             total_trades_found = 0
             crypto_trades_found = 0
 
+            # === Method 0: CLOB Trades (direct from order book - most reliable) ===
+            try:
+                clob_trades = get_trades(self.client, limit=500)
+                logger.info(f"🤖 ML Sync: Found {len(clob_trades)} CLOB trades")
+
+                # Log sample trade for debugging
+                if clob_trades and len(clob_trades) > 0:
+                    sample = clob_trades[0]
+                    logger.debug(
+                        f"🤖 CLOB Sample: id={sample.get('id', '')[:20]}... "
+                        f"market={sample.get('market', '')[:20]}... "
+                        f"side={sample.get('side')} price={sample.get('price')} "
+                        f"size={sample.get('size')} outcome={sample.get('outcome')}"
+                    )
+
+                for trade in clob_trades:
+                    result = self._process_clob_trade_for_ml(trade)
+                    if result == "synced":
+                        synced_count += 1
+                        crypto_trades_found += 1
+                    elif result == "crypto":
+                        crypto_trades_found += 1
+                    total_trades_found += 1
+            except Exception as e:
+                logger.debug(f"CLOB trades fetch failed (may need L2 auth): {e}")
+
             # === Method 1: Closed Positions (completed trades with P&L) ===
             closed_positions = data_api.get_all_closed_positions(wallet_address, max_positions=500)
             logger.info(f"🤖 ML Sync: Found {len(closed_positions)} closed positions")
+
+            # Log sample for debugging
+            if closed_positions and len(closed_positions) > 0:
+                sample = closed_positions[0]
+                logger.debug(
+                    f"🤖 Closed Sample: slug={sample.get('slug', '')[:40]}... "
+                    f"outcome={sample.get('outcome')} pnl={sample.get('realizedPnl')} "
+                    f"avgPrice={sample.get('avgPrice')} totalBought={sample.get('totalBought')}"
+                )
 
             for pos in closed_positions:
                 result = self._process_trade_for_ml(pos, "closed")
@@ -1988,6 +2023,16 @@ class TradingBot:
             # === Method 2: Trade Activity (all BUY/SELL activity) ===
             trade_activity = data_api.get_all_activity(wallet_address, activity_type="TRADE", max_items=500)
             logger.info(f"🤖 ML Sync: Found {len(trade_activity)} trade activities")
+
+            # Log sample for debugging
+            if trade_activity and len(trade_activity) > 0:
+                sample = trade_activity[0]
+                logger.debug(
+                    f"🤖 Activity Sample: slug={sample.get('slug', '')[:40]}... "
+                    f"side={sample.get('side')} outcome={sample.get('outcome')} "
+                    f"price={sample.get('price')} size={sample.get('size')} "
+                    f"usdcSize={sample.get('usdcSize')}"
+                )
 
             for trade in trade_activity:
                 result = self._process_trade_for_ml(trade, "activity")
@@ -2195,6 +2240,155 @@ class TradingBot:
 
         except Exception as e:
             logger.debug(f"Error processing trade for ML: {e}")
+            return "skip"
+
+    def _process_clob_trade_for_ml(self, trade: dict) -> str:
+        """
+        Process a CLOB trade for ML learning.
+
+        CLOB trades have format:
+        {
+            "id": "trade_id",
+            "market": "condition_id",
+            "asset_id": "token_id",
+            "side": "BUY" or "SELL",
+            "size": "100.5",
+            "price": "0.55",
+            "status": "MATCHED",
+            "match_time": "1234567890",
+            "outcome": "Yes" or "No",
+            "taker_order_id": "...",
+            "maker_address": "0x...",
+            "fee_rate_bps": "0",
+            ...
+        }
+
+        Args:
+            trade: CLOB trade data
+
+        Returns:
+            "synced" if successfully synced, "crypto" if crypto but needs settlement,
+            "skip" if not a 15-min crypto trade
+        """
+        try:
+            trade_id = trade.get("id", "")
+            market_id = trade.get("market", "")
+            asset_id = trade.get("asset_id", "")
+            match_time = trade.get("match_time", "")
+
+            # Create unique key
+            trade_key = f"clob:{trade_id}:{market_id}:{match_time}"
+
+            if trade_key in self._synced_trades:
+                return "skip"
+
+            # Try to identify if this is a 15-min crypto market
+            # CLOB trades don't have slug, so we need to check the market
+            outcome = trade.get("outcome", "")
+            side_str = trade.get("side", "")
+            price = float(trade.get("price", 0) or 0)
+            size = float(trade.get("size", 0) or 0)
+
+            if price <= 0 or size <= 0:
+                return "skip"
+
+            # For CLOB trades, we need to determine the market type
+            # Check if we have this market in our known markets
+            market = self.markets.get(market_id) or self.expiring_markets.get(market_id)
+
+            asset = None
+            side = None
+
+            if market:
+                # We have market info
+                asset = market.asset
+                # Determine side from outcome
+                if outcome.lower() in ["yes", "up"]:
+                    side = Side.UP
+                elif outcome.lower() in ["no", "down"]:
+                    side = Side.DOWN
+            else:
+                # Try to identify from asset_id pattern
+                asset_id_lower = asset_id.lower()
+                for pattern, asset_name in [("btc", "BTC"), ("eth", "ETH"), ("sol", "SOL"), ("xrp", "XRP")]:
+                    if pattern in asset_id_lower:
+                        asset = asset_name
+                        break
+
+                if outcome.lower() in ["yes", "up"]:
+                    side = Side.UP
+                elif outcome.lower() in ["no", "down"]:
+                    side = Side.DOWN
+
+            if not asset or not side:
+                return "skip"
+
+            # For CLOB trades, we can't directly determine win/loss without settlement
+            # But we can track BUY trades and check if they've settled
+            if side_str == "SELL":
+                # SELL means closing position - this could be early exit or settlement
+                # Check if this was profitable (price > 0.5 for long, price < 0.5 for short)
+                # This is a heuristic since we don't have perfect info
+                if side == Side.UP:
+                    won = price > 0.5  # If we sold UP for > 0.5, likely winning
+                else:
+                    won = price < 0.5  # If we sold DOWN for < 0.5, likely winning
+            else:
+                # BUY - we need to wait for settlement to know outcome
+                # Skip for now, will be captured by closed-positions or redeem
+                return "crypto"
+
+            # Record the trade
+            asset_volatility = {
+                "BTC": 0.0035, "ETH": 0.0045,
+                "SOL": 0.0070, "XRP": 0.0060,
+            }.get(asset, 0.005)
+
+            price_momentum = 0.3 if won else -0.2
+            if side == Side.DOWN:
+                price_momentum = -price_momentum
+
+            from types import SimpleNamespace
+            fake_signal = SimpleNamespace(
+                edge=0.05 if won else 0.02,
+                market=SimpleNamespace(
+                    asset=asset,
+                    target_price=price,
+                    time_remaining=300,
+                    best_bid=price - 0.01,
+                    best_ask=price + 0.01,
+                    bid_depth=10000,
+                    ask_depth=10000,
+                ),
+                side=side,
+                _arb_type="none",
+                recommended_price=price,
+                size_shares=size,
+                size_usd=size * price,
+                time_remaining=300,
+            )
+
+            self.ml_predictor.record_outcome(
+                signal=fake_signal,
+                volatility=asset_volatility,
+                price_momentum=price_momentum,
+                won=won,
+                current_price=price,
+                target_price=price,
+                price_high=price * 1.005,
+                price_low=price * 0.995,
+                price_velocity=price_momentum * 0.001,
+            )
+
+            self._synced_trades.add(trade_key)
+
+            result_str = "WIN" if won else "LOSS"
+            logger.debug(f"🤖 ML: Synced {asset} {side.value} {result_str} from CLOB")
+
+            return "synced"
+
+        except Exception as e:
+            logger.debug(f"Error processing CLOB trade for ML: {e}")
             return "skip"
 
     async def _sync_positions_from_polymarket(self):
