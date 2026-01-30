@@ -2308,9 +2308,23 @@ class TradingBot:
             if up_book.best_ask is not None:
                 market.best_ask = up_book.best_ask
 
-            # Calculate depth
-            market.bid_depth = sum(level.size for level in up_book.bids)
-            market.ask_depth = sum(level.size for level in up_book.asks)
+            # Calculate depth - make thread-safe copies to avoid race conditions
+            # with WebSocket thread that may be modifying the orderbook
+            try:
+                bids_snapshot = list(up_book.bids)
+                asks_snapshot = list(up_book.asks)
+                # Validate sizes are numeric before summing (handle malformed data)
+                market.bid_depth = sum(
+                    level.size for level in bids_snapshot
+                    if hasattr(level, 'size') and isinstance(level.size, (int, float))
+                )
+                market.ask_depth = sum(
+                    level.size for level in asks_snapshot
+                    if hasattr(level, 'size') and isinstance(level.size, (int, float))
+                )
+            except Exception as e:
+                logger.debug(f"[{market.asset}] Orderbook depth calc error: {e}")
+                # Keep previous depth values on error
 
         market.last_updated = datetime.now(timezone.utc)
 
