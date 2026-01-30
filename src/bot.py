@@ -136,13 +136,14 @@ class TradingBot:
         # When a period boundary is crossed, we need to refresh markets with new target prices
         self._current_period_ts: int = 0  # Current 15-min period timestamp
         self._period_transition_wait_until: Optional[datetime] = None  # Wait for price data
+        self._captured_period_prices: dict[str, float] = {}  # asset -> price captured at period boundary
 
         # Intervals (seconds)
         self.settlement_check_interval = 5.0  # Check settlements frequently
         self.market_discovery_interval = 15.0  # Discover new markets every 15s
         self.balance_sync_interval = 30.0  # Sync balance every 30s
         self.orders_sync_interval = 60.0  # Sync open orders every 60s
-        self.period_transition_delay = 15.0  # Seconds to wait after period boundary for price data
+        self.period_transition_delay = 2.0  # Reduced: only wait 2s for real-time price capture
         self.position_log_interval = 30.0  # Log position status every 30s
         self.last_position_log = None  # Track last position log time
 
@@ -1124,6 +1125,58 @@ class TradingBot:
 
         logger.info("Settlement loop stopped")
 
+    def _capture_period_boundary_prices(self, period_ts: int):
+        """
+        Capture current Chainlink prices at period boundary.
+
+        At the exact moment a new 15-minute period starts, the current
+        Chainlink price becomes the target price for that period's markets.
+        This allows real-time transitions without waiting for the API.
+
+        Args:
+            period_ts: Unix timestamp of the new period start
+        """
+        self._captured_period_prices.clear()
+
+        for asset in self.config.supported_assets:
+            price = self.signal_generator.get_price(asset)
+            if price and price > 0:
+                self._captured_period_prices[asset] = price
+                logger.info(
+                    f"📍 Captured {asset} price at period boundary: ${price:,.2f}"
+                )
+            else:
+                logger.warning(f"⚠️ No Chainlink price available for {asset} at boundary")
+
+        if self._captured_period_prices:
+            logger.info(
+                f"✅ Captured {len(self._captured_period_prices)} prices for period {period_ts}"
+            )
+
+    def _inject_captured_prices_to_gamma(self, period_ts: int):
+        """
+        Inject captured prices into Gamma API cache.
+
+        This allows immediate market creation without waiting for
+        the Polymarket API to update with the new target prices.
+
+        Args:
+            period_ts: Unix timestamp of the period
+        """
+        if not self._captured_period_prices:
+            logger.debug("No captured prices to inject")
+            return
+
+        injected = 0
+        for asset, price in self._captured_period_prices.items():
+            cache_key = f"{asset}:{period_ts}"
+            self.gamma_api._target_price_cache[cache_key] = price
+            injected += 1
+            logger.debug(f"Injected {asset} target price ${price:,.2f} for period {period_ts}")
+
+        if injected > 0:
+            logger.info(f"💉 Injected {injected} target prices into cache for instant trading")
+
     async def _refresh_markets(self):
         """Refresh list of active 15-minute markets."""
         now = datetime.now(timezone.utc)
@@ -1135,34 +1188,33 @@ class TradingBot:
         # Detect period boundary crossing
         if self._current_period_ts > 0 and current_period_ts != self._current_period_ts:
             logger.info(
-                f"PERIOD BOUNDARY: Transitioning from {self._current_period_ts} "
+                f"⏰ PERIOD BOUNDARY: Transitioning from {self._current_period_ts} "
                 f"to {current_period_ts}"
             )
 
-            # Wait for new price data to become available
-            # The API needs a few seconds after period boundary to have closePrice
+            # REAL-TIME: Capture current Chainlink prices as target prices for new period
+            # This eliminates the need to wait for the API
+            self._capture_period_boundary_prices(current_period_ts)
+
+            # Brief wait to ensure price capture is stable (reduced from 15s to 2s)
             if self._period_transition_wait_until is None:
                 wait_seconds = self.period_transition_delay
                 self._period_transition_wait_until = now + timedelta(seconds=wait_seconds)
-                logger.info(
-                    f"Waiting {wait_seconds}s for new period price data..."
-                )
+                logger.debug(f"Brief {wait_seconds}s stabilization wait...")
 
             # If still waiting, don't refresh yet
             if now < self._period_transition_wait_until:
-                logger.debug(
-                    f"Still waiting for period transition "
-                    f"({(self._period_transition_wait_until - now).total_seconds():.1f}s remaining)"
-                )
                 return
 
-            # Wait period complete - clear old markets and reset transition state
-            logger.info("Period transition complete - refreshing markets with new prices")
+            # Transition complete - clear old data and proceed
+            logger.info("✅ Period transition complete - using captured prices")
             self._period_transition_wait_until = None
 
-            # CRITICAL: Clear stale target price cache to force fresh API fetches
-            # This prevents trading on wrong target prices from previous periods
+            # Clear stale target price cache
             self.gamma_api.clear_stale_price_cache(current_period_ts)
+
+            # Inject captured prices into gamma API cache for immediate use
+            self._inject_captured_prices_to_gamma(current_period_ts)
 
             # Clear markets from old period (they should be in expiring/settled by now)
             async with self._markets_lock:
