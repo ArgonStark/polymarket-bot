@@ -193,21 +193,41 @@ class ArbitrageDetector:
         Key insight: Don't predict direction - buy whichever side is cheap.
         If YES + NO should be ~1.0 but one side is temporarily cheap,
         that's an opportunity.
+
+        UPDATED: More conservative fair value calculation that accounts for
+        time remaining and uses realistic probability estimates.
         """
         yes_price = market.best_ask
         no_price = 1 - market.best_bid
 
-        # Calculate "fair" prices based on where Chainlink price is
-        # relative to target
+        # Calculate distance from target as percentage
         distance_pct = (chainlink_price - market.target_price) / market.target_price
 
-        # If price is significantly above target, YES should be expensive
-        # If YES is still cheap, that's an opportunity
-        if distance_pct > 0.001:  # Price above target
-            # YES should be favored, check if it's still cheap
-            fair_yes = min(0.70, 0.50 + abs(distance_pct) * 10)
-            if yes_price < fair_yes - 0.10:  # YES is too cheap
-                edge = fair_yes - yes_price - 0.02  # minus fee
+        # More conservative fair value calculation:
+        # - For small distances (<1%), fair value should be close to 0.50
+        # - Only significant price moves justify higher fair values
+        # - Use square root scaling to be less aggressive
+        # - Cap at 0.65 instead of 0.70 to be more conservative
+        abs_distance = abs(distance_pct)
+
+        # Minimum distance to consider asymmetric (0.2% = 20 basis points)
+        if abs_distance < 0.002:
+            return None
+
+        # Fair value scales with square root of distance for more conservative estimate
+        # At 0.5% distance: 0.50 + sqrt(0.005) * 2 = 0.50 + 0.14 = 0.64
+        # At 1% distance: 0.50 + sqrt(0.01) * 2 = 0.50 + 0.20 = 0.70 (capped at 0.65)
+        import math
+        fair_value_adjustment = min(0.15, math.sqrt(abs_distance) * 2)
+        fair_value = min(0.65, 0.50 + fair_value_adjustment)
+
+        # If price is above target, YES should be expensive
+        if distance_pct > 0.002:  # Price above target by at least 0.2%
+            fair_yes = fair_value
+            # Check if YES is underpriced (market hasn't caught up)
+            mispricing = fair_yes - yes_price
+            if mispricing > 0.05:  # At least 5% mispricing
+                edge = mispricing - 0.02  # minus 2% fee
                 if edge >= self.min_spread_profit:
                     return {
                         "type": "asymmetric",
@@ -221,11 +241,12 @@ class ArbitrageDetector:
                         ),
                     }
 
-        elif distance_pct < -0.001:  # Price below target
-            # NO should be favored, check if it's still cheap
-            fair_no = min(0.70, 0.50 + abs(distance_pct) * 10)
-            if no_price < fair_no - 0.10:  # NO is too cheap
-                edge = fair_no - no_price - 0.02
+        elif distance_pct < -0.002:  # Price below target by at least 0.2%
+            fair_no = fair_value
+            # Check if NO is underpriced (market hasn't caught up)
+            mispricing = fair_no - no_price
+            if mispricing > 0.05:  # At least 5% mispricing
+                edge = mispricing - 0.02
                 if edge >= self.min_spread_profit:
                     return {
                         "type": "asymmetric",

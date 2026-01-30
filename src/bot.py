@@ -104,8 +104,10 @@ class TradingBot:
         # Token-to-market mapping for fast lookups
         self._token_to_market: dict[str, str] = {}  # token_id -> condition_id
 
-        # Track logged rejections to avoid spam
+        # Track logged rejections to avoid spam (cleared periodically)
         self._logged_rejections: set[str] = set()
+        self._last_rejection_clear: Optional[datetime] = None
+        self._rejection_clear_interval = 30.0  # Clear rejections every 30s to re-log
 
         # Cooldown tracking - prevent duplicate orders per asset
         self._last_order_time: dict[str, datetime] = {}  # asset -> last order time
@@ -1017,6 +1019,15 @@ class TradingBot:
                     logger.warning(f"Trading paused: {reason}")
                     await asyncio.sleep(60.0)
                     continue
+
+                # Periodically clear rejection log to re-show blocking reasons
+                now = datetime.now(timezone.utc)
+                if (self._last_rejection_clear is None or
+                    (now - self._last_rejection_clear).total_seconds() > self._rejection_clear_interval):
+                    if self._logged_rejections:
+                        logger.debug(f"Clearing {len(self._logged_rejections)} logged rejections for re-logging")
+                    self._logged_rejections.clear()
+                    self._last_rejection_clear = now
 
                 # Generate and execute signals for each active market
                 active_count = len(self.markets)
@@ -2165,14 +2176,26 @@ class TradingBot:
             logger.debug(f"SKIP {market.asset}: {signal.reasoning}")
             return
 
+        # Log signal details for debugging (only for actionable signals)
+        arb_type = getattr(signal, '_arb_type', 'probability')
+        logger.info(
+            f"📡 SIGNAL [{market.asset}]: {signal.side.value} | "
+            f"Edge: {signal.edge:.1%} | Type: {arb_type} | "
+            f"Size: ${signal.size_usd:.2f} | Action: {signal.recommended_action.value}"
+        )
+
         # Validate signal against risk limits
         is_valid, reason = self.risk_manager.validate_signal(signal)
         if not is_valid:
-            # Only log each rejection reason once per market to avoid spam
+            # Always log the blocking reason (cleared every 30s to avoid spam)
             rejection_key = f"{market.condition_id}:{reason}"
             if rejection_key not in self._logged_rejections:
                 self._logged_rejections.add(rejection_key)
-                logger.info(f"[{market.asset}] Blocked: {reason}")
+                logger.info(
+                    f"[{market.asset}] ❌ BLOCKED: {reason} | "
+                    f"Bankroll: ${self.risk_manager.current_bankroll:.2f} | "
+                    f"Positions: {len(self.risk_manager.positions)}"
+                )
             return
 
         # Adjust size if needed
@@ -2183,7 +2206,12 @@ class TradingBot:
             size_key = f"{market.condition_id}:size_too_small"
             if size_key not in self._logged_rejections:
                 self._logged_rejections.add(size_key)
-                logger.info(f"[{market.asset}] 📏 Size too small after adjustment - check bankroll")
+                max_size = self.risk_manager.current_bankroll * self.config.trading.max_position_pct
+                logger.info(
+                    f"[{market.asset}] ❌ SIZE TOO SMALL: "
+                    f"Max position ${max_size:.2f} (bankroll ${self.risk_manager.current_bankroll:.2f} × "
+                    f"{self.config.trading.max_position_pct:.0%}) < $3 minimum"
+                )
             return
 
         # Trade history filter - check past performance for this asset/side
@@ -2200,7 +2228,7 @@ class TradingBot:
             rejection_key = f"{market.condition_id}:history:{signal.side.value}"
             if rejection_key not in self._logged_rejections:
                 self._logged_rejections.add(rejection_key)
-                logger.info(f"[{market.asset}] 📊 History block: {history_reason}")
+                logger.info(f"[{market.asset}] ❌ HISTORY BLOCK: {history_reason}")
             return
 
         # ML filter - check predicted win probability
@@ -2220,7 +2248,7 @@ class TradingBot:
                 rejection_key = f"{market.condition_id}:ml"
                 if rejection_key not in self._logged_rejections:
                     self._logged_rejections.add(rejection_key)
-                    logger.info(f"[{market.asset}] 🤖 {ml_reason}")
+                    logger.info(f"[{market.asset}] ❌ ML BLOCK: {ml_reason} | Confidence: {confidence:.1%}")
                 return
 
             # Store all ML data with signal for outcome recording
@@ -2550,7 +2578,7 @@ class TradingBot:
                 cooldown_key = f"{signal.market.condition_id}:cooldown"
                 if cooldown_key not in self._logged_rejections:
                     self._logged_rejections.add(cooldown_key)
-                    logger.info(f"[{asset}] ⏳ Cooldown active: {remaining:.0f}s remaining")
+                    logger.info(f"[{asset}] ❌ COOLDOWN: {remaining:.0f}s remaining (last order {elapsed:.0f}s ago)")
                 return
 
         # Check for existing positions from API (prevents duplicate trades)
@@ -2559,7 +2587,7 @@ class TradingBot:
             position_key = f"{signal.market.condition_id}:active_position"
             if position_key not in self._logged_rejections:
                 self._logged_rejections.add(position_key)
-                logger.info(f"[{asset}] 📊 Already has active position - skipping signal")
+                logger.info(f"[{asset}] ❌ ACTIVE POSITION: Already has position - skipping signal")
             return
 
         # Check if we have enough balance before attempting
@@ -2569,7 +2597,10 @@ class TradingBot:
             balance_key = f"{signal.market.condition_id}:balance"
             if balance_key not in self._logged_rejections:
                 self._logged_rejections.add(balance_key)
-                logger.info(f"[{asset}] 💰 Insufficient balance: need ${signal.size_usd:.2f}, have ${available:.2f}")
+                logger.info(
+                    f"[{asset}] ❌ INSUFFICIENT BALANCE: Need ${signal.size_usd:.2f}, "
+                    f"have ${available:.2f} (bankroll ${self.risk_manager.current_bankroll:.2f})"
+                )
             # Set a short cooldown to prevent spam
             self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
             return
