@@ -64,6 +64,7 @@ def learn_from_trader(wallet: str, limit: int = 5000, dry_run: bool = False):
     wins = 0
     losses = 0
     skipped = 0
+    total_pnl = 0.0
 
     print("-" * 70)
     print("Processing 15-min crypto trades...")
@@ -176,6 +177,7 @@ def learn_from_trader(wallet: str, limit: int = 5000, dry_run: bool = False):
                 wins += 1
             else:
                 losses += 1
+            total_pnl += pnl
 
             # Record to ML model with enhanced features
             if not dry_run:
@@ -216,9 +218,17 @@ def learn_from_trader(wallet: str, limit: int = 5000, dry_run: bool = False):
 
     if synced_count > 0:
         win_rate = wins / synced_count * 100
+        avg_pnl = total_pnl / synced_count
+
+        # Color for profit
+        pnl_color = "\033[92m" if total_pnl >= 0 else "\033[91m"
+        reset = "\033[0m"
+
         print(f"\n  Trades processed: {synced_count}")
         print(f"  Wins: {wins} | Losses: {losses}")
         print(f"  Win rate: {win_rate:.1f}%")
+        print(f"  {pnl_color}Total Profit: ${total_pnl:+,.2f}{reset}")
+        print(f"  Avg P&L/trade: ${avg_pnl:+.2f}")
         print(f"  Skipped: {skipped}")
 
         if not dry_run:
