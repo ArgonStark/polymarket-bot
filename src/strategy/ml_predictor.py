@@ -1127,9 +1127,12 @@ def get_ml_predictor() -> MLSignalPredictor:
     return _ml_predictor
 
 
-def calculate_price_trend(prices: list[float], window: int = 10) -> float:
+def calculate_price_trend(prices: list, window: int = 10) -> float:
     """
     Calculate price trend from historical prices.
+
+    Args:
+        prices: List of prices - can be raw floats or (timestamp, price) tuples
 
     Returns:
         Trend value between -1 (strongly down) and 1 (strongly up)
@@ -1137,8 +1140,19 @@ def calculate_price_trend(prices: list[float], window: int = 10) -> float:
     if len(prices) < 2:
         return 0.0
 
+    # Extract just the prices - handle both tuple format (timestamp, price) and raw float format
+    prices_only = []
+    for p in prices:
+        if isinstance(p, (list, tuple)) and len(p) >= 2:
+            prices_only.append(float(p[1]))
+        elif isinstance(p, (int, float)):
+            prices_only.append(float(p))
+
+    if len(prices_only) < 2:
+        return 0.0
+
     # Use the last N prices
-    recent = prices[-min(window, len(prices)):]
+    recent = prices_only[-min(window, len(prices_only)):]
 
     if len(recent) < 2:
         return 0.0
