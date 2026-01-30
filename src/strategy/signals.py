@@ -33,7 +33,14 @@ from ..probability import (
 from ..config import BotConfig
 from .arbitrage import ArbitrageDetector, select_best_opportunity
 from .trend_protection import TrendProtection, TrendProtectionConfig
-from ..data.binance import get_multi_timeframe_trends
+from .technical_analysis import get_smart_trading_decision
+
+# Import with fallback for get_multi_timeframe_trends
+try:
+    from ..data.binance import get_multi_timeframe_trends
+except ImportError:
+    def get_multi_timeframe_trends(asset: str) -> dict:
+        return {"trend_1h": 0.0, "trend_4h": 0.0, "trend_1d": 0.0}
 
 
 logger = logging.getLogger(__name__)
@@ -270,6 +277,11 @@ class SignalGenerator:
         }
 
         if chainlink is None:
+            return result
+
+        # Validate target_price to prevent division by zero
+        if target_price <= 0:
+            logger.warning(f"Invalid target_price: {target_price}")
             return result
 
         # Calculate Chainlink direction relative to target
@@ -601,6 +613,51 @@ class SignalGenerator:
                 )
                 edge = trend_result.adjusted_edge
 
+        # === SMART TREND-FOLLOWING CHECK ===
+        # Use technical analysis to validate trade direction
+        try:
+            smart_decision = get_smart_trading_decision(
+                asset=market.asset,
+                current_price=current_price,
+                target_price=market.target_price,
+                time_remaining=time_remaining,
+                original_side=side.value,
+                original_edge=edge,
+            )
+
+            if not smart_decision.should_trade:
+                logger.info(
+                    f"📊 SMART TREND BLOCKED [{market.asset}]: "
+                    f"{side.value} signal blocked | {smart_decision.reason}"
+                )
+                return Signal(
+                    market=market,
+                    side=Side.NONE,
+                    edge=edge,
+                    true_prob=true_prob,
+                    market_prob=market_prob,
+                    recommended_action=OrderAction.SKIP,
+                    recommended_price=0.0,
+                    size_usd=0.0,
+                    size_shares=0.0,
+                    chainlink_price=current_price,
+                    time_remaining=time_remaining,
+                    reasoning=f"[SMART TREND] {smart_decision.reason}",
+                )
+
+            # Apply edge boost from smart analysis
+            if smart_decision.edge_boost > 0:
+                logger.info(
+                    f"📈 SMART TREND BOOST [{market.asset}]: "
+                    f"Edge {edge:.1%} -> {edge + smart_decision.edge_boost:.1%} | "
+                    f"{smart_decision.reason}"
+                )
+                edge += smart_decision.edge_boost
+
+        except Exception as e:
+            logger.debug(f"Smart trend analysis failed for {market.asset}: {e}")
+            # Continue with original signal if analysis fails
+
         # Determine order action based on edge and time
         action = self._determine_action(edge, time_remaining)
 
@@ -762,7 +819,11 @@ class SignalGenerator:
     ) -> str:
         """Generate human-readable reasoning for the signal."""
         direction = "above" if current_price >= target_price else "below"
-        distance_pct = abs(current_price - target_price) / target_price * 100
+        # Prevent division by zero
+        if target_price > 0:
+            distance_pct = abs(current_price - target_price) / target_price * 100
+        else:
+            distance_pct = 0.0
 
         base_reasoning = (
             f"Chainlink ${current_price:,.2f} is {distance_pct:.2f}% {direction} "
