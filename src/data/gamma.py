@@ -45,6 +45,47 @@ class GammaAPI:
         if self._target_price_cache is None:
             self._target_price_cache = {}
 
+    def clear_stale_price_cache(self, current_period_ts: int) -> int:
+        """
+        Clear target price cache entries for expired periods.
+
+        Called during period transitions to prevent using stale target prices
+        from previous periods. The API sometimes takes time to update after
+        a period transition, and we don't want to use cached old prices.
+
+        Args:
+            current_period_ts: Unix timestamp of the current period start
+
+        Returns:
+            Number of cache entries removed
+        """
+        if not self._target_price_cache:
+            return 0
+
+        # Keep only entries for the current and previous period
+        # (previous period might still have active markets settling)
+        valid_timestamps = {current_period_ts, current_period_ts - 900}
+
+        stale_keys = []
+        for key in list(self._target_price_cache.keys()):
+            # Key format: "{asset}:{start_timestamp}"
+            try:
+                _, ts_str = key.split(":")
+                ts = int(ts_str)
+                if ts not in valid_timestamps:
+                    stale_keys.append(key)
+            except (ValueError, AttributeError):
+                # Invalid key format, remove it
+                stale_keys.append(key)
+
+        for key in stale_keys:
+            del self._target_price_cache[key]
+
+        if stale_keys:
+            logger.info(f"Cleared {len(stale_keys)} stale target price cache entries")
+
+        return len(stale_keys)
+
     @property
     def base_url(self) -> str:
         """Get Gamma API base URL."""
