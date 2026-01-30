@@ -1923,12 +1923,12 @@ class TradingBot:
         """
         Sync ML model with actual trades from Polymarket Data API.
 
-        Uses three endpoints:
-        - /positions - current open positions
-        - /activity - all trade activity
-        - /closed-positions - completed trades with P&L
+        Uses multiple endpoints for comprehensive trade tracking:
+        - /activity (type=TRADE) - All trade activity with BUY/SELL
+        - /closed-positions - Completed trades with realized P&L
+        - /activity (type=REDEEM) - Redeemed positions (settled markets)
 
-        The ML learns from closed positions where we know the outcome (win/loss).
+        The ML learns from trades where we can determine the outcome (win/loss).
 
         Args:
             force: If True, bypass rate limiting (used on startup)
@@ -1953,140 +1953,243 @@ class TradingBot:
                 logger.warning("Could not get wallet address for ML sync")
                 return
 
+            logger.info(f"🤖 ML Sync: Fetching trades for {wallet_address[:10]}...")
+
             # Initialize Data API
             data_api = get_data_api()
 
-            # Track what we've already synced (using condition_id + outcome as key)
-            if not hasattr(self, '_synced_positions'):
-                self._synced_positions = set()
-
-            # Fetch closed positions (completed trades with realized P&L)
-            closed_positions = data_api.get_all_closed_positions(wallet_address, max_positions=200)
-
-            if not closed_positions:
-                logger.info("🤖 No closed positions found in Polymarket history")
-                return
-
-            logger.debug(f"Found {len(closed_positions)} total closed positions to scan")
+            # Track what we've already synced (using condition_id + outcome + timestamp as key)
+            if not hasattr(self, '_synced_trades'):
+                self._synced_trades = set()
 
             synced_count = 0
+            total_trades_found = 0
+            crypto_trades_found = 0
+
+            # === Method 1: Closed Positions (completed trades with P&L) ===
+            closed_positions = data_api.get_all_closed_positions(wallet_address, max_positions=500)
+            logger.info(f"🤖 ML Sync: Found {len(closed_positions)} closed positions")
+
             for pos in closed_positions:
-                try:
-                    # Create unique key for this position
-                    condition_id = pos.get("conditionId", "")
-                    outcome = pos.get("outcome", "")
-                    pos_key = f"{condition_id}:{outcome}"
-
-                    # Skip if already synced
-                    if pos_key in self._synced_positions:
-                        continue
-
-                    # Check if this is a 15-min crypto market
-                    slug = pos.get("slug", "") or pos.get("eventSlug", "")
-                    title = pos.get("title", "")
-                    slug_lower = slug.lower()
-                    title_lower = title.lower()
-
-                    # Comprehensive 15-min crypto market detection
-                    # Patterns: "updown-15m", "15m", "15min", "15-min", "up-down-15m"
-                    is_15min = any(p in slug_lower or p in title_lower for p in [
-                        "updown-15m", "-15m-", "15min", "15-min", "15m",
-                        "up-down-15m", "updown15m", "crypto-15"
-                    ])
-
-                    if not is_15min:
-                        continue
-
-                    # Identify asset from slug or title
-                    asset = None
-                    asset_patterns = {
-                        "btc": "BTC", "bitcoin": "BTC",
-                        "eth": "ETH", "ethereum": "ETH",
-                        "sol": "SOL", "solana": "SOL",
-                        "xrp": "XRP", "ripple": "XRP",
-                    }
-                    for pattern, asset_name in asset_patterns.items():
-                        if pattern in slug_lower or pattern in title_lower:
-                            asset = asset_name
-                            break
-
-                    if not asset:
-                        continue
-
-                    # Get outcome (Up/Down)
-                    if isinstance(outcome, str):
-                        outcome_lower = outcome.lower()
-                        if "up" in outcome_lower:
-                            side = Side.UP
-                        elif "down" in outcome_lower:
-                            side = Side.DOWN
-                        else:
-                            continue
-                    else:
-                        continue
-
-                    # Determine win/loss from realizedPnl
-                    realized_pnl = float(pos.get("realizedPnl", 0) or 0)
-                    won = realized_pnl > 0
-
-                    # Get trade details
-                    avg_price = float(pos.get("avgPrice", 0) or 0)
-                    total_bought = float(pos.get("totalBought", 0) or 0)
-
-                    if avg_price <= 0 or total_bought <= 0:
-                        continue
-
-                    # Create mock signal for ML recording
-                    from types import SimpleNamespace
-                    fake_signal = SimpleNamespace(
-                        edge=0.0,
-                        market=SimpleNamespace(
-                            asset=asset,
-                            target_price=0,
-                            time_remaining=0,
-                            best_bid=avg_price,
-                            best_ask=avg_price,
-                            bid_depth=0,
-                            ask_depth=0,
-                        ),
-                        side=side,
-                        _arb_type="none",
-                        recommended_price=avg_price,
-                        size_shares=total_bought,
-                        size_usd=total_bought * avg_price,
-                        time_remaining=0,
-                    )
-
-                    # Record to ML model (historical trade - no real-time price data)
-                    self.ml_predictor.record_outcome(
-                        signal=fake_signal,
-                        volatility=0.003,
-                        price_momentum=0.0,
-                        won=won,
-                        # Price features not available for historical trades
-                        current_price=0.0,
-                        target_price=0.0,
-                        price_high=0.0,
-                        price_low=0.0,
-                        price_velocity=0.0,
-                    )
-
-                    # Mark as synced
-                    self._synced_positions.add(pos_key)
+                result = self._process_trade_for_ml(pos, "closed")
+                if result == "synced":
                     synced_count += 1
+                    crypto_trades_found += 1
+                elif result == "crypto":
+                    crypto_trades_found += 1
+                total_trades_found += 1
 
-                except Exception as e:
-                    logger.debug(f"Error processing position for ML sync: {e}")
-                    continue
+            # === Method 2: Trade Activity (all BUY/SELL activity) ===
+            trade_activity = data_api.get_all_activity(wallet_address, activity_type="TRADE", max_items=500)
+            logger.info(f"🤖 ML Sync: Found {len(trade_activity)} trade activities")
 
+            for trade in trade_activity:
+                result = self._process_trade_for_ml(trade, "activity")
+                if result == "synced":
+                    synced_count += 1
+                    crypto_trades_found += 1
+                elif result == "crypto":
+                    crypto_trades_found += 1
+                total_trades_found += 1
+
+            # === Method 3: Redeem Activity (claimed winnings) ===
+            redeem_activity = data_api.get_all_activity(wallet_address, activity_type="REDEEM", max_items=200)
+            logger.info(f"🤖 ML Sync: Found {len(redeem_activity)} redeem activities")
+
+            for redeem in redeem_activity:
+                result = self._process_trade_for_ml(redeem, "redeem")
+                if result == "synced":
+                    synced_count += 1
+                    crypto_trades_found += 1
+                elif result == "crypto":
+                    crypto_trades_found += 1
+
+            # Summary logging
             if synced_count > 0:
                 logger.info(
-                    f"🤖 ML synced {synced_count} trades from Polymarket | "
+                    f"🤖 ML synced {synced_count} NEW trades | "
                     f"Total samples: {self.ml_predictor.training_samples}"
+                )
+            elif crypto_trades_found > 0:
+                logger.info(
+                    f"🤖 Found {crypto_trades_found} crypto trades (already synced or pending)"
+                )
+            else:
+                logger.info(
+                    f"🤖 No 15-min crypto trades found in {total_trades_found} total activities"
                 )
 
         except Exception as e:
             logger.error(f"ML sync from Polymarket failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+    def _process_trade_for_ml(self, trade_data: dict, source: str) -> str:
+        """
+        Process a single trade/position for ML learning.
+
+        Args:
+            trade_data: Trade or position data from API
+            source: Source type ("closed", "activity", "redeem")
+
+        Returns:
+            "synced" if successfully synced, "crypto" if crypto but already synced,
+            "skip" if not a 15-min crypto trade
+        """
+        try:
+            # Extract identifiers
+            condition_id = trade_data.get("conditionId", "")
+            outcome = trade_data.get("outcome", "")
+            timestamp = trade_data.get("timestamp", "")
+            tx_hash = trade_data.get("transactionHash", "")
+
+            # Create unique key for deduplication
+            trade_key = f"{condition_id}:{outcome}:{timestamp}:{tx_hash}"
+
+            # Skip if already synced
+            if trade_key in self._synced_trades:
+                return "skip"
+
+            # Extract market info
+            slug = trade_data.get("slug", "") or trade_data.get("eventSlug", "")
+            title = trade_data.get("title", "")
+            slug_lower = slug.lower()
+            title_lower = title.lower()
+
+            # Comprehensive 15-min crypto market detection
+            is_15min = any(p in slug_lower or p in title_lower for p in [
+                "updown-15m", "-15m-", "15min", "15-min", "15m",
+                "up-down-15m", "updown15m", "crypto-15"
+            ])
+
+            if not is_15min:
+                return "skip"
+
+            # Identify asset
+            asset = None
+            asset_patterns = {
+                "btc": "BTC", "bitcoin": "BTC",
+                "eth": "ETH", "ethereum": "ETH",
+                "sol": "SOL", "solana": "SOL",
+                "xrp": "XRP", "ripple": "XRP",
+            }
+            for pattern, asset_name in asset_patterns.items():
+                if pattern in slug_lower or pattern in title_lower:
+                    asset = asset_name
+                    break
+
+            if not asset:
+                return "skip"
+
+            # Get side (Up/Down)
+            if isinstance(outcome, str):
+                outcome_lower = outcome.lower()
+                if "up" in outcome_lower:
+                    side = Side.UP
+                elif "down" in outcome_lower:
+                    side = Side.DOWN
+                else:
+                    return "skip"
+            else:
+                return "skip"
+
+            # Determine win/loss based on source
+            won = None
+
+            if source == "closed":
+                # Closed positions have realized P&L
+                realized_pnl = float(trade_data.get("realizedPnl", 0) or 0)
+                won = realized_pnl > 0
+
+            elif source == "redeem":
+                # Redeems are always wins (you only redeem winning positions)
+                won = True
+
+            elif source == "activity":
+                # Trade activity - check if we can determine outcome
+                # For BUY trades, we need to check if the market settled in our favor
+                trade_side = trade_data.get("side", "")
+                if trade_side == "SELL":
+                    # SELL means we closed a position - check P&L from usdcSize vs size*price
+                    size = float(trade_data.get("size", 0) or 0)
+                    price = float(trade_data.get("price", 0) or 0)
+                    usdc_size = float(trade_data.get("usdcSize", 0) or 0)
+                    # If we sold, the P&L depends on our entry price (unknown)
+                    # Skip for now - closed positions will capture this
+                    return "crypto"
+                else:
+                    # BUY trade - need to check settlement
+                    # Skip for now - will be captured when position closes
+                    return "crypto"
+
+            if won is None:
+                return "crypto"
+
+            # Get trade details
+            avg_price = float(trade_data.get("avgPrice", 0) or trade_data.get("price", 0) or 0)
+            total_bought = float(trade_data.get("totalBought", 0) or trade_data.get("size", 0) or 0)
+
+            if avg_price <= 0 or total_bought <= 0:
+                return "skip"
+
+            # Create mock signal for ML recording
+            from types import SimpleNamespace
+
+            # Per-asset volatility
+            asset_volatility = {
+                "BTC": 0.0035, "ETH": 0.0045,
+                "SOL": 0.0070, "XRP": 0.0060,
+            }.get(asset, 0.005)
+
+            # Estimate momentum from result
+            if won:
+                price_momentum = 0.3 if side == Side.UP else -0.3
+            else:
+                price_momentum = -0.2 if side == Side.UP else 0.2
+
+            fake_signal = SimpleNamespace(
+                edge=0.05 if won else 0.02,  # Estimate edge from result
+                market=SimpleNamespace(
+                    asset=asset,
+                    target_price=avg_price,
+                    time_remaining=300,  # Estimate
+                    best_bid=avg_price - 0.01,
+                    best_ask=avg_price + 0.01,
+                    bid_depth=10000,
+                    ask_depth=10000,
+                ),
+                side=side,
+                _arb_type="none",
+                recommended_price=avg_price,
+                size_shares=total_bought,
+                size_usd=total_bought * avg_price,
+                time_remaining=300,
+            )
+
+            # Record to ML model
+            self.ml_predictor.record_outcome(
+                signal=fake_signal,
+                volatility=asset_volatility,
+                price_momentum=price_momentum,
+                won=won,
+                current_price=avg_price,
+                target_price=avg_price,
+                price_high=avg_price * 1.005,
+                price_low=avg_price * 0.995,
+                price_velocity=price_momentum * 0.001,
+            )
+
+            # Mark as synced
+            self._synced_trades.add(trade_key)
+
+            result_str = "WIN" if won else "LOSS"
+            logger.debug(f"🤖 ML: Synced {asset} {side.value} {result_str} from {source}")
+
+            return "synced"
+
+        except Exception as e:
+            logger.debug(f"Error processing trade for ML: {e}")
+            return "skip"
 
     async def _sync_positions_from_polymarket(self):
         """
