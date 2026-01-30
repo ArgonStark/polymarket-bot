@@ -376,61 +376,52 @@ class GammaAPI:
                 logger.warning(f"Cannot identify UP/DOWN tokens: {condition_id}")
                 return None
 
-            # Parse target price from question or metadata
-            target_price = self._extract_price_from_question(question)
-            if target_price is None or target_price == 0:
-                # Try to get from market metadata
-                target_price = market.get("startPrice") or market.get("targetPrice")
-
-            # For 15-min markets, try cache or API for target price
+            # Parse target price - different logic for 15-min vs other markets
+            target_price = None
             start_ts = None
             cache_key = None
+
+            # For 15-min "updown" markets, ALWAYS use the dedicated price API
+            # Don't trust metadata startPrice/targetPrice as it may be stale
             if "-updown-15m-" in slug.lower():
                 start_ts = self._extract_timestamp_from_slug(slug)
                 cache_key = f"{asset}:{start_ts}" if start_ts else None
 
-                # Check cache first (for prices from any source)
-                if not target_price and cache_key and cache_key in self._target_price_cache:
+                # Check cache first (from previous API calls only)
+                if cache_key and cache_key in self._target_price_cache:
                     cached = self._target_price_cache[cache_key]
-                    if cached and cached > 0:
+                    if cached == 0:
+                        # Already tried and failed, skip market silently
+                        return None
+                    elif cached > 0:
                         target_price = cached
                         logger.debug(f"Using cached target price for {asset}: ${target_price:,.2f}")
 
-                # Cache any successful price from metadata
-                if target_price and target_price > 0 and cache_key:
-                    self._target_price_cache[cache_key] = target_price
-
-            # Only call API if still no price
-            if not target_price or target_price <= 0:
-                # Check if this is a 15-minute market (has updown-15m in slug)
-                if "-updown-15m-" in slug.lower() and start_ts and cache_key:
-                    # Check if API already failed for this timestamp
-                    if cache_key in self._target_price_cache:
-                        cached = self._target_price_cache[cache_key]
-                        if cached == 0:
-                            # Already tried and failed, skip market silently
-                            return None
-                        elif cached > 0:
-                            target_price = cached
+                # If not in cache, fetch from Polymarket price API
+                if not target_price and start_ts and cache_key:
+                    target_price = self.fetch_price_to_beat(asset, start_ts)
+                    if target_price:
+                        # Cache successful price
+                        self._target_price_cache[cache_key] = target_price
+                        logger.debug(f"Got target price for {asset} from API: ${target_price:,.2f}")
                     else:
-                        # Fetch price to beat from Polymarket API
-                        target_price = self.fetch_price_to_beat(asset, start_ts)
-                        if target_price:
-                            # Cache successful price
-                            self._target_price_cache[cache_key] = target_price
-                            logger.debug(f"Got target price for {asset} from API: ${target_price:,.2f}")
-                        else:
-                            # Cache failure to avoid repeated API calls (use 0 as marker)
-                            self._target_price_cache[cache_key] = 0
+                        # Cache failure to avoid repeated API calls (use 0 as marker)
+                        self._target_price_cache[cache_key] = 0
 
-                    # If API fails, skip this market instead of using placeholder
-                    if not target_price or target_price <= 0:
-                        logger.debug(
-                            f"Skipping {asset} market (no price data available yet): "
-                            f"slug={slug}, start_ts={start_ts}"
-                        )
-                        return None
-                else:
+                # If API fails, skip this market
+                if not target_price or target_price <= 0:
+                    logger.debug(
+                        f"Skipping {asset} market (no price data available yet): "
+                        f"slug={slug}, start_ts={start_ts}"
+                    )
+                    return None
+            else:
+                # For non-15-min markets, use question parsing or metadata
+                target_price = self._extract_price_from_question(question)
+                if target_price is None or target_price == 0:
+                    target_price = market.get("startPrice") or market.get("targetPrice")
+
+                if not target_price or target_price <= 0:
                     logger.warning(
                         f"Market missing valid target price: {condition_id} "
                         f"(extracted: {target_price})"

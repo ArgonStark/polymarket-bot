@@ -754,6 +754,12 @@ class TradingBot:
             return
 
         self._running = True
+
+        # Startup banner
+        logger.info("╔════════════════════════════════════════════════════════════════╗")
+        logger.info("║     POLYMARKET 15-MIN CRYPTO ARBITRAGE BOT                     ║")
+        logger.info("║     Made by Argon Stark                                        ║")
+        logger.info("╚════════════════════════════════════════════════════════════════╝")
         logger.info("Starting trading bot...")
 
         try:

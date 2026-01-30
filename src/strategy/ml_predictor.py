@@ -755,24 +755,24 @@ class MLSignalPredictor:
 
         Uses a gradual ramp-up to collect more diverse training data
         before applying strict filtering:
-        - 0-25 samples: Learning mode (allow all) - extended for more exploration
-        - 25-40 samples: 45% threshold (very lenient)
-        - 40-60 samples: 50% threshold (lenient)
-        - 60+ samples: 55% threshold (moderate)
+        - 0-50 samples: Learning mode (allow all) - extended for API sync learning
+        - 50-75 samples: 35% threshold (very lenient)
+        - 75-100 samples: 40% threshold (lenient)
+        - 100+ samples: 45% threshold (moderate)
 
         Returns:
             Current confidence threshold (0.0 to 1.0)
         """
         samples = self.training_samples
 
-        if samples < 25:
-            return 0.0  # Learning mode - allow all (extended from 10 to 25)
-        elif samples < 40:
-            return 0.45  # Early filtering - 45% (lowered from 50%)
-        elif samples < 60:
-            return 0.50  # Medium filtering - 50% (lowered from 55%)
+        if samples < 50:
+            return 0.0  # Learning mode - allow all (extended for API sync)
+        elif samples < 75:
+            return 0.35  # Early filtering - 35%
+        elif samples < 100:
+            return 0.40  # Medium filtering - 40%
         else:
-            return 0.55  # Full filtering - 55% (lowered from 60%)
+            return 0.45  # Full filtering - 45%
 
     def should_trade(
         self,
@@ -795,10 +795,13 @@ class MLSignalPredictor:
         Decide if we should take this trade based on ML prediction.
 
         Uses gradual threshold ramp-up (lenient settings for more trades):
-        - 0-25 samples: Learning mode (allow all)
-        - 25-40 samples: 45% threshold
-        - 40-60 samples: 50% threshold
-        - 60+ samples: 55% threshold
+        - 0-50 samples: Learning mode (allow all)
+        - 50-75 samples: 35% threshold
+        - 75-100 samples: 40% threshold
+        - 100+ samples: 45% threshold
+
+        Strong signals bypass ML filtering:
+        - STRONG Binance confirmation with arbitrage signal
 
         Args:
             signal: Trading signal
@@ -844,6 +847,16 @@ class MLSignalPredictor:
         # Log feature importance info for debugging
         arb_info = f" [ARB: {arb_type}]" if arb_type != "none" else ""
         bn_info = f" [BN: {binance_confirmation}]" if binance_confirmation != "NONE" else ""
+
+        # Strong signal bypass: STRONG Binance confirmation with arbitrage
+        # These are high-quality signals that shouldn't be blocked by ML
+        is_strong_signal = (
+            binance_confirmation == "STRONG" and
+            arb_type in ("asymmetric", "binary_arb")
+        )
+
+        if is_strong_signal:
+            return (True, confidence, f"{model_type} BYPASS (strong signal): {confidence:.0%}{arb_info}{bn_info}")
 
         if confidence < threshold:
             return (False, confidence, f"{model_type} rejected: {confidence:.0%} < {threshold:.0%}{arb_info}{bn_info}")
