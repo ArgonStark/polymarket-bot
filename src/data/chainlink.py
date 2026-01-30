@@ -146,37 +146,44 @@ class ChainlinkFeed:
         self._reconnect_delay = self.config.websocket.initial_reconnect_delay  # Reset reconnect delay
         self._retry_count = 0  # Reset retry count on successful connection
 
-        # Subscribe to both Chainlink and Binance crypto prices
+        # Subscribe to Chainlink and Binance crypto prices SEPARATELY
         # Per Polymarket docs: https://docs.polymarket.com/developers/RTDS/RTDS-crypto-prices
         #
-        # IMPORTANT: Filter formats are DIFFERENT for each source:
-        # - Binance: comma-separated string, lowercase: "solusdt,btcusdt,ethusdt"
-        # - Chainlink: JSON object string: '{"symbol":"eth/usd"}'
-        #
-        subscribe_msg = {
+        # Sending each subscription in its own message for better reliability
+
+        # 1. Subscribe to Chainlink (for settlement prices)
+        chainlink_msg = {
             "action": "subscribe",
             "subscriptions": [
-                # Chainlink subscription - empty string filter = all symbols
                 {
                     "topic": self.config.endpoints.chainlink_topic,
                     "type": "*",
-                    "filters": "",  # Empty string for all symbols
-                },
-                # Binance subscription - comma-separated lowercase symbols
-                {
-                    "topic": "crypto_prices",
-                    "type": "update",
-                    "filters": "btcusdt,ethusdt,solusdt,xrpusdt",  # Comma-separated, lowercase
-                },
+                }
             ],
         }
         try:
-            msg_json = json.dumps(subscribe_msg)
-            logger.info(f"Sending subscription: {msg_json}")
-            ws.send(msg_json)
-            logger.info(f"Subscribed to {self.config.endpoints.chainlink_topic} and crypto_prices (Binance)")
+            logger.info(f"[WS] Subscribing to Chainlink: {json.dumps(chainlink_msg)}")
+            ws.send(json.dumps(chainlink_msg))
         except Exception as e:
-            logger.error(f"Failed to send subscription message: {e}")
+            logger.error(f"Failed to subscribe to Chainlink: {e}")
+
+        # 2. Subscribe to Binance (for leading indicator)
+        binance_msg = {
+            "action": "subscribe",
+            "subscriptions": [
+                {
+                    "topic": "crypto_prices",
+                    "type": "update",
+                }
+            ],
+        }
+        try:
+            logger.info(f"[WS] Subscribing to Binance: {json.dumps(binance_msg)}")
+            ws.send(json.dumps(binance_msg))
+        except Exception as e:
+            logger.error(f"Failed to subscribe to Binance: {e}")
+
+        logger.info(f"[WS] Subscriptions sent for {self.config.endpoints.chainlink_topic} and crypto_prices")
 
     def _on_message(self, ws, message: str):
         """Handle incoming WebSocket message."""
