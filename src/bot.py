@@ -2198,22 +2198,6 @@ class TradingBot:
                 )
             return
 
-        # Adjust size if needed
-        signal = self.risk_manager.adjust_signal_size(signal)
-
-        # Check if signal was rejected due to size
-        if signal.size_usd <= 0 or signal.size_shares <= 0:
-            size_key = f"{market.condition_id}:size_too_small"
-            if size_key not in self._logged_rejections:
-                self._logged_rejections.add(size_key)
-                max_size = self.risk_manager.current_bankroll * self.config.trading.max_position_pct
-                logger.info(
-                    f"[{market.asset}] ❌ SIZE TOO SMALL: "
-                    f"Max position ${max_size:.2f} (bankroll ${self.risk_manager.current_bankroll:.2f} × "
-                    f"{self.config.trading.max_position_pct:.0%}) < $3 minimum"
-                )
-            return
-
         # Trade history filter - check past performance for this asset/side
         trade_history = get_trade_history()
         should_proceed, history_reason = trade_history.evaluate_trade(
@@ -2231,7 +2215,8 @@ class TradingBot:
                 logger.info(f"[{market.asset}] ❌ HISTORY BLOCK: {history_reason}")
             return
 
-        # ML filter - check predicted win probability
+        # ML filter - check predicted win probability (do this BEFORE sizing for Kelly)
+        ml_confidence = None
         if self.ml_predictor:
             # Extract all ML features using the helper function
             ml_features = extract_ml_features_from_market(
@@ -2251,6 +2236,9 @@ class TradingBot:
                     logger.info(f"[{market.asset}] ❌ ML BLOCK: {ml_reason} | Confidence: {confidence:.1%}")
                 return
 
+            # Store ML confidence for Kelly sizing
+            ml_confidence = confidence
+
             # Store all ML data with signal for outcome recording
             signal._ml_volatility = ml_features["volatility"]
             signal._ml_momentum = ml_features["price_momentum"]
@@ -2266,6 +2254,26 @@ class TradingBot:
             signal._ml_trend_1h = ml_features.get("trend_1h", 0.0)
             signal._ml_trend_4h = ml_features.get("trend_4h", 0.0)
             signal._ml_trend_1d = ml_features.get("trend_1d", 0.0)
+
+        # Adjust size using Kelly criterion (with ML confidence for optimal sizing)
+        signal = self.risk_manager.adjust_signal_size(
+            signal,
+            ml_confidence=ml_confidence,
+            use_kelly=True,
+        )
+
+        # Check if signal was rejected due to size
+        if signal.size_usd <= 0 or signal.size_shares <= 0:
+            size_key = f"{market.condition_id}:size_too_small"
+            if size_key not in self._logged_rejections:
+                self._logged_rejections.add(size_key)
+                max_size = self.risk_manager.current_bankroll * self.config.trading.max_position_pct
+                logger.info(
+                    f"[{market.asset}] ❌ SIZE TOO SMALL: "
+                    f"Max position ${max_size:.2f} (bankroll ${self.risk_manager.current_bankroll:.2f} × "
+                    f"{self.config.trading.max_position_pct:.0%}) < $3 minimum"
+                )
+            return
 
         # Execute the signal
         await self._execute_signal(signal)
