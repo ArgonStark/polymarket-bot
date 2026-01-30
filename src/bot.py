@@ -1979,18 +1979,27 @@ class TradingBot:
                 clob_trades = get_trades(self.client, limit=500)
                 logger.info(f"📊 [1/4] CLOB Trades: {len(clob_trades)} found")
 
+                # Count trades with Up/Down outcomes (15-min crypto indicators)
+                up_down_trades = [t for t in clob_trades if t.get("outcome", "").lower() in ["up", "down"]]
+                if up_down_trades:
+                    logger.info(f"     └─ {len(up_down_trades)} trades with Up/Down outcomes (15-min crypto)")
+
                 # Log sample trades for visibility
                 if clob_trades and len(clob_trades) > 0:
                     for i, sample in enumerate(clob_trades[:3]):
+                        market_id = sample.get('market', '')[:12] + '...' if sample.get('market') else '?'
                         logger.info(
                             f"     └─ Trade {i+1}: {sample.get('side', '?'):4} | "
                             f"Price: {sample.get('price', '?')} | "
                             f"Size: {sample.get('size', '?')} | "
-                            f"Outcome: {sample.get('outcome', '?')}"
+                            f"Outcome: {sample.get('outcome', '?')} | "
+                            f"Market: {market_id}"
                         )
                     if len(clob_trades) > 3:
                         logger.info(f"     └─ ... and {len(clob_trades) - 3} more")
 
+                # Process trades with market lookup
+                lookups_done = 0
                 for trade in clob_trades:
                     result = self._process_clob_trade_for_ml(trade)
                     if result == "synced":
@@ -2000,6 +2009,13 @@ class TradingBot:
                     elif result == "crypto":
                         crypto_trades_found += 1
                     total_trades_found += 1
+
+                # Show market lookup stats
+                if hasattr(self, '_market_lookup_cache'):
+                    cache_size = len(self._market_lookup_cache)
+                    crypto_markets = sum(1 for v in self._market_lookup_cache.values() if v and v.get("asset"))
+                    if cache_size > 0:
+                        logger.info(f"     └─ Market lookups: {cache_size} total, {crypto_markets} 15-min crypto identified")
             except Exception as e:
                 logger.info(f"📊 [1/4] CLOB Trades: Failed ({e})")
 
@@ -2319,7 +2335,7 @@ class TradingBot:
             "price": "0.55",
             "status": "MATCHED",
             "match_time": "1234567890",
-            "outcome": "Yes" or "No",
+            "outcome": "Yes" or "No" or "Up" or "Down",
             "taker_order_id": "...",
             "maker_address": "0x...",
             "fee_rate_bps": "0",
@@ -2355,35 +2371,74 @@ class TradingBot:
             if price <= 0 or size <= 0:
                 return "skip"
 
-            # For CLOB trades, we need to determine the market type
-            # Check if we have this market in our known markets
-            market = self.markets.get(market_id) or self.expiring_markets.get(market_id)
-
-            asset = None
+            # Determine side from outcome (Up/Down for 15-min crypto markets)
+            outcome_lower = outcome.lower()
             side = None
+            if outcome_lower in ["yes", "up"]:
+                side = Side.UP
+            elif outcome_lower in ["no", "down"]:
+                side = Side.DOWN
+            else:
+                return "skip"  # Not a 15-min crypto market
+
+            # For CLOB trades, we need to determine the asset
+            # First check if we have this market in our known markets
+            market = self.markets.get(market_id) or self.expiring_markets.get(market_id)
+            asset = None
 
             if market:
-                # We have market info
+                # We have market info cached
                 asset = market.asset
-                # Determine side from outcome
-                if outcome.lower() in ["yes", "up"]:
-                    side = Side.UP
-                elif outcome.lower() in ["no", "down"]:
-                    side = Side.DOWN
             else:
-                # Try to identify from asset_id pattern
-                asset_id_lower = asset_id.lower()
-                for pattern, asset_name in [("btc", "BTC"), ("eth", "ETH"), ("sol", "SOL"), ("xrp", "XRP")]:
-                    if pattern in asset_id_lower:
-                        asset = asset_name
-                        break
+                # Initialize market lookup cache if needed
+                if not hasattr(self, '_market_lookup_cache'):
+                    self._market_lookup_cache = {}
 
-                if outcome.lower() in ["yes", "up"]:
-                    side = Side.UP
-                elif outcome.lower() in ["no", "down"]:
-                    side = Side.DOWN
+                # Check cache first
+                if market_id in self._market_lookup_cache:
+                    cached = self._market_lookup_cache[market_id]
+                    if cached:
+                        asset = cached.get("asset")
+                else:
+                    # Look up market from Gamma API
+                    try:
+                        market_info = self.gamma_api.get_market_by_id(market_id)
+                        if market_info:
+                            slug = market_info.get("slug", "").lower()
+                            question = market_info.get("question", "").lower()
 
-            if not asset or not side:
+                            # Check if this is a 15-min crypto market
+                            is_15min = any(p in slug or p in question for p in [
+                                "updown-15m", "-15m-", "15min", "15-min", "15m",
+                                "up-down-15m", "updown15m"
+                            ])
+
+                            if is_15min:
+                                # Identify asset from slug or question
+                                for pattern, asset_name in [
+                                    ("btc", "BTC"), ("bitcoin", "BTC"),
+                                    ("eth", "ETH"), ("ethereum", "ETH"),
+                                    ("sol", "SOL"), ("solana", "SOL"),
+                                    ("xrp", "XRP"), ("ripple", "XRP"),
+                                ]:
+                                    if pattern in slug or pattern in question:
+                                        asset = asset_name
+                                        break
+
+                            # Cache the result (even if not 15-min, to avoid re-lookup)
+                            self._market_lookup_cache[market_id] = {
+                                "asset": asset,
+                                "is_15min": is_15min,
+                                "slug": slug,
+                            }
+                        else:
+                            # Cache negative result
+                            self._market_lookup_cache[market_id] = None
+                    except Exception as e:
+                        logger.debug(f"Market lookup failed for {market_id[:16]}...: {e}")
+                        self._market_lookup_cache[market_id] = None
+
+            if not asset:
                 return "skip"
 
             # For CLOB trades, we can't directly determine win/loss without settlement
