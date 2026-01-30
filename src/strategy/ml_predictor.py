@@ -399,10 +399,12 @@ class SimpleNeuralNetwork:
     @classmethod
     def from_dict(cls, data: dict) -> "SimpleNeuralNetwork":
         """Deserialize model."""
+        # Use current architecture defaults (33 features, 32 hidden)
+        # Old models with wrong dimensions will be re-initialized
         return cls(
-            input_size=data.get("input_size", 11),
-            hidden_size=data.get("hidden_size", 16),
-            learning_rate=data.get("learning_rate", 0.05),
+            input_size=data.get("input_size", 33),  # Must match TradeFeatures.to_vector()
+            hidden_size=data.get("hidden_size", 32),  # Current architecture
+            learning_rate=data.get("learning_rate", 0.03),  # Current default
             weights_ih=data.get("weights_ih", []),
             weights_ho=data.get("weights_ho", []),
             bias_h=data.get("bias_h", []),

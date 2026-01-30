@@ -147,23 +147,31 @@ class ChainlinkFeed:
         self._retry_count = 0  # Reset retry count on successful connection
 
         # Subscribe to both Chainlink and Binance crypto prices
-        # Per Polymarket docs: https://docs.polymarket.com/developers/RTDS/RTDS-crypto-prices
-        # - Binance filters: comma-separated string (e.g., "btcusdt,ethusdt,solusdt,xrpusdt")
-        # - Chainlink filters: omit or empty string for all symbols
+        # Per Polymarket GitHub: https://github.com/Polymarket/real-time-data-client
+        # - filters is a JSON STRING containing an object: '{"symbol":"BTCUSDT"}'
+        # - Each symbol needs its own subscription entry
+        # - Binance uses uppercase: BTCUSDT, Chainlink uses lowercase: btc/usd
+        subscriptions = []
+
+        # Chainlink subscriptions (for settlement prices)
+        for symbol in ["btc/usd", "eth/usd", "sol/usd", "xrp/usd"]:
+            subscriptions.append({
+                "topic": self.config.endpoints.chainlink_topic,
+                "type": "*",
+                "filters": json.dumps({"symbol": symbol}),  # JSON string: '{"symbol":"btc/usd"}'
+            })
+
+        # Binance subscriptions (for leading indicator)
+        for symbol in ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]:
+            subscriptions.append({
+                "topic": "crypto_prices",
+                "type": "update",
+                "filters": json.dumps({"symbol": symbol}),  # JSON string: '{"symbol":"BTCUSDT"}'
+            })
+
         subscribe_msg = {
             "action": "subscribe",
-            "subscriptions": [
-                {
-                    "topic": self.config.endpoints.chainlink_topic,
-                    "type": "*",
-                    # No filters = subscribe to all Chainlink symbols
-                },
-                {
-                    "topic": "crypto_prices",  # Binance prices via Polymarket
-                    "type": "update",
-                    "filters": "btcusdt,ethusdt,solusdt,xrpusdt",  # Comma-separated string per docs
-                }
-            ],
+            "subscriptions": subscriptions,
         }
         try:
             ws.send(json.dumps(subscribe_msg))
