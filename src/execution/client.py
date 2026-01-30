@@ -252,7 +252,10 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
 
         all_positions = response.json()
         if not all_positions:
+            logger.debug("API returned no positions")
             return {}
+
+        logger.debug(f"API returned {len(all_positions)} total positions")
 
         current_time = int(time.time())
         positions = {}
@@ -266,60 +269,101 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
         }
 
         for pos in all_positions:
-            slug = pos.get("slug", "").lower() or pos.get("eventSlug", "").lower()
-            title = pos.get("title", "").lower()
+            # Try multiple field names for slug (API may vary)
+            slug = (
+                pos.get("slug", "") or
+                pos.get("eventSlug", "") or
+                pos.get("market_slug", "") or
+                pos.get("marketSlug", "") or
+                ""
+            ).lower()
+            title = (pos.get("title", "") or pos.get("question", "") or "").lower()
+            size = float(pos.get("size", 0))
+
+            # Skip zero-size positions
+            if size <= 0:
+                continue
+
+            # Log all non-zero positions for debugging
+            logger.debug(f"Checking position: slug={slug[:50]}, title={title[:50]}, size={size}")
 
             # Check if this is a 15-min crypto market
-            if "updown-15m" not in slug and "15m" not in title:
+            is_15m = "updown-15m" in slug or "15m" in title or "15-min" in title
+            if not is_15m:
+                logger.debug(f"  -> Skipped: not a 15-min market")
                 continue
 
-            # Extract timestamp from slug (e.g., btc-updown-15m-1706123400)
-            # If we can't determine the timestamp, skip to be safe (don't block new trades)
-            market_ts = None
-            try:
-                parts = slug.split("-")
-                if len(parts) >= 4:
-                    market_ts = int(parts[-1])
-            except (ValueError, IndexError):
-                pass
-
-            if market_ts is None:
-                # Can't determine market timestamp - skip this position
-                logger.debug(f"Skipping position with unparseable slug: {slug}")
-                continue
-
-            # Check if market is still active (settles at market_ts + 900)
-            if current_time > market_ts + 900:
-                logger.debug(f"Skipping settled position: {slug} (settled {current_time - market_ts - 900:.0f}s ago)")
-                continue  # Market already settled
-
-            # Identify asset
+            # Identify asset first (before timestamp check)
             asset = None
             for pattern, asset_name in asset_patterns.items():
                 if pattern in slug or pattern in title:
                     asset = asset_name
                     break
 
-            if asset and asset not in positions:
-                size = float(pos.get("size", 0))
+            if not asset:
+                logger.debug(f"  -> Skipped: unknown asset (not BTC/ETH/SOL/XRP)")
+                continue
+
+            # Extract timestamp from slug (e.g., btc-updown-15m-1706123400)
+            market_ts = None
+            try:
+                parts = slug.split("-")
+                if len(parts) >= 4:
+                    # Try last part as timestamp
+                    market_ts = int(parts[-1])
+            except (ValueError, IndexError):
+                pass
+
+            # If we couldn't parse timestamp from slug, try conditionId or other fields
+            if market_ts is None:
+                # Try to extract from other fields
+                cond_id = pos.get("conditionId", "")
+                if cond_id:
+                    # Sometimes the timestamp is embedded differently
+                    # Just accept the position if it's a valid 15m market
+                    logger.debug(f"  -> Could not parse timestamp, but accepting 15m {asset} position")
+                    # Use current time as approximate (will be slightly off but better than missing)
+                    market_ts = current_time - 450  # Assume ~7.5 min into period
+
+            if market_ts is None:
+                logger.debug(f"  -> Skipped: cannot determine market timestamp")
+                continue
+
+            # Check if market is still active (settles at market_ts + 900)
+            # Add 60s buffer for settlement processing delays
+            settle_buffer = 60
+            if current_time > market_ts + 900 + settle_buffer:
+                elapsed = current_time - market_ts - 900
+                logger.debug(f"  -> Skipped: market settled {elapsed:.0f}s ago")
+                continue
+
+            # Track position (only one per asset)
+            if asset not in positions:
                 avg_price = float(pos.get("avgPrice", 0))
                 current_value = float(pos.get("currentValue", 0))
 
-                if size > 0:
-                    positions[asset] = {
-                        "size": size,
-                        "price": avg_price,
-                        "cost": size * avg_price,
-                        "current_value": current_value,
-                        "market": slug,
-                        "title": pos.get("title", ""),
-                    }
-                    logger.info(f"Position: {asset} | {size:.2f} shares @ {avg_price:.2f} | Value: ${current_value:.2f}")
+                positions[asset] = {
+                    "size": size,
+                    "price": avg_price,
+                    "cost": size * avg_price,
+                    "current_value": current_value,
+                    "market": slug,
+                    "title": pos.get("title", ""),
+                    "conditionId": pos.get("conditionId", ""),
+                }
+                logger.info(f"📍 Found position: {asset} | {size:.2f} shares @ {avg_price:.2f} | Value: ${current_value:.2f}")
+
+        if positions:
+            logger.info(f"📊 Active positions: {', '.join(positions.keys())}")
+        else:
+            logger.debug("No active 15-min crypto positions found")
 
         return positions
 
     except Exception as e:
         logger.error(f"Failed to get positions from API: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
         return {}
 
 
