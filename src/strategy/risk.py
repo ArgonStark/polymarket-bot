@@ -177,22 +177,55 @@ class RiskManager:
 
         return (True, "")
 
-    def adjust_signal_size(self, signal: Signal) -> Signal:
+    def adjust_signal_size(
+        self,
+        signal: Signal,
+        ml_confidence: Optional[float] = None,
+        use_kelly: bool = True,
+    ) -> Signal:
         """
         Adjust signal size to fit within risk limits.
 
-        Uses ONLY bankroll percentage - no fixed base size.
-        Position size = bankroll × max_position_pct
+        Supports two modes:
+        1. Kelly Criterion (when ml_confidence provided and use_kelly=True)
+        2. Fixed percentage (fallback)
+
+        Args:
+            signal: Trading signal to adjust
+            ml_confidence: ML predicted win probability (enables Kelly sizing)
+            use_kelly: Whether to use Kelly criterion when confidence available
         """
         trading = self.config.trading
 
-        # Simple: position size is percentage of current bankroll
         # Keep 10% buffer for fees
         available = self.current_bankroll * 0.90
-        position_size = min(
-            self.current_bankroll * trading.max_position_pct,
-            available
-        )
+        max_position = self.current_bankroll * trading.max_position_pct
+
+        # Try Kelly criterion if ML confidence available
+        if use_kelly and ml_confidence is not None and ml_confidence > 0.52:
+            try:
+                from .kelly import calculate_kelly_position
+                kelly_size, kelly_details = calculate_kelly_position(
+                    bankroll=self.current_bankroll,
+                    win_probability=ml_confidence,
+                    market_price=signal.recommended_price,
+                    edge=signal.edge,
+                    max_position_usd=max_position,
+                )
+                position_size = min(kelly_size, available)
+
+                # Log Kelly sizing
+                kelly_frac = kelly_details.get("adjusted_kelly_fraction", 0)
+                logger.debug(
+                    f"[{signal.market.asset}] Kelly size: ${position_size:.2f} "
+                    f"({kelly_frac:.1%} of bankroll) | ML conf: {ml_confidence:.1%}"
+                )
+            except Exception as e:
+                logger.debug(f"Kelly calculation failed, using fixed %: {e}")
+                position_size = min(max_position, available)
+        else:
+            # Fallback: fixed percentage of bankroll
+            position_size = min(max_position, available)
 
         # Ensure minimum viable trade size ($3)
         if position_size < 3.0:
