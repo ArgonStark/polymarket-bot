@@ -1047,10 +1047,16 @@ class TradingBot:
                 # Process markets - parallel or sequential based on config
                 if self.config.trading.parallel_execution:
                     # Parallel execution - process all markets simultaneously
-                    await asyncio.gather(
+                    results = await asyncio.gather(
                         *[self._process_market(m) for m in sorted_markets],
                         return_exceptions=True
                     )
+                    # Log any exceptions that were silently returned
+                    for i, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            market = sorted_markets[i] if i < len(sorted_markets) else None
+                            asset = market.asset if market else "UNKNOWN"
+                            logger.error(f"[{asset}] Market processing error: {result}")
                 else:
                     # Sequential execution
                     for market in sorted_markets:
@@ -2185,6 +2191,7 @@ class TradingBot:
         )
 
         # Validate signal against risk limits
+        logger.info(f"[{market.asset}] ✓1 Risk validation")
         is_valid, reason = self.risk_manager.validate_signal(signal)
         if not is_valid:
             # Always log the blocking reason (cleared every 30s to avoid spam)
@@ -2196,9 +2203,12 @@ class TradingBot:
                     f"Bankroll: ${self.risk_manager.current_bankroll:.2f} | "
                     f"Positions: {len(self.risk_manager.positions)}"
                 )
+            else:
+                logger.info(f"[{market.asset}] ⏸️ BLOCKED (repeat): {reason}")
             return
 
         # Trade history filter - check past performance for this asset/side
+        logger.info(f"[{market.asset}] ✓2 History filter")
         trade_history = get_trade_history()
         should_proceed, history_reason = trade_history.evaluate_trade(
             asset=market.asset,
@@ -2213,9 +2223,12 @@ class TradingBot:
             if rejection_key not in self._logged_rejections:
                 self._logged_rejections.add(rejection_key)
                 logger.info(f"[{market.asset}] ❌ HISTORY BLOCK: {history_reason}")
+            else:
+                logger.info(f"[{market.asset}] ⏸️ HISTORY (repeat): {history_reason}")
             return
 
         # ML filter - check predicted win probability (do this BEFORE sizing for Kelly)
+        logger.info(f"[{market.asset}] ✓3 ML filter")
         ml_confidence = None
         if self.ml_predictor:
             # Extract all ML features using the helper function
@@ -2234,6 +2247,8 @@ class TradingBot:
                 if rejection_key not in self._logged_rejections:
                     self._logged_rejections.add(rejection_key)
                     logger.info(f"[{market.asset}] ❌ ML BLOCK: {ml_reason} | Confidence: {confidence:.1%}")
+                else:
+                    logger.info(f"[{market.asset}] ⏸️ ML (repeat): {ml_reason} | Conf: {confidence:.1%}")
                 return
 
             # Store ML confidence for Kelly sizing
@@ -2256,6 +2271,7 @@ class TradingBot:
             signal._ml_trend_1d = ml_features.get("trend_1d", 0.0)
 
         # Adjust size using Kelly criterion (with ML confidence for optimal sizing)
+        logger.info(f"[{market.asset}] ✓4 Kelly sizing (conf: {ml_confidence})")
         signal = self.risk_manager.adjust_signal_size(
             signal,
             ml_confidence=ml_confidence,
@@ -2263,6 +2279,7 @@ class TradingBot:
         )
 
         # Check if signal was rejected due to size
+        logger.info(f"[{market.asset}] ✓5 Size: ${signal.size_usd:.2f} ({signal.size_shares:.1f} shares)")
         if signal.size_usd <= 0 or signal.size_shares <= 0:
             size_key = f"{market.condition_id}:size_too_small"
             if size_key not in self._logged_rejections:
@@ -2273,9 +2290,12 @@ class TradingBot:
                     f"Max position ${max_size:.2f} (bankroll ${self.risk_manager.current_bankroll:.2f} × "
                     f"{self.config.trading.max_position_pct:.0%}) < $3 minimum"
                 )
+            else:
+                logger.info(f"[{market.asset}] ⏸️ SIZE (repeat): too small")
             return
 
         # Execute the signal
+        logger.info(f"[{market.asset}] ✓6 EXECUTING TRADE!")
         await self._execute_signal(signal)
 
     def _update_market_from_orderbook(self, market: MarketState):
