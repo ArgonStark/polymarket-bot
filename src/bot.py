@@ -1960,6 +1960,7 @@ class TradingBot:
                 return
 
             logger.info(f"🤖 ML Sync: Fetching trades for {wallet_address[:10]}...")
+            logger.info("─" * 50)
 
             # Initialize Data API
             data_api = get_data_api()
@@ -1971,103 +1972,164 @@ class TradingBot:
             synced_count = 0
             total_trades_found = 0
             crypto_trades_found = 0
+            source_stats = {"clob": 0, "closed": 0, "activity": 0, "redeem": 0}
 
             # === Method 0: CLOB Trades (direct from order book - most reliable) ===
             try:
                 clob_trades = get_trades(self.client, limit=500)
-                logger.info(f"🤖 ML Sync: Found {len(clob_trades)} CLOB trades")
+                logger.info(f"📊 [1/4] CLOB Trades: {len(clob_trades)} found")
 
-                # Log sample trade for debugging
+                # Log sample trades for visibility
                 if clob_trades and len(clob_trades) > 0:
-                    sample = clob_trades[0]
-                    logger.debug(
-                        f"🤖 CLOB Sample: id={sample.get('id', '')[:20]}... "
-                        f"market={sample.get('market', '')[:20]}... "
-                        f"side={sample.get('side')} price={sample.get('price')} "
-                        f"size={sample.get('size')} outcome={sample.get('outcome')}"
-                    )
+                    for i, sample in enumerate(clob_trades[:3]):
+                        logger.info(
+                            f"     └─ Trade {i+1}: {sample.get('side', '?'):4} | "
+                            f"Price: {sample.get('price', '?')} | "
+                            f"Size: {sample.get('size', '?')} | "
+                            f"Outcome: {sample.get('outcome', '?')}"
+                        )
+                    if len(clob_trades) > 3:
+                        logger.info(f"     └─ ... and {len(clob_trades) - 3} more")
 
                 for trade in clob_trades:
                     result = self._process_clob_trade_for_ml(trade)
                     if result == "synced":
                         synced_count += 1
                         crypto_trades_found += 1
+                        source_stats["clob"] += 1
                     elif result == "crypto":
                         crypto_trades_found += 1
                     total_trades_found += 1
             except Exception as e:
-                logger.debug(f"CLOB trades fetch failed (may need L2 auth): {e}")
+                logger.info(f"📊 [1/4] CLOB Trades: Failed ({e})")
 
             # === Method 1: Closed Positions (completed trades with P&L) ===
             closed_positions = data_api.get_all_closed_positions(wallet_address, max_positions=500)
-            logger.info(f"🤖 ML Sync: Found {len(closed_positions)} closed positions")
+            logger.info(f"📊 [2/4] Closed Positions: {len(closed_positions)} found")
 
-            # Log sample for debugging
-            if closed_positions and len(closed_positions) > 0:
-                sample = closed_positions[0]
-                logger.debug(
-                    f"🤖 Closed Sample: slug={sample.get('slug', '')[:40]}... "
-                    f"outcome={sample.get('outcome')} pnl={sample.get('realizedPnl')} "
-                    f"avgPrice={sample.get('avgPrice')} totalBought={sample.get('totalBought')}"
-                )
+            # Log sample positions for visibility
+            crypto_closed = []
+            for pos in closed_positions:
+                slug = (pos.get("slug", "") or "").lower()
+                title = (pos.get("title", "") or "").lower()
+                if any(p in slug or p in title for p in ["15m", "15-min", "updown"]):
+                    crypto_closed.append(pos)
+
+            if crypto_closed:
+                for i, sample in enumerate(crypto_closed[:3]):
+                    pnl = float(sample.get('realizedPnl', 0) or 0)
+                    pnl_str = f"${pnl:+.2f}"
+                    result = "✓ WIN" if pnl > 0 else "✗ LOSS"
+                    logger.info(
+                        f"     └─ {sample.get('outcome', '?'):5} | "
+                        f"Avg: {sample.get('avgPrice', '?')} | "
+                        f"{result} {pnl_str}"
+                    )
+                if len(crypto_closed) > 3:
+                    logger.info(f"     └─ ... and {len(crypto_closed) - 3} more 15-min trades")
+            else:
+                logger.info(f"     └─ No 15-min crypto positions found")
 
             for pos in closed_positions:
                 result = self._process_trade_for_ml(pos, "closed")
                 if result == "synced":
                     synced_count += 1
                     crypto_trades_found += 1
+                    source_stats["closed"] += 1
                 elif result == "crypto":
                     crypto_trades_found += 1
                 total_trades_found += 1
 
             # === Method 2: Trade Activity (all BUY/SELL activity) ===
             trade_activity = data_api.get_all_activity(wallet_address, activity_type="TRADE", max_items=500)
-            logger.info(f"🤖 ML Sync: Found {len(trade_activity)} trade activities")
+            logger.info(f"📊 [3/4] Trade Activity: {len(trade_activity)} found")
 
-            # Log sample for debugging
-            if trade_activity and len(trade_activity) > 0:
-                sample = trade_activity[0]
-                logger.debug(
-                    f"🤖 Activity Sample: slug={sample.get('slug', '')[:40]}... "
-                    f"side={sample.get('side')} outcome={sample.get('outcome')} "
-                    f"price={sample.get('price')} size={sample.get('size')} "
-                    f"usdcSize={sample.get('usdcSize')}"
-                )
+            # Log sample activities for visibility
+            crypto_activity = []
+            for act in trade_activity:
+                slug = (act.get("slug", "") or "").lower()
+                title = (act.get("title", "") or "").lower()
+                if any(p in slug or p in title for p in ["15m", "15-min", "updown"]):
+                    crypto_activity.append(act)
+
+            if crypto_activity:
+                for i, sample in enumerate(crypto_activity[:3]):
+                    side_icon = "🟢" if sample.get('side') == "BUY" else "🔴"
+                    usdc = float(sample.get('usdcSize', 0) or 0)
+                    logger.info(
+                        f"     └─ {side_icon} {sample.get('side', '?'):4} {sample.get('outcome', '?'):5} | "
+                        f"Price: {sample.get('price', '?')} | "
+                        f"${usdc:.2f}"
+                    )
+                if len(crypto_activity) > 3:
+                    logger.info(f"     └─ ... and {len(crypto_activity) - 3} more 15-min trades")
+            else:
+                logger.info(f"     └─ No 15-min crypto activity found")
 
             for trade in trade_activity:
                 result = self._process_trade_for_ml(trade, "activity")
                 if result == "synced":
                     synced_count += 1
                     crypto_trades_found += 1
+                    source_stats["activity"] += 1
                 elif result == "crypto":
                     crypto_trades_found += 1
                 total_trades_found += 1
 
             # === Method 3: Redeem Activity (claimed winnings) ===
             redeem_activity = data_api.get_all_activity(wallet_address, activity_type="REDEEM", max_items=200)
-            logger.info(f"🤖 ML Sync: Found {len(redeem_activity)} redeem activities")
+            logger.info(f"📊 [4/4] Redeem Activity: {len(redeem_activity)} found")
+
+            # Log sample redeems for visibility
+            crypto_redeems = []
+            for act in redeem_activity:
+                slug = (act.get("slug", "") or "").lower()
+                title = (act.get("title", "") or "").lower()
+                if any(p in slug or p in title for p in ["15m", "15-min", "updown"]):
+                    crypto_redeems.append(act)
+
+            if crypto_redeems:
+                for i, sample in enumerate(crypto_redeems[:3]):
+                    usdc = float(sample.get('usdcSize', 0) or 0)
+                    logger.info(
+                        f"     └─ 💰 {sample.get('outcome', '?'):5} redeemed | "
+                        f"${usdc:.2f}"
+                    )
+                if len(crypto_redeems) > 3:
+                    logger.info(f"     └─ ... and {len(crypto_redeems) - 3} more redeems")
+            else:
+                logger.info(f"     └─ No 15-min crypto redeems found")
 
             for redeem in redeem_activity:
                 result = self._process_trade_for_ml(redeem, "redeem")
                 if result == "synced":
                     synced_count += 1
                     crypto_trades_found += 1
+                    source_stats["redeem"] += 1
                 elif result == "crypto":
                     crypto_trades_found += 1
 
             # Summary logging
+            logger.info("─" * 50)
             if synced_count > 0:
+                sources_used = [f"{k}:{v}" for k, v in source_stats.items() if v > 0]
                 logger.info(
-                    f"🤖 ML synced {synced_count} NEW trades | "
-                    f"Total samples: {self.ml_predictor.training_samples}"
+                    f"✅ ML SYNCED: {synced_count} new trades | "
+                    f"Sources: {', '.join(sources_used) or 'none'}"
+                )
+                logger.info(
+                    f"📈 Total ML samples: {self.ml_predictor.training_samples}"
                 )
             elif crypto_trades_found > 0:
                 logger.info(
-                    f"🤖 Found {crypto_trades_found} crypto trades (already synced or pending)"
+                    f"ℹ️  Found {crypto_trades_found} crypto trades (already synced or pending settlement)"
                 )
             else:
                 logger.info(
-                    f"🤖 No 15-min crypto trades found in {total_trades_found} total activities"
+                    f"⚠️  No 15-min crypto trades found in {total_trades_found} total activities"
+                )
+                logger.info(
+                    f"    Hint: Make sure you have traded 15-min crypto markets (BTC/ETH/SOL/XRP)"
                 )
 
         except Exception as e:
@@ -2233,8 +2295,9 @@ class TradingBot:
             # Mark as synced
             self._synced_trades.add(trade_key)
 
-            result_str = "WIN" if won else "LOSS"
-            logger.debug(f"🤖 ML: Synced {asset} {side.value} {result_str} from {source}")
+            result_str = "✓ WIN" if won else "✗ LOSS"
+            result_icon = "🟢" if won else "🔴"
+            logger.info(f"     {result_icon} ML +1: {asset} {side.value:4} {result_str} (from {source})")
 
             return "synced"
 
@@ -2382,8 +2445,9 @@ class TradingBot:
 
             self._synced_trades.add(trade_key)
 
-            result_str = "WIN" if won else "LOSS"
-            logger.debug(f"🤖 ML: Synced {asset} {side.value} {result_str} from CLOB")
+            result_str = "✓ WIN" if won else "✗ LOSS"
+            result_icon = "🟢" if won else "🔴"
+            logger.info(f"     {result_icon} ML +1: {asset} {side.value:4} {result_str} (from CLOB)")
 
             return "synced"
 
