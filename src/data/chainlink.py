@@ -171,7 +171,9 @@ class ChainlinkFeed:
             ],
         }
         try:
-            ws.send(json.dumps(subscribe_msg))
+            msg_json = json.dumps(subscribe_msg)
+            logger.info(f"Sending subscription: {msg_json}")
+            ws.send(msg_json)
             logger.info(f"Subscribed to {self.config.endpoints.chainlink_topic} and crypto_prices (Binance)")
         except Exception as e:
             logger.error(f"Failed to send subscription message: {e}")
