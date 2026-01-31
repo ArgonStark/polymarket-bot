@@ -174,6 +174,11 @@ class ChartAnalysis:
     is_bearish_pattern: bool = False
     pattern_name: str = ""
 
+    # Market uncertainty (trend change detection)
+    is_uncertain: bool = False  # True if market is in transition
+    uncertainty_score: float = 0.0  # 0 to 1
+    uncertainty_reason: str = ""  # Why market is uncertain
+
     # Recommendation
     bias: str = "neutral"  # "bullish", "bearish", "neutral"
     confidence: float = 0.5  # 0 to 1
@@ -193,6 +198,9 @@ class ChartAnalysis:
             "momentum": self.momentum,
             "bias": self.bias,
             "confidence": self.confidence,
+            "is_uncertain": self.is_uncertain,
+            "uncertainty_score": self.uncertainty_score,
+            "uncertainty_reason": self.uncertainty_reason,
         }
 
 
@@ -518,6 +526,84 @@ class BinanceChartAnalyzer:
 
         return TrendChange.NO_CHANGE, 0.0
 
+    def detect_market_uncertainty(self, candles: List[Candle]) -> tuple[bool, float, str]:
+        """
+        Detect if the market is in an uncertain/transitional state.
+
+        Signs of uncertainty:
+        1. EMAs are very close together (about to cross or just crossed)
+        2. Recent volatility spike
+        3. Conflicting timeframe signals
+        4. Price oscillating around EMAs
+
+        Returns:
+            Tuple of (is_uncertain, uncertainty_score 0-1, reason)
+        """
+        if len(candles) < 30:
+            return False, 0.0, ""
+
+        closes = [c.close for c in candles]
+        current_price = closes[-1]
+
+        # Calculate EMAs
+        ema_9 = self.calculate_ema(closes, 9)
+        ema_21 = self.calculate_ema(closes, 21)
+        ema_50 = self.calculate_ema(closes, 50) if len(closes) >= 50 else ema_21
+
+        # 1. Check if EMAs are converging (about to cross)
+        ema_spread = abs(ema_9 - ema_21) / ema_21
+        emas_converging = ema_spread < 0.002  # Within 0.2%
+
+        # 2. Check for volatility spike
+        atr = self.calculate_atr(candles)
+        avg_atr = sum(c.range for c in candles[-20:]) / 20
+        volatility_spike = atr > avg_atr * 1.5
+
+        # 3. Check if price is oscillating around EMAs
+        price_above_ema9 = current_price > ema_9
+        price_above_ema21 = current_price > ema_21
+        ema9_above_ema21 = ema_9 > ema_21
+
+        # Mixed signals = uncertainty
+        signals_mixed = (price_above_ema9 != price_above_ema21) or \
+                        (price_above_ema9 != ema9_above_ema21)
+
+        # 4. Check recent price action for whipsaws
+        recent_closes = closes[-10:]
+        crosses_ema = 0
+        for i in range(1, len(recent_closes)):
+            if (recent_closes[i] > ema_21 and recent_closes[i-1] < ema_21) or \
+               (recent_closes[i] < ema_21 and recent_closes[i-1] > ema_21):
+                crosses_ema += 1
+        whipsaw = crosses_ema >= 2  # 2+ crosses in last 10 candles
+
+        # Calculate uncertainty score
+        uncertainty_score = 0.0
+        reasons = []
+
+        if emas_converging:
+            uncertainty_score += 0.35
+            reasons.append("EMAs converging")
+
+        if volatility_spike:
+            uncertainty_score += 0.25
+            reasons.append("volatility spike")
+
+        if signals_mixed:
+            uncertainty_score += 0.25
+            reasons.append("mixed signals")
+
+        if whipsaw:
+            uncertainty_score += 0.30
+            reasons.append("whipsaw detected")
+
+        uncertainty_score = min(1.0, uncertainty_score)
+        is_uncertain = uncertainty_score >= 0.5
+
+        reason = ", ".join(reasons) if reasons else "stable"
+
+        return is_uncertain, uncertainty_score, reason
+
     def detect_patterns(self, candles: List[Candle]) -> tuple[bool, bool, str]:
         """
         Detect bullish/bearish candlestick patterns.
@@ -735,6 +821,18 @@ class BinanceChartAnalyzer:
                 bias = "neutral"
                 confidence = 0.5
 
+            # Detect market uncertainty (trend changes, transitions)
+            is_uncertain, uncertainty_score, uncertainty_reason = self.detect_market_uncertainty(candles_15m)
+
+            # Also flag as uncertain if we just had a reversal
+            if trend_change in [TrendChange.BULLISH_REVERSAL, TrendChange.BEARISH_REVERSAL]:
+                is_uncertain = True
+                uncertainty_score = max(uncertainty_score, 0.7)
+                if uncertainty_reason:
+                    uncertainty_reason += f", {trend_change.value}"
+                else:
+                    uncertainty_reason = trend_change.value
+
             analysis = ChartAnalysis(
                 asset=asset,
                 timestamp=datetime.now(timezone.utc),
@@ -766,6 +864,9 @@ class BinanceChartAnalyzer:
                 is_bullish_pattern=is_bullish,
                 is_bearish_pattern=is_bearish,
                 pattern_name=pattern_name,
+                is_uncertain=is_uncertain,
+                uncertainty_score=uncertainty_score,
+                uncertainty_reason=uncertainty_reason,
                 bias=bias,
                 confidence=confidence,
             )
@@ -853,3 +954,58 @@ def is_trend_changing(asset: str) -> tuple[bool, TrendChange, float]:
         ]
         return is_changing, analysis.trend_change, analysis.trend_change_confidence
     return False, TrendChange.NO_CHANGE, 0.0
+
+
+def is_market_uncertain(asset: str) -> tuple[bool, float, str]:
+    """
+    Check if the market is in an uncertain/transitional state.
+
+    This is used to pause trading during trend changes.
+
+    Returns:
+        Tuple of (is_uncertain, uncertainty_score, reason)
+    """
+    analysis = analyze_chart(asset)
+    if analysis:
+        return analysis.is_uncertain, analysis.uncertainty_score, analysis.uncertainty_reason
+    return False, 0.0, ""
+
+
+def should_pause_trading(asset: str, min_uncertainty: float = 0.5) -> tuple[bool, str]:
+    """
+    Determine if trading should be paused for an asset.
+
+    Reasons to pause:
+    1. Market uncertainty is high (trend change in progress)
+    2. EMAs converging (about to cross)
+    3. Recent reversal detected
+
+    Args:
+        asset: Asset symbol
+        min_uncertainty: Minimum uncertainty score to trigger pause (default 0.5)
+
+    Returns:
+        Tuple of (should_pause, reason)
+    """
+    analysis = analyze_chart(asset)
+    if not analysis:
+        return False, ""
+
+    reasons = []
+
+    # Check uncertainty
+    if analysis.is_uncertain and analysis.uncertainty_score >= min_uncertainty:
+        reasons.append(f"market uncertain ({analysis.uncertainty_score:.0%}): {analysis.uncertainty_reason}")
+
+    # Check for recent reversal
+    if analysis.trend_change in [TrendChange.BULLISH_REVERSAL, TrendChange.BEARISH_REVERSAL]:
+        reasons.append(f"trend reversal: {analysis.trend_change.value}")
+
+    # Check if bias is neutral with low confidence (indecisive market)
+    if analysis.bias == "neutral" and analysis.confidence < 0.55:
+        reasons.append(f"indecisive market (bias={analysis.bias}, conf={analysis.confidence:.0%})")
+
+    if reasons:
+        return True, "; ".join(reasons)
+
+    return False, ""

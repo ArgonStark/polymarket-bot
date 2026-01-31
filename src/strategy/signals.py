@@ -47,6 +47,7 @@ try:
     from ..data.binance_chart import (
         analyze_chart,
         get_chart_bias,
+        should_pause_trading,
         MarketType,
         TrendChange,
     )
@@ -57,6 +58,8 @@ except ImportError:
         return None
     def get_chart_bias(asset: str):
         return "neutral", 0.5
+    def should_pause_trading(asset: str, min_uncertainty: float = 0.5):
+        return False, ""
 
 
 logger = logging.getLogger(__name__)
@@ -562,6 +565,10 @@ class SignalGenerator:
                 chart_analysis = analyze_chart(market.asset)
                 if chart_analysis:
                     # Log comprehensive chart analysis at INFO level for visibility
+                    uncertainty_info = ""
+                    if chart_analysis.is_uncertain:
+                        uncertainty_info = f" | ⚠️ UNCERTAIN ({chart_analysis.uncertainty_score:.0%}): {chart_analysis.uncertainty_reason}"
+
                     logger.info(
                         f"📊 CHART ANALYSIS [{market.asset}]: "
                         f"Type={chart_analysis.market_type.value} | "
@@ -572,7 +579,34 @@ class SignalGenerator:
                         f"4h={chart_analysis.trend_4h:+.2f} | "
                         f"Change={chart_analysis.trend_change.value}"
                         + (f" | Pattern={chart_analysis.pattern_name}" if chart_analysis.pattern_name else "")
+                        + uncertainty_info
                     )
+
+                    # === PAUSE TRADING DURING UNCERTAIN MARKETS ===
+                    # When market is in transition, wait for the new trend to establish
+                    if chart_analysis.is_uncertain and chart_analysis.uncertainty_score >= 0.6:
+                        logger.info(
+                            f"⏸️ MARKET PAUSE [{market.asset}]: Trend change in progress - "
+                            f"waiting for new direction | "
+                            f"Uncertainty: {chart_analysis.uncertainty_score:.0%} | "
+                            f"Reason: {chart_analysis.uncertainty_reason}"
+                        )
+                        # Return a skip signal
+                        return Signal(
+                            market=market,
+                            side=Side.NONE,
+                            edge=0.0,
+                            true_prob=0.5,
+                            market_prob=0.5,
+                            recommended_action=OrderAction.SKIP,
+                            recommended_price=0.0,
+                            size_usd=0.0,
+                            size_shares=0.0,
+                            chainlink_price=current_price,
+                            time_remaining=time_remaining,
+                            reasoning=f"[MARKET PAUSE] Trend change in progress ({chart_analysis.uncertainty_reason}). Waiting for new direction.",
+                        )
+
             except Exception as e:
                 logger.debug(f"Chart analysis failed for {market.asset}: {e}")
 
