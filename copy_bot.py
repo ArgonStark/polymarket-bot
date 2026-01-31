@@ -24,7 +24,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Set
+from typing import Optional, List, Dict
 
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -97,8 +97,9 @@ class CopyBot:
         self.client = None
         self.balance = 0.0
 
-        # Track seen trades to avoid duplicates
-        self.seen_trades: Set[str] = set()
+        # Track seen trades to avoid duplicates (with timestamp for cleanup)
+        self.seen_trades: Dict[str, float] = {}  # tx_hash -> timestamp
+        self._max_seen_trades = 1000  # Limit to prevent memory leak
 
         # Active markets cache
         self.markets: Dict[str, dict] = {}  # condition_id -> market info
@@ -213,7 +214,16 @@ class CopyBot:
                 if not tx_hash or tx_hash in self.seen_trades:
                     continue
 
-                self.seen_trades.add(tx_hash)
+                # Add to seen trades with timestamp
+                self.seen_trades[tx_hash] = time.time()
+
+                # Cleanup old entries if too many (prevent memory leak)
+                if len(self.seen_trades) > self._max_seen_trades:
+                    # Remove oldest 20% of entries
+                    sorted_entries = sorted(self.seen_trades.items(), key=lambda x: x[1])
+                    to_remove = len(self.seen_trades) // 5
+                    for old_hash, _ in sorted_entries[:to_remove]:
+                        del self.seen_trades[old_hash]
 
                 # Check if 15-min crypto market
                 slug = (trade.get("slug", "") or "").lower()
@@ -288,15 +298,24 @@ class CopyBot:
                 logger.warning(f"Skip [{asset}]: market not found")
                 return
 
+            # Check if market data is stale (older than 60 seconds)
+            refresh_time = market.get("refresh_time", 0)
+            data_age = time.time() - refresh_time
+            if data_age > 60:
+                logger.warning(f"Skip [{asset}]: stale market data ({data_age:.0f}s old)")
+                return
+
             # Determine token and price
             # outcome is "Yes" or "No" - we copy their exact position
             if outcome.lower() == "yes":
                 token_id = market.get("up_token_id")
-                price = market.get("best_ask", 0.5)
+                price = market.get("best_ask", 0.5)  # Best ask for UP token
                 our_side = "UP"
             else:
                 token_id = market.get("down_token_id")
-                price = market.get("best_ask", 0.5)
+                # DOWN token price = 1 - UP best_bid (approximately)
+                # Use down_best_ask if available, otherwise estimate
+                price = market.get("down_best_ask", 1 - market.get("best_bid", 0.5))
                 our_side = "DOWN"
 
             if not token_id or price <= 0:
@@ -448,7 +467,9 @@ class CopyBot:
                     "target_price": market.get("target_price"),
                     "best_ask": market.get("best_ask", 0.5),
                     "best_bid": market.get("best_bid", 0.5),
+                    "down_best_ask": market.get("down_best_ask", 1 - market.get("best_bid", 0.5)),
                     "end_time": market.get("end_time"),
+                    "refresh_time": time.time(),  # Track when data was last refreshed
                 }
 
             if new_markets:
