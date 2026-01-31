@@ -51,6 +51,15 @@ class TradeFeatures:
     - price_above_target: Whether price is above target (binary)
     - price_range_position: Where price sits in recent high/low range (0-1)
     - price_velocity: How fast price is moving (magnitude)
+
+    CHART ANALYSIS FEATURES (from Binance candlestick data):
+    - chart_rsi: Relative Strength Index (0-100)
+    - chart_trend_strength: How strong the current trend is (0-1)
+    - chart_market_type: Encoded market type (trending/ranging)
+    - chart_trend_change: Encoded trend change signal
+    - chart_momentum: Short-term momentum (-1 to +1)
+    - chart_bias: Overall chart bias (bullish/bearish/neutral)
+    - chart_pattern: Candlestick pattern detected
     """
     # Core features
     edge: float  # Expected edge/profit margin
@@ -80,14 +89,29 @@ class TradeFeatures:
     trend_4h: float = 0.0   # 4-hour trend (-1 to +1)
     trend_1d: float = 0.0   # 1-day trend (-1 to +1)
 
-    # NEW: Price observation features (helps ML understand price context)
+    # Price observation features (helps ML understand price context)
     price_normalized: float = 0.0  # Current price normalized (0-1 scale per asset)
     price_above_target: float = 0.0  # 1.0 if price >= target, 0.0 otherwise
     price_range_position: float = 0.5  # Position in recent range (0=low, 1=high)
     price_velocity: float = 0.0  # Speed of price movement (normalized)
 
+    # Chart analysis features (from Binance candlestick technical analysis)
+    chart_rsi: float = 50.0  # RSI (0-100)
+    chart_trend_strength: float = 0.0  # Trend strength (0-1)
+    chart_is_uptrend: float = 0.0  # 1 if uptrend, 0 otherwise
+    chart_is_downtrend: float = 0.0  # 1 if downtrend, 0 otherwise
+    chart_is_ranging: float = 0.0  # 1 if ranging market, 0 otherwise
+    chart_bullish_reversal: float = 0.0  # 1 if bullish reversal detected
+    chart_bearish_reversal: float = 0.0  # 1 if bearish reversal detected
+    chart_momentum: float = 0.0  # Short-term momentum (-1 to +1)
+    chart_bias_bullish: float = 0.0  # 1 if overall bias is bullish
+    chart_bias_bearish: float = 0.0  # 1 if overall bias is bearish
+    chart_confidence: float = 0.5  # Confidence in chart analysis (0-1)
+    chart_bullish_pattern: float = 0.0  # 1 if bullish pattern detected
+    chart_bearish_pattern: float = 0.0  # 1 if bearish pattern detected
+
     def to_vector(self) -> list[float]:
-        """Convert to feature vector for model (33 features total)."""
+        """Convert to feature vector for model (46 features total)."""
         # Normalize features to roughly 0-1 range
         # NOTE: hour_of_day and day_of_week are set to neutral (0.5) because
         # they don't predict crypto price direction - they're just noise.
@@ -131,11 +155,25 @@ class TradeFeatures:
             (self.trend_1h + 1) / 2,
             (self.trend_4h + 1) / 2,
             (self.trend_1d + 1) / 2,
-            # NEW: Price observation features (4)
+            # Price observation features (4)
             min(max(self.price_normalized, 0.0), 1.0),  # Already 0-1
             self.price_above_target,  # Binary 0 or 1
             min(max(self.price_range_position, 0.0), 1.0),  # 0-1 range position
             min(abs(self.price_velocity) * 10, 1.0),  # Velocity normalized (0.1 = 1.0)
+            # Chart analysis features (13) - from Binance candlestick analysis
+            self.chart_rsi / 100.0,  # RSI normalized 0-1
+            min(max(self.chart_trend_strength, 0.0), 1.0),  # Trend strength 0-1
+            self.chart_is_uptrend,  # Binary
+            self.chart_is_downtrend,  # Binary
+            self.chart_is_ranging,  # Binary
+            self.chart_bullish_reversal,  # Binary
+            self.chart_bearish_reversal,  # Binary
+            (self.chart_momentum + 1) / 2,  # -1,1 -> 0,1
+            self.chart_bias_bullish,  # Binary
+            self.chart_bias_bearish,  # Binary
+            min(max(self.chart_confidence, 0.0), 1.0),  # Confidence 0-1
+            self.chart_bullish_pattern,  # Binary
+            self.chart_bearish_pattern,  # Binary
         ]
         return vector
 
@@ -165,6 +203,20 @@ class TradeFeatures:
             "price_above_target": self.price_above_target,
             "price_range_position": self.price_range_position,
             "price_velocity": self.price_velocity,
+            # Chart analysis features
+            "chart_rsi": self.chart_rsi,
+            "chart_trend_strength": self.chart_trend_strength,
+            "chart_is_uptrend": self.chart_is_uptrend,
+            "chart_is_downtrend": self.chart_is_downtrend,
+            "chart_is_ranging": self.chart_is_ranging,
+            "chart_bullish_reversal": self.chart_bullish_reversal,
+            "chart_bearish_reversal": self.chart_bearish_reversal,
+            "chart_momentum": self.chart_momentum,
+            "chart_bias_bullish": self.chart_bias_bullish,
+            "chart_bias_bearish": self.chart_bias_bearish,
+            "chart_confidence": self.chart_confidence,
+            "chart_bullish_pattern": self.chart_bullish_pattern,
+            "chart_bearish_pattern": self.chart_bearish_pattern,
         }
 
     @classmethod
@@ -194,6 +246,20 @@ class TradeFeatures:
             price_above_target=data.get("price_above_target", 0.0),
             price_range_position=data.get("price_range_position", 0.5),
             price_velocity=data.get("price_velocity", 0.0),
+            # Chart analysis features
+            chart_rsi=data.get("chart_rsi", 50.0),
+            chart_trend_strength=data.get("chart_trend_strength", 0.0),
+            chart_is_uptrend=data.get("chart_is_uptrend", 0.0),
+            chart_is_downtrend=data.get("chart_is_downtrend", 0.0),
+            chart_is_ranging=data.get("chart_is_ranging", 0.0),
+            chart_bullish_reversal=data.get("chart_bullish_reversal", 0.0),
+            chart_bearish_reversal=data.get("chart_bearish_reversal", 0.0),
+            chart_momentum=data.get("chart_momentum", 0.0),
+            chart_bias_bullish=data.get("chart_bias_bullish", 0.0),
+            chart_bias_bearish=data.get("chart_bias_bearish", 0.0),
+            chart_confidence=data.get("chart_confidence", 0.5),
+            chart_bullish_pattern=data.get("chart_bullish_pattern", 0.0),
+            chart_bearish_pattern=data.get("chart_bearish_pattern", 0.0),
         )
 
 
@@ -203,12 +269,12 @@ class SimpleLogisticRegression:
     A simple logistic regression model that doesn't require sklearn.
     Uses online learning to update weights incrementally.
 
-    UPDATED: Now supports 29 features including multi-timeframe trends (1h, 4h, 1d).
+    UPDATED: Now supports 46 features including chart analysis from Binance.
     """
     weights: list[float] = field(default_factory=list)
     bias: float = 0.0
     learning_rate: float = 0.1
-    n_features: int = 33  # Number of features in TradeFeatures.to_vector()
+    n_features: int = 46  # Number of features in TradeFeatures.to_vector()
 
     def __post_init__(self):
         if not self.weights:
@@ -279,13 +345,13 @@ class SimpleNeuralNetwork:
     Simple 2-layer neural network for online learning.
     More powerful than logistic regression, adapts to new patterns.
 
-    Architecture: Input(33) -> Hidden(32) -> Output(1)
+    Architecture: Input(46) -> Hidden(48) -> Output(1)
     Uses ReLU activation and online gradient descent.
 
-    FIXED: Now uses all 33 features from TradeFeatures.to_vector()
+    UPDATED: Now uses all 46 features including chart analysis from Binance.
     """
-    input_size: int = 33  # Full feature vector (matching TradeFeatures.to_vector())
-    hidden_size: int = 32  # Larger hidden layer for more features
+    input_size: int = 46  # Full feature vector (matching TradeFeatures.to_vector())
+    hidden_size: int = 48  # Larger hidden layer for more features
     learning_rate: float = 0.03  # Slightly lower for stability
 
     # Weights
@@ -401,11 +467,11 @@ class SimpleNeuralNetwork:
     @classmethod
     def from_dict(cls, data: dict) -> "SimpleNeuralNetwork":
         """Deserialize model."""
-        # Use current architecture defaults (33 features, 32 hidden)
+        # Use current architecture defaults (46 features, 48 hidden)
         # Old models with wrong dimensions will be re-initialized
         return cls(
-            input_size=data.get("input_size", 33),  # Must match TradeFeatures.to_vector()
-            hidden_size=data.get("hidden_size", 32),  # Current architecture
+            input_size=data.get("input_size", 46),  # Must match TradeFeatures.to_vector()
+            hidden_size=data.get("hidden_size", 48),  # Current architecture
             learning_rate=data.get("learning_rate", 0.03),  # Current default
             weights_ih=data.get("weights_ih", []),
             weights_ho=data.get("weights_ho", []),
@@ -703,6 +769,20 @@ class MLSignalPredictor:
         price_high: float = 0.0,
         price_low: float = 0.0,
         price_velocity: float = 0.0,
+        # Chart analysis features
+        chart_rsi: float = 50.0,
+        chart_trend_strength: float = 0.0,
+        chart_is_uptrend: float = 0.0,
+        chart_is_downtrend: float = 0.0,
+        chart_is_ranging: float = 0.0,
+        chart_bullish_reversal: float = 0.0,
+        chart_bearish_reversal: float = 0.0,
+        chart_momentum: float = 0.0,
+        chart_bias_bullish: float = 0.0,
+        chart_bias_bearish: float = 0.0,
+        chart_confidence: float = 0.5,
+        chart_bullish_pattern: float = 0.0,
+        chart_bearish_pattern: float = 0.0,
     ) -> TradeFeatures:
         """
         Extract features from a trading signal.
@@ -727,6 +807,19 @@ class MLSignalPredictor:
             price_high: Recent high price (for range calculation)
             price_low: Recent low price (for range calculation)
             price_velocity: Rate of price change (absolute)
+            chart_rsi: RSI from Binance chart (0-100)
+            chart_trend_strength: Trend strength from chart (0-1)
+            chart_is_uptrend: 1 if chart shows uptrend
+            chart_is_downtrend: 1 if chart shows downtrend
+            chart_is_ranging: 1 if chart shows ranging market
+            chart_bullish_reversal: 1 if bullish reversal detected
+            chart_bearish_reversal: 1 if bearish reversal detected
+            chart_momentum: Chart momentum (-1 to +1)
+            chart_bias_bullish: 1 if chart bias is bullish
+            chart_bias_bearish: 1 if chart bias is bearish
+            chart_confidence: Chart analysis confidence (0-1)
+            chart_bullish_pattern: 1 if bullish pattern detected
+            chart_bearish_pattern: 1 if bearish pattern detected
         """
         now = datetime.now(timezone.utc)
 
@@ -779,6 +872,20 @@ class MLSignalPredictor:
             price_above_target=price_above_target,
             price_range_position=price_range_position,
             price_velocity=price_velocity,
+            # Chart analysis features
+            chart_rsi=chart_rsi,
+            chart_trend_strength=chart_trend_strength,
+            chart_is_uptrend=chart_is_uptrend,
+            chart_is_downtrend=chart_is_downtrend,
+            chart_is_ranging=chart_is_ranging,
+            chart_bullish_reversal=chart_bullish_reversal,
+            chart_bearish_reversal=chart_bearish_reversal,
+            chart_momentum=chart_momentum,
+            chart_bias_bullish=chart_bias_bullish,
+            chart_bias_bearish=chart_bias_bearish,
+            chart_confidence=chart_confidence,
+            chart_bullish_pattern=chart_bullish_pattern,
+            chart_bearish_pattern=chart_bearish_pattern,
         )
 
     def _get_gradual_threshold(self) -> float:
@@ -822,6 +929,20 @@ class MLSignalPredictor:
         trend_1d: float = 0.0,
         current_price: float = 0.0,
         target_price: float = 0.0,
+        # Chart analysis features
+        chart_rsi: float = 50.0,
+        chart_trend_strength: float = 0.0,
+        chart_is_uptrend: float = 0.0,
+        chart_is_downtrend: float = 0.0,
+        chart_is_ranging: float = 0.0,
+        chart_bullish_reversal: float = 0.0,
+        chart_bearish_reversal: float = 0.0,
+        chart_momentum: float = 0.0,
+        chart_bias_bullish: float = 0.0,
+        chart_bias_bearish: float = 0.0,
+        chart_confidence: float = 0.5,
+        chart_bullish_pattern: float = 0.0,
+        chart_bearish_pattern: float = 0.0,
     ) -> tuple[bool, float, str]:
         """
         Decide if we should take this trade based on ML prediction.
@@ -892,7 +1013,22 @@ class MLSignalPredictor:
             signal, volatility, price_momentum, arb_type,
             spread, bid_depth, ask_depth, price_trend, distance_from_target,
             binance_lead_pct, binance_confirmation,
-            trend_1h, trend_4h, trend_1d
+            trend_1h, trend_4h, trend_1d,
+            current_price=current_price, target_price=target_price,
+            # Chart analysis features
+            chart_rsi=chart_rsi,
+            chart_trend_strength=chart_trend_strength,
+            chart_is_uptrend=chart_is_uptrend,
+            chart_is_downtrend=chart_is_downtrend,
+            chart_is_ranging=chart_is_ranging,
+            chart_bullish_reversal=chart_bullish_reversal,
+            chart_bearish_reversal=chart_bearish_reversal,
+            chart_momentum=chart_momentum,
+            chart_bias_bullish=chart_bias_bullish,
+            chart_bias_bearish=chart_bias_bearish,
+            chart_confidence=chart_confidence,
+            chart_bullish_pattern=chart_bullish_pattern,
+            chart_bearish_pattern=chart_bearish_pattern,
         )
         feature_vector = features.to_vector()
 
@@ -939,6 +1075,20 @@ class MLSignalPredictor:
         price_high: float = 0.0,
         price_low: float = 0.0,
         price_velocity: float = 0.0,
+        # Chart analysis features
+        chart_rsi: float = 50.0,
+        chart_trend_strength: float = 0.0,
+        chart_is_uptrend: float = 0.0,
+        chart_is_downtrend: float = 0.0,
+        chart_is_ranging: float = 0.0,
+        chart_bullish_reversal: float = 0.0,
+        chart_bearish_reversal: float = 0.0,
+        chart_momentum: float = 0.0,
+        chart_bias_bullish: float = 0.0,
+        chart_bias_bearish: float = 0.0,
+        chart_confidence: float = 0.5,
+        chart_bullish_pattern: float = 0.0,
+        chart_bearish_pattern: float = 0.0,
     ):
         """
         Record a trade outcome and update the model.
@@ -970,7 +1120,21 @@ class MLSignalPredictor:
             spread, bid_depth, ask_depth, price_trend, distance_from_target,
             binance_lead_pct, binance_confirmation,
             trend_1h, trend_4h, trend_1d,
-            current_price, target_price, price_high, price_low, price_velocity
+            current_price, target_price, price_high, price_low, price_velocity,
+            # Chart analysis features
+            chart_rsi=chart_rsi,
+            chart_trend_strength=chart_trend_strength,
+            chart_is_uptrend=chart_is_uptrend,
+            chart_is_downtrend=chart_is_downtrend,
+            chart_is_ranging=chart_is_ranging,
+            chart_bullish_reversal=chart_bullish_reversal,
+            chart_bearish_reversal=chart_bearish_reversal,
+            chart_momentum=chart_momentum,
+            chart_bias_bullish=chart_bias_bullish,
+            chart_bias_bearish=chart_bias_bearish,
+            chart_confidence=chart_confidence,
+            chart_bullish_pattern=chart_bullish_pattern,
+            chart_bearish_pattern=chart_bearish_pattern,
         )
         feature_vector = features.to_vector()
 
@@ -1149,17 +1313,31 @@ class MLSignalPredictor:
                     )
                 elif len(old_weights) == 29:
                     logger.info(
-                        f"🤖 Migrating ML model from 29 to 33 features (adding price observation)..."
+                        f"🤖 Migrating ML model from 29 to 46 features (adding price + chart analysis)..."
                     )
-                    # Extend weights for price features only (4 new: price_normalized, price_above_target, price_range_position, price_velocity)
-                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(4)]
+                    # Extend weights for price features + chart analysis (17 new features)
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(17)]
                     model_data["weights"] = new_weights
-                    # Keep most training data since this is a minor addition
-                    self.training_samples = max(0, int(data.get("training_samples", 0) * 0.9))
-                    self.predictions_made = int(data.get("predictions_made", 0) * 0.9)
-                    self.correct_predictions = int(data.get("correct_predictions", 0) * 0.9)
+                    # Keep most training data since this is a significant addition
+                    self.training_samples = max(0, int(data.get("training_samples", 0) * 0.8))
+                    self.predictions_made = int(data.get("predictions_made", 0) * 0.8)
+                    self.correct_predictions = int(data.get("correct_predictions", 0) * 0.8)
                     logger.info(
-                        f"🤖 Migration complete - model will retrain with price observation features"
+                        f"🤖 Migration complete - model will retrain with price + chart features"
+                    )
+                elif len(old_weights) == 33:
+                    logger.info(
+                        f"🤖 Migrating ML model from 33 to 46 features (adding chart analysis)..."
+                    )
+                    # Extend weights for chart analysis features (13 new)
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(13)]
+                    model_data["weights"] = new_weights
+                    # Keep most training data since this is a significant addition
+                    self.training_samples = max(0, int(data.get("training_samples", 0) * 0.85))
+                    self.predictions_made = int(data.get("predictions_made", 0) * 0.85)
+                    self.correct_predictions = int(data.get("correct_predictions", 0) * 0.85)
+                    logger.info(
+                        f"🤖 Migration complete - model will retrain with chart analysis features"
                     )
                 else:
                     self.training_samples = data.get("training_samples", 0)
@@ -1251,6 +1429,7 @@ def extract_ml_features_from_market(
     signal,
     signal_generator,
     market,
+    chart_analysis=None,
 ) -> dict:
     """
     Extract all ML features from signal, market, and signal generator.
@@ -1261,6 +1440,7 @@ def extract_ml_features_from_market(
         signal: Trading signal
         signal_generator: SignalGenerator instance
         market: MarketState instance
+        chart_analysis: Optional ChartAnalysis from Binance candlestick analysis
 
     Returns:
         Dictionary with all ML feature parameters
@@ -1321,6 +1501,55 @@ def extract_ml_features_from_market(
     except Exception as e:
         logger.debug(f"Could not fetch multi-timeframe trends: {e}")
 
+    # Chart analysis features (from Binance candlestick data)
+    chart_rsi = 50.0
+    chart_trend_strength = 0.0
+    chart_is_uptrend = 0.0
+    chart_is_downtrend = 0.0
+    chart_is_ranging = 0.0
+    chart_bullish_reversal = 0.0
+    chart_bearish_reversal = 0.0
+    chart_momentum = 0.0
+    chart_bias_bullish = 0.0
+    chart_bias_bearish = 0.0
+    chart_confidence = 0.5
+    chart_bullish_pattern = 0.0
+    chart_bearish_pattern = 0.0
+
+    if chart_analysis is not None:
+        chart_rsi = chart_analysis.rsi_14
+        chart_trend_strength = chart_analysis.trend_strength
+        chart_momentum = chart_analysis.momentum
+        chart_confidence = chart_analysis.confidence
+
+        # Determine market type
+        market_type = chart_analysis.market_type.value
+        if "uptrend" in market_type:
+            chart_is_uptrend = 1.0
+        elif "downtrend" in market_type:
+            chart_is_downtrend = 1.0
+        elif market_type == "ranging":
+            chart_is_ranging = 1.0
+
+        # Trend change
+        trend_change = chart_analysis.trend_change.value
+        if trend_change == "bullish_reversal":
+            chart_bullish_reversal = 1.0
+        elif trend_change == "bearish_reversal":
+            chart_bearish_reversal = 1.0
+
+        # Bias
+        if chart_analysis.bias == "bullish":
+            chart_bias_bullish = 1.0
+        elif chart_analysis.bias == "bearish":
+            chart_bias_bearish = 1.0
+
+        # Patterns
+        if chart_analysis.is_bullish_pattern:
+            chart_bullish_pattern = 1.0
+        if chart_analysis.is_bearish_pattern:
+            chart_bearish_pattern = 1.0
+
     return {
         "volatility": volatility,
         "price_momentum": price_momentum,
@@ -1335,7 +1564,21 @@ def extract_ml_features_from_market(
         "trend_1h": trend_1h,
         "trend_4h": trend_4h,
         "trend_1d": trend_1d,
-        # NEW: Pass current and target price for sanity checks
+        # Pass current and target price for sanity checks
         "current_price": current_price or 0.0,
         "target_price": market.target_price if market else 0.0,
+        # Chart analysis features
+        "chart_rsi": chart_rsi,
+        "chart_trend_strength": chart_trend_strength,
+        "chart_is_uptrend": chart_is_uptrend,
+        "chart_is_downtrend": chart_is_downtrend,
+        "chart_is_ranging": chart_is_ranging,
+        "chart_bullish_reversal": chart_bullish_reversal,
+        "chart_bearish_reversal": chart_bearish_reversal,
+        "chart_momentum": chart_momentum,
+        "chart_bias_bullish": chart_bias_bullish,
+        "chart_bias_bearish": chart_bias_bearish,
+        "chart_confidence": chart_confidence,
+        "chart_bullish_pattern": chart_bullish_pattern,
+        "chart_bearish_pattern": chart_bearish_pattern,
     }

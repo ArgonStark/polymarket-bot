@@ -262,6 +262,20 @@ class RiskManager:
         ml_trend_1h: Optional[float] = None,
         ml_trend_4h: Optional[float] = None,
         ml_trend_1d: Optional[float] = None,
+        # Chart analysis features
+        ml_chart_rsi: Optional[float] = None,
+        ml_chart_trend_strength: Optional[float] = None,
+        ml_chart_is_uptrend: Optional[float] = None,
+        ml_chart_is_downtrend: Optional[float] = None,
+        ml_chart_is_ranging: Optional[float] = None,
+        ml_chart_bullish_reversal: Optional[float] = None,
+        ml_chart_bearish_reversal: Optional[float] = None,
+        ml_chart_momentum: Optional[float] = None,
+        ml_chart_bias_bullish: Optional[float] = None,
+        ml_chart_bias_bearish: Optional[float] = None,
+        ml_chart_confidence: Optional[float] = None,
+        ml_chart_bullish_pattern: Optional[float] = None,
+        ml_chart_bearish_pattern: Optional[float] = None,
     ):
         """
         Record a new position being opened.
@@ -284,6 +298,7 @@ class RiskManager:
             ml_trend_1h: ML feature - 1-hour trend
             ml_trend_4h: ML feature - 4-hour trend
             ml_trend_1d: ML feature - 1-day trend
+            ml_chart_*: Chart analysis features from Binance candlestick data
         """
         market_key = signal.market.condition_id
 
@@ -312,6 +327,20 @@ class RiskManager:
             ml_trend_1h=ml_trend_1h,
             ml_trend_4h=ml_trend_4h,
             ml_trend_1d=ml_trend_1d,
+            # Chart analysis features
+            ml_chart_rsi=ml_chart_rsi,
+            ml_chart_trend_strength=ml_chart_trend_strength,
+            ml_chart_is_uptrend=ml_chart_is_uptrend,
+            ml_chart_is_downtrend=ml_chart_is_downtrend,
+            ml_chart_is_ranging=ml_chart_is_ranging,
+            ml_chart_bullish_reversal=ml_chart_bullish_reversal,
+            ml_chart_bearish_reversal=ml_chart_bearish_reversal,
+            ml_chart_momentum=ml_chart_momentum,
+            ml_chart_bias_bullish=ml_chart_bias_bullish,
+            ml_chart_bias_bearish=ml_chart_bias_bearish,
+            ml_chart_confidence=ml_chart_confidence,
+            ml_chart_bullish_pattern=ml_chart_bullish_pattern,
+            ml_chart_bearish_pattern=ml_chart_bearish_pattern,
         )
 
         self.positions[market_key] = position

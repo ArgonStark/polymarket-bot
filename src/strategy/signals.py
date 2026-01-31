@@ -557,6 +557,19 @@ class SignalGenerator:
         if CHART_ANALYSIS_AVAILABLE:
             try:
                 chart_analysis = analyze_chart(market.asset)
+                if chart_analysis:
+                    # Log comprehensive chart analysis at INFO level for visibility
+                    logger.info(
+                        f"📊 CHART ANALYSIS [{market.asset}]: "
+                        f"Type={chart_analysis.market_type.value} | "
+                        f"Bias={chart_analysis.bias} ({chart_analysis.confidence:.0%}) | "
+                        f"RSI={chart_analysis.rsi_14:.0f} | "
+                        f"Trends: 15m={chart_analysis.trend_15m:+.2f}, "
+                        f"1h={chart_analysis.trend_1h:+.2f}, "
+                        f"4h={chart_analysis.trend_4h:+.2f} | "
+                        f"Change={chart_analysis.trend_change.value}"
+                        + (f" | Pattern={chart_analysis.pattern_name}" if chart_analysis.pattern_name else "")
+                    )
             except Exception as e:
                 logger.debug(f"Chart analysis failed for {market.asset}: {e}")
 

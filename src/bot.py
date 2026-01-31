@@ -34,6 +34,15 @@ from .strategy.ml_predictor import (
 from .strategy.trade_history import get_trade_history
 from .utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
 
+# Import Binance chart analyzer for ML features
+try:
+    from .data.binance_chart import analyze_chart
+    CHART_ANALYSIS_AVAILABLE = True
+except ImportError:
+    CHART_ANALYSIS_AVAILABLE = False
+    def analyze_chart(asset: str):
+        return None
+
 
 logger = logging.getLogger(__name__)
 
@@ -2019,6 +2028,20 @@ class TradingBot:
                 trend_1h = position.ml_trend_1h or 0.0
                 trend_4h = position.ml_trend_4h or 0.0
                 trend_1d = position.ml_trend_1d or 0.0
+                # Chart analysis features from stored position
+                chart_rsi = position.ml_chart_rsi or 50.0
+                chart_trend_strength = position.ml_chart_trend_strength or 0.0
+                chart_is_uptrend = position.ml_chart_is_uptrend or 0.0
+                chart_is_downtrend = position.ml_chart_is_downtrend or 0.0
+                chart_is_ranging = position.ml_chart_is_ranging or 0.0
+                chart_bullish_reversal = position.ml_chart_bullish_reversal or 0.0
+                chart_bearish_reversal = position.ml_chart_bearish_reversal or 0.0
+                chart_momentum = position.ml_chart_momentum or 0.0
+                chart_bias_bullish = position.ml_chart_bias_bullish or 0.0
+                chart_bias_bearish = position.ml_chart_bias_bearish or 0.0
+                chart_confidence = position.ml_chart_confidence or 0.5
+                chart_bullish_pattern = position.ml_chart_bullish_pattern or 0.0
+                chart_bearish_pattern = position.ml_chart_bearish_pattern or 0.0
             else:
                 # Extract features now (for positions without stored ML data)
                 volatility = self.signal_generator.get_volatility(market.asset)
@@ -2040,6 +2063,20 @@ class TradingBot:
                 trend_1h = 0.0
                 trend_4h = 0.0
                 trend_1d = 0.0
+                # Default chart analysis features
+                chart_rsi = 50.0
+                chart_trend_strength = 0.0
+                chart_is_uptrend = 0.0
+                chart_is_downtrend = 0.0
+                chart_is_ranging = 0.0
+                chart_bullish_reversal = 0.0
+                chart_bearish_reversal = 0.0
+                chart_momentum = 0.0
+                chart_bias_bullish = 0.0
+                chart_bias_bearish = 0.0
+                chart_confidence = 0.5
+                chart_bullish_pattern = 0.0
+                chart_bearish_pattern = 0.0
                 # Try to fetch trends if available
                 try:
                     from .data.binance import get_multi_timeframe_trends
@@ -2106,6 +2143,20 @@ class TradingBot:
                 price_high=price_high,
                 price_low=price_low,
                 price_velocity=price_velocity,
+                # Chart analysis features
+                chart_rsi=chart_rsi,
+                chart_trend_strength=chart_trend_strength,
+                chart_is_uptrend=chart_is_uptrend,
+                chart_is_downtrend=chart_is_downtrend,
+                chart_is_ranging=chart_is_ranging,
+                chart_bullish_reversal=chart_bullish_reversal,
+                chart_bearish_reversal=chart_bearish_reversal,
+                chart_momentum=chart_momentum,
+                chart_bias_bullish=chart_bias_bullish,
+                chart_bias_bearish=chart_bias_bearish,
+                chart_confidence=chart_confidence,
+                chart_bullish_pattern=chart_bullish_pattern,
+                chart_bearish_pattern=chart_bearish_pattern,
             )
 
     async def _sync_ml_from_polymarket(self, force: bool = False):
@@ -2970,12 +3021,21 @@ class TradingBot:
         # ML filter - check predicted win probability (do this BEFORE sizing for Kelly)
         logger.info(f"[{market.asset}] ✓3 ML filter")
         ml_confidence = None
+        chart_analysis = None
         if self.ml_predictor:
+            # Get chart analysis for ML features
+            if CHART_ANALYSIS_AVAILABLE:
+                try:
+                    chart_analysis = analyze_chart(market.asset)
+                except Exception as e:
+                    logger.debug(f"Chart analysis failed for ML features: {e}")
+
             # Extract all ML features using the helper function
             ml_features = extract_ml_features_from_market(
                 signal=signal,
                 signal_generator=self.signal_generator,
                 market=market,
+                chart_analysis=chart_analysis,
             )
 
             should_trade, confidence, ml_reason = self.ml_predictor.should_trade(
@@ -3009,6 +3069,20 @@ class TradingBot:
             signal._ml_trend_1h = ml_features.get("trend_1h", 0.0)
             signal._ml_trend_4h = ml_features.get("trend_4h", 0.0)
             signal._ml_trend_1d = ml_features.get("trend_1d", 0.0)
+            # Chart analysis features
+            signal._ml_chart_rsi = ml_features.get("chart_rsi", 50.0)
+            signal._ml_chart_trend_strength = ml_features.get("chart_trend_strength", 0.0)
+            signal._ml_chart_is_uptrend = ml_features.get("chart_is_uptrend", 0.0)
+            signal._ml_chart_is_downtrend = ml_features.get("chart_is_downtrend", 0.0)
+            signal._ml_chart_is_ranging = ml_features.get("chart_is_ranging", 0.0)
+            signal._ml_chart_bullish_reversal = ml_features.get("chart_bullish_reversal", 0.0)
+            signal._ml_chart_bearish_reversal = ml_features.get("chart_bearish_reversal", 0.0)
+            signal._ml_chart_momentum = ml_features.get("chart_momentum", 0.0)
+            signal._ml_chart_bias_bullish = ml_features.get("chart_bias_bullish", 0.0)
+            signal._ml_chart_bias_bearish = ml_features.get("chart_bias_bearish", 0.0)
+            signal._ml_chart_confidence = ml_features.get("chart_confidence", 0.5)
+            signal._ml_chart_bullish_pattern = ml_features.get("chart_bullish_pattern", 0.0)
+            signal._ml_chart_bearish_pattern = ml_features.get("chart_bearish_pattern", 0.0)
 
         # Adjust size using Kelly criterion (with ML confidence for optimal sizing)
         logger.info(f"[{market.asset}] ✓4 Kelly sizing (conf: {ml_confidence})")
@@ -3538,6 +3612,20 @@ class TradingBot:
             ml_trend_1h = getattr(signal, '_ml_trend_1h', None)
             ml_trend_4h = getattr(signal, '_ml_trend_4h', None)
             ml_trend_1d = getattr(signal, '_ml_trend_1d', None)
+            # Chart analysis features
+            ml_chart_rsi = getattr(signal, '_ml_chart_rsi', None)
+            ml_chart_trend_strength = getattr(signal, '_ml_chart_trend_strength', None)
+            ml_chart_is_uptrend = getattr(signal, '_ml_chart_is_uptrend', None)
+            ml_chart_is_downtrend = getattr(signal, '_ml_chart_is_downtrend', None)
+            ml_chart_is_ranging = getattr(signal, '_ml_chart_is_ranging', None)
+            ml_chart_bullish_reversal = getattr(signal, '_ml_chart_bullish_reversal', None)
+            ml_chart_bearish_reversal = getattr(signal, '_ml_chart_bearish_reversal', None)
+            ml_chart_momentum = getattr(signal, '_ml_chart_momentum', None)
+            ml_chart_bias_bullish = getattr(signal, '_ml_chart_bias_bullish', None)
+            ml_chart_bias_bearish = getattr(signal, '_ml_chart_bias_bearish', None)
+            ml_chart_confidence = getattr(signal, '_ml_chart_confidence', None)
+            ml_chart_bullish_pattern = getattr(signal, '_ml_chart_bullish_pattern', None)
+            ml_chart_bearish_pattern = getattr(signal, '_ml_chart_bearish_pattern', None)
 
             conf_str = f" (ML: {ml_confidence:.0%})" if ml_confidence else ""
             arb_str = f" [{ml_arb_type}]" if ml_arb_type and ml_arb_type != "none" else ""
@@ -3563,6 +3651,20 @@ class TradingBot:
                     ml_trend_1h=ml_trend_1h,
                     ml_trend_4h=ml_trend_4h,
                     ml_trend_1d=ml_trend_1d,
+                    # Chart analysis features
+                    ml_chart_rsi=ml_chart_rsi,
+                    ml_chart_trend_strength=ml_chart_trend_strength,
+                    ml_chart_is_uptrend=ml_chart_is_uptrend,
+                    ml_chart_is_downtrend=ml_chart_is_downtrend,
+                    ml_chart_is_ranging=ml_chart_is_ranging,
+                    ml_chart_bullish_reversal=ml_chart_bullish_reversal,
+                    ml_chart_bearish_reversal=ml_chart_bearish_reversal,
+                    ml_chart_momentum=ml_chart_momentum,
+                    ml_chart_bias_bullish=ml_chart_bias_bullish,
+                    ml_chart_bias_bearish=ml_chart_bias_bearish,
+                    ml_chart_confidence=ml_chart_confidence,
+                    ml_chart_bullish_pattern=ml_chart_bullish_pattern,
+                    ml_chart_bearish_pattern=ml_chart_bearish_pattern,
                 )
 
                 # Record in trade history

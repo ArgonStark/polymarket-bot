@@ -216,6 +216,21 @@ class Position:
     ml_trend_4h: Optional[float] = None
     ml_trend_1d: Optional[float] = None
 
+    # Chart analysis data (from Binance candlestick analysis at entry)
+    ml_chart_rsi: Optional[float] = None
+    ml_chart_trend_strength: Optional[float] = None
+    ml_chart_is_uptrend: Optional[float] = None
+    ml_chart_is_downtrend: Optional[float] = None
+    ml_chart_is_ranging: Optional[float] = None
+    ml_chart_bullish_reversal: Optional[float] = None
+    ml_chart_bearish_reversal: Optional[float] = None
+    ml_chart_momentum: Optional[float] = None
+    ml_chart_bias_bullish: Optional[float] = None
+    ml_chart_bias_bearish: Optional[float] = None
+    ml_chart_confidence: Optional[float] = None
+    ml_chart_bullish_pattern: Optional[float] = None
+    ml_chart_bearish_pattern: Optional[float] = None
+
     @property
     def cost_basis(self) -> float:
         """Get total cost basis."""
