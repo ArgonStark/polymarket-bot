@@ -2753,8 +2753,7 @@ class TradingBot:
 
         IMPORTANT: Only clears positions that are both:
         1. Not found on Polymarket API
-        2. Older than 5 minutes (grace period for API delays)
-        3. Market has passed settlement time
+        2. Either: older than 60 seconds OR market has passed settlement time
         """
         if not self.client:
             return
@@ -2782,45 +2781,46 @@ class TradingBot:
             internal_positions = list(self.risk_manager.positions.keys())
             cleared_count = 0
             now = datetime.now(timezone.utc)
-            grace_period_seconds = 300  # 5 minutes grace period
+            grace_period_seconds = 60  # 60 seconds grace period for new positions
 
             for market_key in internal_positions:
                 position = self.risk_manager.positions.get(market_key)
                 if not position:
                     continue
 
-                # Skip if position was opened recently (within grace period)
-                # This prevents clearing positions before API has time to sync
-                if hasattr(position, 'entry_time') and position.entry_time:
-                    age = (now - position.entry_time).total_seconds()
-                    if age < grace_period_seconds:
-                        logger.debug(
-                            f"Skipping position sync for {position.market.asset if hasattr(position, 'market') else '???'}: "
-                            f"opened {age:.0f}s ago (grace period: {grace_period_seconds}s)"
-                        )
-                        continue
+                asset = position.market.asset if hasattr(position, 'market') else "???"
 
-                # Skip if market hasn't settled yet
-                if hasattr(position, 'market') and position.market:
-                    time_remaining = position.market.time_remaining
-                    if time_remaining > -30:  # 30 second buffer after settlement
-                        logger.debug(
-                            f"Skipping position sync for {position.market.asset}: "
-                            f"market still active ({time_remaining:.0f}s remaining)"
-                        )
-                        continue
+                # Check if market has settled (end_time has passed)
+                market_settled = False
+                if hasattr(position, 'market') and position.market and hasattr(position.market, 'end_time'):
+                    # Calculate actual time remaining (can be negative)
+                    actual_remaining = (position.market.end_time - now).total_seconds()
+                    market_settled = actual_remaining < -30  # 30 second buffer after settlement
+
+                # Check position age
+                position_age = 0
+                if hasattr(position, 'entry_time') and position.entry_time:
+                    position_age = (now - position.entry_time).total_seconds()
+
+                # Skip if position is new AND market hasn't settled yet
+                # (Give API time to sync for new positions)
+                if position_age < grace_period_seconds and not market_settled:
+                    logger.debug(
+                        f"Skipping position sync for {asset}: "
+                        f"opened {position_age:.0f}s ago, market not settled"
+                    )
+                    continue
 
                 if market_key not in api_condition_ids:
-                    # Position exists internally but not on Polymarket - it's been settled
-                    asset = position.market.asset if hasattr(position, 'market') else "???"
+                    # Position exists internally but not on Polymarket
                     side = position.side.value if hasattr(position, 'side') else "???"
 
+                    reason = "market settled" if market_settled else "not found on API"
                     logger.info(
-                        f"🧹 Clearing stale position: {asset} {side} | "
-                        f"Not found on Polymarket (market settled)"
+                        f"🧹 Clearing stale position: {asset} {side} | {reason}"
                     )
 
-                    # Remove from risk manager (assume break-even if unknown)
+                    # Remove from risk manager
                     self.risk_manager.positions.pop(market_key, None)
                     cleared_count += 1
 
