@@ -1388,19 +1388,28 @@ class TradingBot:
 
     async def _check_early_exits(self):
         """
-        Check open positions for take-profit or stop-loss conditions.
+        Check open positions for take-profit, stop-loss, or chart-based exit conditions.
 
         For each position:
         1. Get current market price from order book
         2. Calculate unrealized P&L percentage
         3. If >= take_profit_pct: sell to lock in profit
         4. If <= -stop_loss_pct: sell to limit loss
+        5. Check chart analysis for trend reversal or DCA opportunity
         """
         if not self.risk_manager.positions:
             return
 
         now = datetime.now(timezone.utc)
         trading = self.config.trading
+
+        # Import position monitor
+        try:
+            from .strategy.position_monitor import analyze_open_position, PositionAction
+            from .data.binance_chart import analyze_chart
+            POSITION_MONITOR_AVAILABLE = True
+        except ImportError:
+            POSITION_MONITOR_AVAILABLE = False
 
         for market_key, position in list(self.risk_manager.positions.items()):
             try:
@@ -1446,8 +1455,154 @@ class TradingBot:
                     await self._execute_early_exit(market, position, current_price, "stop_loss")
                     continue
 
+                # === CHART-BASED POSITION MONITORING ===
+                # Check 15m chart to decide: hold, close, or DCA
+                if POSITION_MONITOR_AVAILABLE:
+                    await self._check_chart_based_exit(market, position, current_price)
+
             except Exception as e:
                 logger.error(f"Error checking early exit for {market_key}: {e}")
+
+    async def _check_chart_based_exit(self, market: MarketState, position, current_token_price: float):
+        """
+        Check if chart analysis suggests exiting or modifying a position.
+
+        Uses 15m candlestick data to detect:
+        - Trend reversals (close position)
+        - Strong confirmation (DCA opportunity)
+        - Extreme RSI (potential reversal)
+        """
+        try:
+            from .strategy.position_monitor import analyze_open_position, PositionAction, get_position_monitor
+            from .data.binance_chart import analyze_chart
+        except ImportError:
+            return
+
+        asset = market.asset
+        monitor = get_position_monitor()
+
+        # Check if we should analyze (rate limited)
+        if not monitor.should_check(asset):
+            return
+
+        # Get chart analysis
+        chart_analysis = analyze_chart(asset)
+        if not chart_analysis:
+            return
+
+        # Analyze position
+        decision = analyze_open_position(
+            position=position,
+            chart_analysis=chart_analysis,
+            current_token_price=current_token_price,
+            time_remaining=market.time_remaining,
+        )
+
+        # Log position status periodically
+        summary = monitor.get_position_summary(position, chart_analysis, current_token_price)
+        logger.info(f"📊 POSITION MONITOR: {summary} | Action: {decision.action.value}")
+
+        # Act on decision
+        if decision.action == PositionAction.CLOSE:
+            logger.info(
+                f"{Colors.BRIGHT_YELLOW}📉 CHART EXIT: {asset} {position.side.value} | "
+                f"Reason: {decision.reason} | Confidence: {decision.confidence:.0%}{Colors.RESET}"
+            )
+            await self._execute_early_exit(market, position, current_token_price, f"chart_exit_{decision.urgency}")
+
+        elif decision.action == PositionAction.DCA:
+            logger.info(
+                f"{Colors.BRIGHT_CYAN}📈 CHART DCA: {asset} {position.side.value} | "
+                f"Reason: {decision.reason} | Size: ${decision.suggested_size:.2f}{Colors.RESET}"
+            )
+            # Execute DCA through averaging system
+            await self._execute_chart_dca(market, position, decision)
+
+        elif decision.action == PositionAction.ADD:
+            logger.info(
+                f"{Colors.BRIGHT_GREEN}📈 CHART ADD: {asset} {position.side.value} | "
+                f"Reason: {decision.reason} | Size: ${decision.suggested_size:.2f}{Colors.RESET}"
+            )
+            # Execute ADD through averaging system
+            await self._execute_chart_dca(market, position, decision)
+
+        # HOLD - just log at debug level
+        else:
+            logger.debug(f"[{asset}] Position HOLD: {decision.reason}")
+
+    async def _execute_chart_dca(self, market: MarketState, position, decision):
+        """
+        Execute a DCA or ADD order based on chart analysis.
+
+        Args:
+            market: Market state
+            position: Position to add to
+            decision: PositionDecision with suggested size
+        """
+        try:
+            from .strategy.averaging import update_position_after_averaging
+        except ImportError:
+            logger.error("Could not import averaging module")
+            return
+
+        asset = market.asset
+
+        # Calculate shares and price
+        if position.side == Side.UP:
+            token_price = market.best_ask
+        else:
+            token_price = 1 - market.best_bid
+
+        shares = decision.suggested_size / token_price
+        if shares < 5:
+            shares = 5
+            decision.suggested_size = shares * token_price
+
+        # Create signal for execution
+        signal = Signal(
+            market=market,
+            side=position.side,
+            edge=0.10,  # Placeholder
+            true_prob=0.5,
+            market_prob=token_price,
+            recommended_action=OrderAction.LIMIT,
+            recommended_price=token_price,
+            size_usd=decision.suggested_size,
+            size_shares=shares,
+            chainlink_price=self.signal_generator.get_price(asset) or 0,
+            time_remaining=market.time_remaining,
+            reasoning=f"[CHART {decision.action.value}] {decision.reason}",
+        )
+
+        # Execute the order
+        result = self.executor.execute_signal(signal)
+
+        if result.success:
+            # Calculate new average price
+            old_cost = position.total_cost if position.total_cost > 0 else (position.entry_price * position.shares)
+            new_total_cost = old_cost + decision.suggested_size
+            new_total_shares = position.shares + shares
+            new_avg_price = new_total_cost / new_total_shares
+
+            # Update position
+            update_position_after_averaging(
+                position=position,
+                additional_shares=shares,
+                additional_cost=decision.suggested_size,
+                new_entry_price=new_avg_price,
+            )
+
+            # Set cooldown
+            now = datetime.now(timezone.utc)
+            self._last_order_time[asset] = now
+
+            logger.info(
+                f"[{asset}] ✅ CHART {decision.action.value}: "
+                f"Added {shares:.1f} shares @ ${decision.suggested_size:.2f} | "
+                f"New avg: ${new_avg_price:.3f}"
+            )
+        else:
+            logger.warning(f"[{asset}] ❌ CHART {decision.action.value} FAILED: {result.error_message}")
 
     async def _execute_early_exit(
         self,

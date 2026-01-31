@@ -403,7 +403,10 @@ class BinanceChartAnalyzer:
 
     def detect_trend(self, candles: List[Candle]) -> float:
         """
-        Detect trend direction and strength.
+        Detect trend direction and strength using CONTINUOUS values.
+
+        Uses actual price distances from EMAs rather than binary flags
+        to provide more granular trend readings.
 
         Returns:
             Float from -1 (strong downtrend) to +1 (strong uptrend)
@@ -412,48 +415,52 @@ class BinanceChartAnalyzer:
             return 0.0
 
         closes = [c.close for c in candles]
+        current_price = closes[-1]
 
         # Calculate EMAs
         ema_9 = self.calculate_ema(closes, 9)
         ema_21 = self.calculate_ema(closes, 21)
+        ema_50 = self.calculate_ema(closes, min(50, len(closes)))
 
-        current_price = closes[-1]
-
-        # Price position relative to EMAs
-        above_ema_9 = current_price > ema_9
-        above_ema_21 = current_price > ema_21
-        ema_9_above_21 = ema_9 > ema_21
-
-        # Calculate trend strength based on multiple factors
         trend_score = 0.0
 
-        # EMA alignment
-        if above_ema_9 and above_ema_21 and ema_9_above_21:
-            trend_score += 0.4  # Bullish alignment
-        elif not above_ema_9 and not above_ema_21 and not ema_9_above_21:
-            trend_score -= 0.4  # Bearish alignment
+        # === 1. PRICE DISTANCE FROM EMAs (continuous, up to ±0.35) ===
+        # How far is price from EMA21? Further = stronger trend
+        ema21_distance = (current_price - ema_21) / ema_21
+        # Scale: 0.5% distance = 0.1 score, cap at 1.5% = 0.3
+        ema_score = max(-0.35, min(0.35, ema21_distance * 20))
+        trend_score += ema_score
 
-        # Price momentum (last 5 candles)
+        # === 2. EMA SEPARATION (continuous, up to ±0.25) ===
+        # How far apart are EMA9 and EMA21? Wider = stronger trend
+        ema_separation = (ema_9 - ema_21) / ema_21
+        # Scale: 0.3% separation = 0.1 score, cap at 0.75% = 0.25
+        separation_score = max(-0.25, min(0.25, ema_separation * 33))
+        trend_score += separation_score
+
+        # === 3. MOMENTUM (last 5 candles, up to ±0.20) ===
         if len(closes) >= 5:
             momentum = (closes[-1] - closes[-5]) / closes[-5]
-            trend_score += max(-0.3, min(0.3, momentum * 10))
+            # Scale: 1% move in 5 candles = 0.1 score
+            momentum_score = max(-0.20, min(0.20, momentum * 10))
+            trend_score += momentum_score
 
-        # Higher highs / lower lows
-        if len(candles) >= 10:
-            recent_highs = [c.high for c in candles[-10:]]
-            recent_lows = [c.low for c in candles[-10:]]
+        # === 4. CANDLE DIRECTION (last 3 candles, up to ±0.10) ===
+        if len(candles) >= 3:
+            bullish_count = sum(1 for c in candles[-3:] if c.is_bullish)
+            bearish_count = sum(1 for c in candles[-3:] if c.is_bearish)
+            # 3 bullish = +0.10, 3 bearish = -0.10
+            candle_score = (bullish_count - bearish_count) / 3 * 0.10
+            trend_score += candle_score
 
-            # Check for higher highs
-            if recent_highs[-1] > max(recent_highs[:-3]):
-                trend_score += 0.15
-            elif recent_highs[-1] < min(recent_highs[:-3]):
-                trend_score -= 0.15
-
-            # Check for higher lows / lower lows
-            if recent_lows[-1] > min(recent_lows[:-3]):
-                trend_score += 0.15
-            elif recent_lows[-1] < min(recent_lows[:-3]):
-                trend_score -= 0.15
+        # === 5. SLOPE OF EMA21 (recent direction, up to ±0.10) ===
+        if len(closes) >= 25:
+            # Compare current EMA21 vs EMA21 from 5 candles ago
+            old_closes = closes[:-5]
+            old_ema_21 = self.calculate_ema(old_closes, 21)
+            ema_slope = (ema_21 - old_ema_21) / old_ema_21
+            slope_score = max(-0.10, min(0.10, ema_slope * 50))
+            trend_score += slope_score
 
         return max(-1.0, min(1.0, trend_score))
 
