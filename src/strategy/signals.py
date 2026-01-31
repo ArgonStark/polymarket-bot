@@ -489,6 +489,29 @@ class SignalGenerator:
             )
             return None
 
+        # === SPREAD CHECK ===
+        # Wide spreads eat into edge - skip if spread is too wide
+        spread = market.best_ask - market.best_bid
+        MAX_SPREAD = 0.10  # 10 cents max spread
+        if spread > MAX_SPREAD:
+            logger.info(
+                f"⚠️ WIDE SPREAD [{market.asset}]: {spread:.2f} > {MAX_SPREAD:.2f} - skipping"
+            )
+            return Signal(
+                market=market,
+                side=Side.NONE,
+                edge=0.0,
+                true_prob=0.5,
+                market_prob=0.5,
+                recommended_action=OrderAction.SKIP,
+                recommended_price=0.0,
+                size_usd=0.0,
+                size_shares=0.0,
+                chainlink_price=current_price,
+                time_remaining=time_remaining,
+                reasoning=f"[WIDE SPREAD] Spread {spread:.2f} > max {MAX_SPREAD:.2f}",
+            )
+
         # STAGE 1: Check for arbitrage opportunities (pattern-based)
         arb_signal = self._check_arbitrage_opportunities(market, current_price, time_remaining)
         if arb_signal:
@@ -736,59 +759,61 @@ class SignalGenerator:
             # === APPLY CHART DECISION TO EDGES ===
             # When chart gives a clear signal, it OVERRIDES probability-based edges
 
+            # === SIMPLIFIED CHART-BASED EDGE ADJUSTMENT ===
+            # Instead of heavy penalties, use SKIP for conflicting trades
+            # Only apply moderate boosts for aligned trades
+
             if chart_says_down and chart_signal_strength >= 0.6:
-                # Chart says DOWN - this should be our primary signal
+                # Chart says DOWN
 
                 if price_above_target:
                     # IDEAL: Chart bearish + price above target = strong DOWN signal
-                    # Price is likely to fall back below target
-                    chart_edge_boost = chart_signal_strength * 0.15  # Up to 15% boost
+                    chart_edge_boost = chart_signal_strength * 0.10  # Up to 10% boost (reduced from 15%)
                     edge_down += chart_edge_boost
 
-                    # HEAVILY penalize UP - chart says price will fall
-                    chart_edge_penalty = chart_signal_strength * 0.40  # Up to 40% penalty
+                    # Moderate penalty for UP (reduced from 40% to 15%)
+                    chart_edge_penalty = chart_signal_strength * 0.15
                     edge_up -= chart_edge_penalty
 
                     logger.info(
-                        f"🔴 CHART DECISION [{market.asset}]: BEARISH ({chart_signal_strength:.0%}) + "
+                        f"🔴 CHART [{market.asset}]: BEARISH ({chart_signal_strength:.0%}) + "
                         f"above target → DOWN +{chart_edge_boost:.1%}, UP -{chart_edge_penalty:.1%}"
                     )
 
-                elif price_below_target and distance_from_target < 0.01:  # Within 1% of target
-                    # Price barely below target in downtrend - might still go DOWN
-                    # But don't take UP position, price could fall further
-                    chart_edge_penalty = chart_signal_strength * 0.25
+                elif price_below_target and distance_from_target < 0.01:
+                    # Price barely below target in downtrend
+                    chart_edge_penalty = chart_signal_strength * 0.08  # Reduced from 25%
                     edge_up -= chart_edge_penalty
 
                     logger.info(
-                        f"🔴 CHART CAUTION [{market.asset}]: BEARISH ({chart_signal_strength:.0%}) + "
+                        f"🔴 CHART [{market.asset}]: BEARISH ({chart_signal_strength:.0%}) + "
                         f"barely below target → UP -{chart_edge_penalty:.1%}"
                     )
 
             elif chart_says_up and chart_signal_strength >= 0.6:
-                # Chart says UP - this should be our primary signal
+                # Chart says UP
 
                 if price_below_target:
                     # IDEAL: Chart bullish + price below target = strong UP signal
-                    chart_edge_boost = chart_signal_strength * 0.15
+                    chart_edge_boost = chart_signal_strength * 0.10  # Reduced from 15%
                     edge_up += chart_edge_boost
 
-                    # HEAVILY penalize DOWN - chart says price will rise
-                    chart_edge_penalty = chart_signal_strength * 0.40
+                    # Moderate penalty for DOWN (reduced from 40% to 15%)
+                    chart_edge_penalty = chart_signal_strength * 0.15
                     edge_down -= chart_edge_penalty
 
                     logger.info(
-                        f"🟢 CHART DECISION [{market.asset}]: BULLISH ({chart_signal_strength:.0%}) + "
+                        f"🟢 CHART [{market.asset}]: BULLISH ({chart_signal_strength:.0%}) + "
                         f"below target → UP +{chart_edge_boost:.1%}, DOWN -{chart_edge_penalty:.1%}"
                     )
 
                 elif price_above_target and distance_from_target < 0.01:
                     # Price barely above target in uptrend
-                    chart_edge_penalty = chart_signal_strength * 0.25
+                    chart_edge_penalty = chart_signal_strength * 0.08  # Reduced from 25%
                     edge_down -= chart_edge_penalty
 
                     logger.info(
-                        f"🟢 CHART CAUTION [{market.asset}]: BULLISH ({chart_signal_strength:.0%}) + "
+                        f"🟢 CHART [{market.asset}]: BULLISH ({chart_signal_strength:.0%}) + "
                         f"barely above target → DOWN -{chart_edge_penalty:.1%}"
                     )
 
@@ -858,6 +883,16 @@ class SignalGenerator:
 
         except Exception as e:
             logger.debug(f"Chart-based analysis failed for {market.asset}: {e}")
+
+        # === CLAMP EDGES TO MINIMUM 0 ===
+        # Negative edges mean the trade is expected to lose money
+        # Never trade with negative edge - this prevents over-penalization
+        if edge_up < 0:
+            logger.debug(f"EDGE CLAMP [{market.asset}]: UP edge {edge_up:.1%} clamped to 0%")
+            edge_up = 0.0
+        if edge_down < 0:
+            logger.debug(f"EDGE CLAMP [{market.asset}]: DOWN edge {edge_down:.1%} clamped to 0%")
+            edge_down = 0.0
 
         if edge_up > edge_down and edge_up >= min_edge:
             side = Side.UP
