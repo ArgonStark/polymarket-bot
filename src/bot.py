@@ -771,6 +771,22 @@ class TradingBot:
         logger.info("║     POLYMARKET 15-MIN CRYPTO ARBITRAGE BOT                     ║")
         logger.info("║     Made by Argon Stark                                        ║")
         logger.info("╚════════════════════════════════════════════════════════════════╝")
+
+        # LIVE TRADING WARNING
+        if not self.config.dry_run:
+            logger.warning("╔════════════════════════════════════════════════════════════════╗")
+            logger.warning("║  ⚠️  LIVE TRADING MODE - REAL MONEY AT RISK ⚠️                  ║")
+            logger.warning("╠════════════════════════════════════════════════════════════════╣")
+            logger.warning(f"║  Max positions: {self.config.trading.max_concurrent_positions}                                              ║")
+            max_exp = getattr(self.config.trading, 'max_total_exposure_pct', 0.25)
+            logger.warning(f"║  Max exposure: {max_exp:.0%} of bankroll                                 ║")
+            logger.warning(f"║  Bankroll: ${self.risk_manager.current_bankroll:.2f}                                       ║")
+            logger.warning("║                                                                ║")
+            logger.warning("║  Use --dry-run to test without real trades                     ║")
+            logger.warning("╚════════════════════════════════════════════════════════════════╝")
+        else:
+            logger.info("🔸 DRY RUN MODE - No real trades will be placed")
+
         logger.info("Starting trading bot...")
 
         try:
@@ -3787,6 +3803,68 @@ class TradingBot:
                     self._logged_rejections.add(cooldown_key)
                     logger.info(f"[{asset}] ❌ COOLDOWN: {remaining:.0f}s remaining (last order {elapsed:.0f}s ago)")
                 return
+
+        # Check for existing PENDING orders for this asset (prevents duplicate unfilled orders)
+        for order_id, order_data in self._pending_orders.items():
+            if order_data.get("asset") == asset:
+                pending_key = f"{signal.market.condition_id}:pending_order"
+                if pending_key not in self._logged_rejections:
+                    self._logged_rejections.add(pending_key)
+                    placed_time = order_data.get("placed_time")
+                    if placed_time:
+                        age = (now - placed_time).total_seconds()
+                        logger.info(
+                            f"[{asset}] ❌ PENDING ORDER EXISTS: Order {order_id[:8]}... "
+                            f"placed {age:.0f}s ago @ {order_data.get('price', 0):.3f} - waiting for fill"
+                        )
+                    else:
+                        logger.info(f"[{asset}] ❌ PENDING ORDER EXISTS: Order {order_id[:8]}... - waiting for fill")
+                return
+
+        # Check total positions (filled + pending) against max concurrent limit
+        filled_positions = len(self.risk_manager.positions)
+        pending_orders = len(self._pending_orders)
+        total_positions = filled_positions + pending_orders
+        max_positions = self.config.trading.max_concurrent_positions
+
+        if total_positions >= max_positions:
+            limit_key = f"global:position_limit"
+            if limit_key not in self._logged_rejections:
+                self._logged_rejections.add(limit_key)
+                logger.info(
+                    f"[{asset}] ❌ POSITION LIMIT: {total_positions} positions "
+                    f"({filled_positions} filled + {pending_orders} pending) >= {max_positions} max"
+                )
+            return
+
+        # Check total capital at risk (filled positions + pending orders + new order)
+        current_exposure = 0.0
+        # Add value of filled positions
+        for pos in self.risk_manager.positions.values():
+            current_exposure += pos.shares * pos.entry_price
+        # Add value of pending orders
+        for order_data in self._pending_orders.values():
+            order_size = order_data.get("size", 0) * order_data.get("price", 0)
+            current_exposure += order_size
+        # Add proposed new order
+        new_order_value = signal.size_usd
+        total_exposure = current_exposure + new_order_value
+
+        # Calculate max allowed exposure
+        bankroll = self.risk_manager.current_bankroll
+        max_exposure_pct = getattr(self.config.trading, 'max_total_exposure_pct', 0.25)
+        max_exposure = bankroll * max_exposure_pct
+
+        if total_exposure > max_exposure:
+            exposure_key = f"global:exposure_limit"
+            if exposure_key not in self._logged_rejections:
+                self._logged_rejections.add(exposure_key)
+                logger.info(
+                    f"[{asset}] ❌ EXPOSURE LIMIT: ${total_exposure:.2f} "
+                    f"(current ${current_exposure:.2f} + new ${new_order_value:.2f}) > "
+                    f"${max_exposure:.2f} max ({max_exposure_pct:.0%} of ${bankroll:.2f})"
+                )
+            return
 
         # Check for existing positions from API (prevents duplicate trades)
         existing_position = self._get_active_position(asset)
