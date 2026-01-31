@@ -1122,6 +1122,19 @@ class SignalGenerator:
         price = max(0.01, min(0.99, price))
         size_shares = size_usd / price
 
+        # === MINIMUM ORDER SIZE CHECK ===
+        # Polymarket requires minimum 5 shares per order
+        MIN_SHARES = 5.0
+        if size_shares < MIN_SHARES:
+            # Bump up to minimum if within reasonable range (allows up to 2x bump)
+            if size_shares >= MIN_SHARES / 2:
+                size_shares = MIN_SHARES
+                size_usd = size_shares * price
+                logger.info(f"📏 ORDER SIZE: Bumped to minimum {MIN_SHARES} shares (${size_usd:.2f})")
+            else:
+                # Too small even with bump - will be filtered out as too risky
+                logger.debug(f"📏 ORDER SIZE: {size_shares:.2f} shares too small (min {MIN_SHARES})")
+
         return (size_usd, size_shares)
 
     def _generate_reasoning(

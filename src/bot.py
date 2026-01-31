@@ -3615,6 +3615,16 @@ class TradingBot:
 
         logger.info(f"{Colors.BRIGHT_CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
 
+        # === MINIMUM ORDER SIZE CHECK ===
+        # Polymarket requires minimum 5 shares per order
+        MIN_SHARES = 5.0
+        if signal.size_shares < MIN_SHARES:
+            logger.warning(
+                f"[{asset}] ❌ ORDER TOO SMALL: {signal.size_shares:.2f} shares < {MIN_SHARES} minimum | "
+                f"Skipping trade (graduated sizing reduced position too much)"
+            )
+            return
+
         # Log the trade attempt with colors
         direction = "▲" if signal.side == Side.UP else "▼"
         side_color = Colors.BRIGHT_GREEN if signal.side == Side.UP else Colors.BRIGHT_RED
