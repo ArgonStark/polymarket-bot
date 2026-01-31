@@ -3481,6 +3481,136 @@ class TradingBot:
 
         return False
 
+    def _get_active_position(self, asset: str):
+        """
+        Get the active position for an asset if one exists.
+
+        Args:
+            asset: Asset symbol (BTC, ETH, SOL, XRP)
+
+        Returns:
+            Position object or None
+        """
+        # Check internal tracking first
+        for pos in self.risk_manager.positions.values():
+            if pos.market.asset == asset:
+                return pos
+
+        return None
+
+    def _check_averaging_opportunity(self, position, signal, market):
+        """
+        Check if we should average down on an existing position.
+
+        Args:
+            position: Existing position
+            signal: New signal that triggered this check
+            market: Current market state
+
+        Returns:
+            AveragingDecision or None
+        """
+        try:
+            from .strategy.averaging import should_average_down, AveragingConfig
+            from .data.binance_chart import analyze_chart
+        except ImportError:
+            return None
+
+        # Only consider averaging if signal matches position direction
+        if signal.side != position.side:
+            return None
+
+        # Get current token price
+        if position.side.value == "UP":
+            current_token_price = market.best_ask
+        else:
+            current_token_price = 1 - market.best_bid
+
+        # Get chart analysis
+        chart_analysis = analyze_chart(market.asset)
+
+        # Check averaging conditions with moderate config
+        config = AveragingConfig(
+            enabled=True,
+            min_chart_confidence=0.70,  # 70% chart confidence
+            min_price_improvement=0.08,  # 8% cheaper
+            max_averages=1,  # Only average once
+            min_time_remaining=300,  # 5 minutes
+            rsi_min=25.0,  # Don't average if too oversold
+            rsi_max=75.0,  # Don't average if too overbought
+            min_alignment_score=0.66,  # 2/3 timeframes agree
+            averaging_size_multiplier=0.5,  # Add 50% of original
+        )
+
+        return should_average_down(
+            position=position,
+            current_token_price=current_token_price,
+            chart_analysis=chart_analysis,
+            time_remaining=market.time_remaining,
+            config=config,
+        )
+
+    def _execute_averaging_order(self, position, signal, averaging_decision):
+        """
+        Execute an averaging down order.
+
+        Args:
+            position: Position to add to
+            signal: Original signal (for order execution)
+            averaging_decision: AveragingDecision with suggested size
+        """
+        try:
+            from .strategy.averaging import update_position_after_averaging
+        except ImportError:
+            logger.error("Could not import averaging module")
+            return
+
+        market = signal.market
+        asset = market.asset
+
+        # Create a modified signal for the averaging order
+        averaging_signal = Signal(
+            market=market,
+            side=position.side,
+            edge=signal.edge,
+            true_prob=signal.true_prob,
+            market_prob=signal.market_prob,
+            recommended_action=OrderAction.LIMIT,
+            recommended_price=signal.recommended_price,
+            size_usd=averaging_decision.suggested_size_usd,
+            size_shares=averaging_decision.suggested_shares,
+            chainlink_price=signal.chainlink_price,
+            time_remaining=signal.time_remaining,
+            reasoning=f"[AVERAGING] {averaging_decision.reason}",
+        )
+
+        # Execute the order
+        result = self.executor.execute_signal(averaging_signal)
+
+        if result.success:
+            # Update position with new average
+            update_position_after_averaging(
+                position=position,
+                additional_shares=averaging_decision.suggested_shares,
+                additional_cost=averaging_decision.suggested_size_usd,
+                new_entry_price=averaging_decision.new_avg_price,
+            )
+
+            # Set cooldown
+            now = datetime.now(timezone.utc)
+            self._last_order_time[asset] = now
+
+            logger.info(
+                f"[{asset}] ✅ AVERAGED DOWN: "
+                f"Added {averaging_decision.suggested_shares:.1f} shares @ ${averaging_decision.suggested_size_usd:.2f} | "
+                f"New avg price: ${averaging_decision.new_avg_price:.3f} | "
+                f"Total shares: {position.shares:.1f}"
+            )
+        else:
+            logger.warning(
+                f"[{asset}] ❌ AVERAGING FAILED: {result.error_message}"
+            )
+
     def _update_cached_positions(self, positions: dict):
         """Update cached API positions."""
         self._api_positions = positions
@@ -3503,12 +3633,30 @@ class TradingBot:
                 return
 
         # Check for existing positions from API (prevents duplicate trades)
-        if self._has_active_position(asset):
-            # Log at INFO level - this is an important reason trades aren't executing
+        existing_position = self._get_active_position(asset)
+        if existing_position:
+            # Check if we should average down instead of skipping
+            averaging_decision = self._check_averaging_opportunity(
+                position=existing_position,
+                signal=signal,
+                market=signal.market,
+            )
+
+            if averaging_decision and averaging_decision.should_average:
+                # Execute averaging order
+                logger.info(
+                    f"[{asset}] 📈 AVERAGING DOWN: {averaging_decision.reason} | "
+                    f"Adding ${averaging_decision.suggested_size_usd:.2f} ({averaging_decision.suggested_shares:.1f} shares)"
+                )
+                self._execute_averaging_order(existing_position, signal, averaging_decision)
+                return
+
+            # Not averaging - skip as usual
             position_key = f"{signal.market.condition_id}:active_position"
             if position_key not in self._logged_rejections:
                 self._logged_rejections.add(position_key)
-                logger.info(f"[{asset}] ❌ ACTIVE POSITION: Already has position - skipping signal")
+                reason = averaging_decision.reason if averaging_decision else "already has position"
+                logger.info(f"[{asset}] ❌ ACTIVE POSITION: {reason} - skipping signal")
             return
 
         # Check if we have enough balance before attempting
