@@ -492,11 +492,116 @@ The bot uses colorful logging for easy monitoring:
 🎉 POSITION CLOSED: BTC UP | WIN | Shares: 24.04 | P&L: +$11.54
 ```
 
+## Copy Trading Bot
+
+A standalone bot for copying trades from successful Polymarket traders.
+
+### Analyze a Trader First
+
+Before copying, analyze their trading history:
+
+```bash
+python analyze_wallet.py 0x1234...abcd
+python analyze_wallet.py 0x1234...abcd --detailed  # Show recent trades
+```
+
+Output shows:
+- Overall win rate and P&L
+- 15-min crypto specific stats
+- Per-asset breakdown (BTC, ETH, SOL, XRP)
+- Recommendation (copy or avoid)
+- Suggested position sizes based on your balance
+
+### Run the Copy Bot
+
+```bash
+# Basic usage - 5% of your balance per trade
+python copy_bot.py -w 0x1234...abcd
+
+# Multiple wallets
+python copy_bot.py -w 0x1234... -w 0x5678...
+
+# Dry run (no real trades)
+python copy_bot.py -w 0x1234... --dry-run
+```
+
+### Sizing Strategies
+
+| Mode | Description | Example |
+|------|-------------|---------|
+| `percent` | Trade X% of YOUR balance | `--size-mode percent --size-pct 0.05` |
+| `fixed` | Always trade fixed amount | `--size-mode fixed --fixed-size 10` |
+| `proportional` | Match their % of portfolio | `--size-mode proportional --their-balance 500000` |
+| `kelly` | Kelly criterion (1/4 fractional) | `--size-mode kelly` |
+
+**Full Example:**
+```bash
+python copy_bot.py \
+    -w 0x63ce342161250d705dc0b16df89036c8e5f9ba9a \
+    --size-mode proportional \
+    --their-balance 500000 \
+    --min-size 5 \
+    --max-size 50 \
+    --max-risk-pct 0.10
+```
+
+### Copy Bot Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--wallet, -w` | Required | Wallet address to copy (can repeat) |
+| `--size-mode` | `percent` | Sizing: fixed, percent, proportional, kelly |
+| `--size-pct` | 0.05 | Percent of balance (for percent mode) |
+| `--fixed-size` | 10 | Fixed USD amount (for fixed mode) |
+| `--their-balance` | 100000 | Their estimated balance (for proportional) |
+| `--min-size` | 5 | Minimum trade size USD |
+| `--max-size` | 50 | Maximum trade size USD |
+| `--max-risk-pct` | 0.10 | Max risk per trade (10%) |
+| `--poll-interval` | 0.5 | Poll interval in seconds |
+| `--dry-run` | false | Simulate without trading |
+
+## Technical Analysis
+
+The bot includes real-time Binance chart analysis for better signal generation.
+
+### Chart Analysis Features
+
+- **Trend Detection**: EMA crossovers, price momentum
+- **RSI Extremes**: Overbought (>70) / Oversold (<30) signals
+- **Multi-Timeframe**: 15m, 1h, 4h trend alignment
+- **Supply/Demand Zones**: Support/resistance from swing highs/lows
+
+### How Zones Work
+
+```
+Supply Zone (Resistance)     - Price rejected multiple times
+━━━━━━━━━━━━━━━━━━━━━━━━━━   - Bearish bias when approaching
+        ▲   ▲   ▲
+        │   │   │
+   ─────┴───┴───┴─────────   Price action
+        │   │   │
+        ▼   ▼   ▼
+━━━━━━━━━━━━━━━━━━━━━━━━━━   - Bullish bias when bouncing
+Demand Zone (Support)        - Price bounced multiple times
+```
+
+### Edge Adjustments
+
+| Condition | UP Edge | DOWN Edge |
+|-----------|---------|-----------|
+| Price at demand zone | +2-5% | -1-2.5% |
+| Price at supply zone | -1-2.5% | +2-5% |
+| Bullish trend + below target | +3-5% | -2-3% |
+| Bearish trend + above target | -2-3% | +3-5% |
+| 1h timeframe conflict | -5% | -5% |
+
 ## Project Structure
 
 ```
 polymarket-bot/
-├── main.py                 # Entry point
+├── main.py                 # Main bot entry point
+├── copy_bot.py             # Standalone copy trading bot
+├── analyze_wallet.py       # Wallet analysis tool
 ├── requirements.txt        # Dependencies
 ├── .env.example           # Environment template
 ├── ml_model.json          # Persisted ML model
@@ -509,7 +614,10 @@ polymarket-bot/
     ├── data/
     │   ├── chainlink.py   # Chainlink price feed
     │   ├── clob.py        # Order book feed
-    │   └── gamma.py       # Market discovery
+    │   ├── gamma.py       # Market discovery
+    │   ├── binance.py     # Binance price feed
+    │   ├── binance_chart.py # Chart analysis & zones
+    │   └── polymarket_data.py # User activity API
     ├── execution/
     │   ├── client.py      # Trading client
     │   └── orders.py      # Order execution
@@ -517,7 +625,8 @@ polymarket-bot/
     │   ├── signals.py     # Signal generation
     │   ├── risk.py        # Risk management
     │   ├── arbitrage.py   # Arbitrage detection
-    │   └── ml_predictor.py # ML signal filter
+    │   ├── ml_predictor.py # ML signal filter
+    │   └── trade_history.py # Performance tracking
     └── utils/
         └── logging.py     # Logging utilities
 ```
