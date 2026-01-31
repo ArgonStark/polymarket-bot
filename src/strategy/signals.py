@@ -981,6 +981,113 @@ class SignalGenerator:
                             f"📍 NEAR SUPPLY [{market.asset}]: Price near resistance ${chart_analysis.nearest_supply:,.2f} → DOWN +2%"
                         )
 
+            # === NEW INDICATOR SIGNALS ===
+            if chart_analysis:
+                # --- MACD Crossover (strong momentum signal) ---
+                if chart_analysis.macd_crossover == "bullish":
+                    edge_up += 0.04
+                    edge_down -= 0.02
+                    logger.info(f"📈 MACD BULLISH CROSSOVER [{market.asset}]: Momentum shifting up → UP +4%")
+                elif chart_analysis.macd_crossover == "bearish":
+                    edge_down += 0.04
+                    edge_up -= 0.02
+                    logger.info(f"📉 MACD BEARISH CROSSOVER [{market.asset}]: Momentum shifting down → DOWN +4%")
+
+                # MACD histogram direction (momentum strength)
+                if chart_analysis.macd_histogram > 0 and chart_says_up:
+                    edge_up += 0.02
+                elif chart_analysis.macd_histogram < 0 and chart_says_down:
+                    edge_down += 0.02
+
+                # --- Bollinger Bands (mean reversion + breakout) ---
+                if chart_analysis.bb_position == "below_lower":
+                    # Price below lower band - oversold, expect bounce
+                    edge_up += 0.03
+                    edge_down -= 0.02
+                    logger.info(f"📊 BOLLINGER [{market.asset}]: Price below lower band (oversold) → UP +3%")
+                elif chart_analysis.bb_position == "above_upper":
+                    # Price above upper band - overbought, expect pullback
+                    edge_down += 0.03
+                    edge_up -= 0.02
+                    logger.info(f"📊 BOLLINGER [{market.asset}]: Price above upper band (overbought) → DOWN +3%")
+
+                # Bollinger squeeze (low bandwidth = big move coming)
+                if chart_analysis.bb_bandwidth < 1.5:  # Tight squeeze
+                    # Increase edge in the direction of momentum
+                    if chart_analysis.momentum > 0:
+                        edge_up += 0.02
+                        logger.info(f"🔥 BOLLINGER SQUEEZE [{market.asset}]: Low volatility + bullish momentum → UP +2%")
+                    elif chart_analysis.momentum < 0:
+                        edge_down += 0.02
+                        logger.info(f"🔥 BOLLINGER SQUEEZE [{market.asset}]: Low volatility + bearish momentum → DOWN +2%")
+
+                # --- Stochastic (faster overbought/oversold) ---
+                if chart_analysis.stoch_signal == "oversold" and chart_says_up:
+                    edge_up += 0.03
+                    logger.info(f"📉 STOCHASTIC OVERSOLD [{market.asset}]: K={chart_analysis.stoch_k:.0f}, D={chart_analysis.stoch_d:.0f} → UP +3%")
+                elif chart_analysis.stoch_signal == "overbought" and chart_says_down:
+                    edge_down += 0.03
+                    logger.info(f"📈 STOCHASTIC OVERBOUGHT [{market.asset}]: K={chart_analysis.stoch_k:.0f}, D={chart_analysis.stoch_d:.0f} → DOWN +3%")
+
+                # --- RSI Divergence (powerful reversal signal) ---
+                if chart_analysis.rsi_divergence == "bullish" and chart_analysis.rsi_divergence_strength > 0.3:
+                    edge_up += 0.05
+                    edge_down -= 0.03
+                    logger.info(
+                        f"🔄 RSI BULLISH DIVERGENCE [{market.asset}]: "
+                        f"Strength={chart_analysis.rsi_divergence_strength:.0%} → UP +5%, DOWN -3%"
+                    )
+                elif chart_analysis.rsi_divergence == "bearish" and chart_analysis.rsi_divergence_strength > 0.3:
+                    edge_down += 0.05
+                    edge_up -= 0.03
+                    logger.info(
+                        f"🔄 RSI BEARISH DIVERGENCE [{market.asset}]: "
+                        f"Strength={chart_analysis.rsi_divergence_strength:.0%} → DOWN +5%, UP -3%"
+                    )
+
+                # --- Volume Confirmation ---
+                # High volume confirms the move
+                if chart_analysis.is_high_volume:
+                    if chart_says_up:
+                        edge_up += 0.02
+                        logger.info(f"📊 HIGH VOLUME [{market.asset}]: Volume {chart_analysis.volume_ratio:.1f}x avg confirms UP → +2%")
+                    elif chart_says_down:
+                        edge_down += 0.02
+                        logger.info(f"📊 HIGH VOLUME [{market.asset}]: Volume {chart_analysis.volume_ratio:.1f}x avg confirms DOWN → +2%")
+
+                # OBV trend confirmation
+                if chart_analysis.obv_trend > 0.3 and chart_says_up:
+                    edge_up += 0.02
+                    logger.info(f"📈 OBV BULLISH [{market.asset}]: Volume flowing into asset → UP +2%")
+                elif chart_analysis.obv_trend < -0.3 and chart_says_down:
+                    edge_down += 0.02
+                    logger.info(f"📉 OBV BEARISH [{market.asset}]: Volume flowing out of asset → DOWN +2%")
+
+                # --- VOLATILITY-DISTANCE CHECK ---
+                # Can price realistically reach the target in 15 minutes?
+                distance_to_target = abs(current_price - market.target_price)
+                atr_15min = chart_analysis.atr  # ATR is already in price units
+
+                # Typical 15-min move is about 0.5-1x ATR
+                expected_move = atr_15min * 0.75
+
+                if distance_to_target > expected_move * 2:
+                    # Target is far - price unlikely to reach it
+                    if price_below_target:
+                        # Price below target, unlikely to go UP to target
+                        edge_down += 0.03
+                        logger.info(
+                            f"📏 VOLATILITY-DISTANCE [{market.asset}]: Target ${market.target_price:,.0f} is "
+                            f"${distance_to_target:,.0f} away (ATR=${atr_15min:,.0f}) → Price likely stays DOWN"
+                        )
+                    else:
+                        # Price above target, unlikely to go DOWN to target
+                        edge_up += 0.03
+                        logger.info(
+                            f"📏 VOLATILITY-DISTANCE [{market.asset}]: Target ${market.target_price:,.0f} is "
+                            f"${distance_to_target:,.0f} away (ATR=${atr_15min:,.0f}) → Price likely stays UP"
+                        )
+
             # === BTC TREND FOLLOWING ===
             # BTC leads the market - follow its trend for all assets
             # For altcoins: stronger correlation (they follow BTC)

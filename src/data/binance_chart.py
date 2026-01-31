@@ -205,6 +205,33 @@ class ChartAnalysis:
     # RSI
     rsi_14: float = 50.0
 
+    # MACD
+    macd_line: float = 0.0
+    macd_signal: float = 0.0
+    macd_histogram: float = 0.0  # Positive = bullish momentum
+    macd_crossover: str = ""  # "bullish", "bearish", or ""
+
+    # Bollinger Bands
+    bb_upper: float = 0.0
+    bb_middle: float = 0.0
+    bb_lower: float = 0.0
+    bb_bandwidth: float = 0.0  # Low = squeeze, High = expansion
+    bb_position: str = ""  # "above_upper", "below_lower", "middle"
+
+    # Stochastic
+    stoch_k: float = 50.0
+    stoch_d: float = 50.0
+    stoch_signal: str = ""  # "overbought", "oversold", "neutral"
+
+    # RSI Divergence
+    rsi_divergence: str = "none"  # "bullish", "bearish", "none"
+    rsi_divergence_strength: float = 0.0
+
+    # Volume Analysis
+    volume_ratio: float = 1.0  # Current / Average
+    is_high_volume: bool = False
+    obv_trend: float = 0.0  # -1 to +1
+
     # Momentum
     momentum: float = 0.0  # -1 to +1
     momentum_increasing: bool = False
@@ -450,6 +477,232 @@ class BinanceChartAnalyzer:
             return sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
 
         return sum(true_ranges[-period:]) / period
+
+    def calculate_macd(
+        self,
+        prices: List[float],
+        fast: int = 12,
+        slow: int = 26,
+        signal: int = 9,
+    ) -> tuple[float, float, float]:
+        """
+        Calculate MACD (Moving Average Convergence Divergence).
+
+        Returns:
+            Tuple of (macd_line, signal_line, histogram)
+            - macd_line: EMA(fast) - EMA(slow)
+            - signal_line: EMA(macd_line, signal)
+            - histogram: macd_line - signal_line (positive = bullish momentum)
+        """
+        if len(prices) < slow + signal:
+            return 0.0, 0.0, 0.0
+
+        # Calculate MACD line
+        ema_fast = self.calculate_ema(prices, fast)
+        ema_slow = self.calculate_ema(prices, slow)
+        macd_line = ema_fast - ema_slow
+
+        # Calculate signal line (need historical MACD values)
+        macd_values = []
+        for i in range(slow, len(prices) + 1):
+            subset = prices[:i]
+            ema_f = self.calculate_ema(subset, fast)
+            ema_s = self.calculate_ema(subset, slow)
+            macd_values.append(ema_f - ema_s)
+
+        if len(macd_values) < signal:
+            signal_line = macd_line
+        else:
+            signal_line = self.calculate_ema(macd_values, signal)
+
+        histogram = macd_line - signal_line
+
+        return macd_line, signal_line, histogram
+
+    def calculate_bollinger_bands(
+        self,
+        prices: List[float],
+        period: int = 20,
+        std_dev: float = 2.0,
+    ) -> tuple[float, float, float, float]:
+        """
+        Calculate Bollinger Bands.
+
+        Returns:
+            Tuple of (upper_band, middle_band, lower_band, bandwidth_pct)
+            - bandwidth_pct: (upper - lower) / middle * 100 (squeeze indicator)
+        """
+        if len(prices) < period:
+            if prices:
+                return prices[-1], prices[-1], prices[-1], 0.0
+            return 0.0, 0.0, 0.0, 0.0
+
+        # Middle band is SMA
+        middle = sum(prices[-period:]) / period
+
+        # Calculate standard deviation
+        variance = sum((p - middle) ** 2 for p in prices[-period:]) / period
+        std = variance ** 0.5
+
+        upper = middle + (std_dev * std)
+        lower = middle - (std_dev * std)
+
+        # Bandwidth as percentage (low = squeeze, high = expansion)
+        bandwidth_pct = ((upper - lower) / middle) * 100 if middle > 0 else 0.0
+
+        return upper, middle, lower, bandwidth_pct
+
+    def detect_rsi_divergence(
+        self,
+        candles: List[Candle],
+        rsi_period: int = 14,
+        lookback: int = 10,
+    ) -> tuple[str, float]:
+        """
+        Detect RSI Divergence - a powerful reversal signal.
+
+        Bullish divergence: Price makes LOWER low, RSI makes HIGHER low
+        Bearish divergence: Price makes HIGHER high, RSI makes LOWER high
+
+        Returns:
+            Tuple of (divergence_type, strength)
+            - divergence_type: "bullish", "bearish", or "none"
+            - strength: 0.0 to 1.0
+        """
+        if len(candles) < rsi_period + lookback:
+            return "none", 0.0
+
+        closes = [c.close for c in candles]
+        lows = [c.low for c in candles]
+        highs = [c.high for c in candles]
+
+        # Calculate RSI for each point in lookback period
+        rsi_values = []
+        for i in range(lookback):
+            idx = len(closes) - lookback + i
+            if idx >= rsi_period:
+                subset = closes[:idx + 1]
+                rsi = self.calculate_rsi(subset, rsi_period)
+                rsi_values.append(rsi)
+
+        if len(rsi_values) < 2:
+            return "none", 0.0
+
+        # Find recent swing points
+        recent_lows = lows[-lookback:]
+        recent_highs = highs[-lookback:]
+
+        current_low = min(recent_lows[-3:])  # Recent low
+        prev_low = min(recent_lows[:-3]) if len(recent_lows) > 3 else current_low
+
+        current_high = max(recent_highs[-3:])  # Recent high
+        prev_high = max(recent_highs[:-3]) if len(recent_highs) > 3 else current_high
+
+        current_rsi = rsi_values[-1]
+        prev_rsi = min(rsi_values[:-3]) if len(rsi_values) > 3 else rsi_values[0]
+        prev_rsi_high = max(rsi_values[:-3]) if len(rsi_values) > 3 else rsi_values[0]
+
+        # Bullish divergence: Lower low in price, higher low in RSI
+        if current_low < prev_low and current_rsi > prev_rsi:
+            strength = min(1.0, (current_rsi - prev_rsi) / 20)  # RSI diff / 20
+            return "bullish", strength
+
+        # Bearish divergence: Higher high in price, lower high in RSI
+        if current_high > prev_high and current_rsi < prev_rsi_high:
+            strength = min(1.0, (prev_rsi_high - current_rsi) / 20)
+            return "bearish", strength
+
+        return "none", 0.0
+
+    def calculate_volume_analysis(
+        self,
+        candles: List[Candle],
+        period: int = 20,
+    ) -> tuple[float, bool, float]:
+        """
+        Analyze volume for confirmation signals.
+
+        Returns:
+            Tuple of (volume_ratio, is_high_volume, obv_trend)
+            - volume_ratio: Current volume / Average volume
+            - is_high_volume: True if volume > 1.5x average
+            - obv_trend: On-Balance Volume trend (-1 to +1)
+        """
+        if len(candles) < period:
+            return 1.0, False, 0.0
+
+        volumes = [c.volume for c in candles]
+        avg_volume = sum(volumes[-period:]) / period
+        current_volume = volumes[-1]
+
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
+        is_high_volume = volume_ratio > 1.5
+
+        # Calculate OBV (On-Balance Volume) trend
+        obv = 0.0
+        for i in range(1, len(candles)):
+            if candles[i].close > candles[i - 1].close:
+                obv += candles[i].volume
+            elif candles[i].close < candles[i - 1].close:
+                obv -= candles[i].volume
+
+        # OBV trend: compare recent OBV to OBV 5 candles ago
+        obv_5_ago = 0.0
+        for i in range(1, len(candles) - 5):
+            if candles[i].close > candles[i - 1].close:
+                obv_5_ago += candles[i].volume
+            elif candles[i].close < candles[i - 1].close:
+                obv_5_ago -= candles[i].volume
+
+        if abs(obv_5_ago) > 0:
+            obv_trend = (obv - obv_5_ago) / abs(obv_5_ago)
+            obv_trend = max(-1.0, min(1.0, obv_trend))
+        else:
+            obv_trend = 0.0
+
+        return volume_ratio, is_high_volume, obv_trend
+
+    def calculate_stochastic(
+        self,
+        candles: List[Candle],
+        k_period: int = 14,
+        d_period: int = 3,
+    ) -> tuple[float, float]:
+        """
+        Calculate Stochastic Oscillator (faster than RSI for short-term).
+
+        Returns:
+            Tuple of (%K, %D)
+            - %K: Main line (0-100)
+            - %D: Signal line (SMA of %K)
+        """
+        if len(candles) < k_period:
+            return 50.0, 50.0
+
+        # Calculate %K values for smoothing
+        k_values = []
+        for i in range(k_period - 1, len(candles)):
+            subset = candles[i - k_period + 1:i + 1]
+            highest_high = max(c.high for c in subset)
+            lowest_low = min(c.low for c in subset)
+            current_close = candles[i].close
+
+            if highest_high != lowest_low:
+                k = ((current_close - lowest_low) / (highest_high - lowest_low)) * 100
+            else:
+                k = 50.0
+            k_values.append(k)
+
+        if len(k_values) < d_period:
+            return k_values[-1] if k_values else 50.0, 50.0
+
+        # %K is the latest value
+        k = k_values[-1]
+
+        # %D is SMA of %K
+        d = sum(k_values[-d_period:]) / d_period
+
+        return k, d
 
     def detect_trend(self, candles: List[Candle]) -> float:
         """
@@ -1266,6 +1519,51 @@ class BinanceChartAnalyzer:
             # Calculate ATR
             atr = self.calculate_atr(candles_15m)
 
+            # === NEW INDICATORS ===
+
+            # MACD
+            macd_line, macd_signal, macd_histogram = self.calculate_macd(closes_15m)
+            macd_crossover = ""
+            if len(closes_15m) >= 30:
+                # Check for recent crossover (within last 3 candles)
+                prev_macd = []
+                for i in range(3, 0, -1):
+                    subset = closes_15m[:-i] if i > 0 else closes_15m
+                    if len(subset) >= 26:
+                        ml, ms, _ = self.calculate_macd(subset)
+                        prev_macd.append(ml - ms)
+                if prev_macd and len(prev_macd) >= 2:
+                    if prev_macd[-2] < 0 and macd_histogram > 0:
+                        macd_crossover = "bullish"
+                    elif prev_macd[-2] > 0 and macd_histogram < 0:
+                        macd_crossover = "bearish"
+
+            # Bollinger Bands
+            bb_upper, bb_middle, bb_lower, bb_bandwidth = self.calculate_bollinger_bands(closes_15m)
+            bb_position = ""
+            if current_price > bb_upper:
+                bb_position = "above_upper"
+            elif current_price < bb_lower:
+                bb_position = "below_lower"
+            else:
+                bb_position = "middle"
+
+            # Stochastic
+            stoch_k, stoch_d = self.calculate_stochastic(candles_15m)
+            stoch_signal = ""
+            if stoch_k > 80 and stoch_d > 80:
+                stoch_signal = "overbought"
+            elif stoch_k < 20 and stoch_d < 20:
+                stoch_signal = "oversold"
+            else:
+                stoch_signal = "neutral"
+
+            # RSI Divergence
+            rsi_divergence, rsi_divergence_strength = self.detect_rsi_divergence(candles_15m)
+
+            # Volume Analysis
+            volume_ratio, is_high_volume, obv_trend = self.calculate_volume_analysis(candles_15m)
+
             # Detect market type
             avg_trend = (trend_15m + trend_1h + trend_4h) / 3
             market_type, trend_strength = self.detect_market_type(candles_15m, avg_trend)
@@ -1442,6 +1740,29 @@ class BinanceChartAnalyzer:
                 support_level=support,
                 resistance_level=resistance,
                 rsi_14=rsi_14,
+                # MACD
+                macd_line=macd_line,
+                macd_signal=macd_signal,
+                macd_histogram=macd_histogram,
+                macd_crossover=macd_crossover,
+                # Bollinger Bands
+                bb_upper=bb_upper,
+                bb_middle=bb_middle,
+                bb_lower=bb_lower,
+                bb_bandwidth=bb_bandwidth,
+                bb_position=bb_position,
+                # Stochastic
+                stoch_k=stoch_k,
+                stoch_d=stoch_d,
+                stoch_signal=stoch_signal,
+                # RSI Divergence
+                rsi_divergence=rsi_divergence,
+                rsi_divergence_strength=rsi_divergence_strength,
+                # Volume
+                volume_ratio=volume_ratio,
+                is_high_volume=is_high_volume,
+                obv_trend=obv_trend,
+                # Momentum
                 momentum=momentum,
                 momentum_increasing=momentum_increasing,
                 is_bullish_pattern=is_bullish,
