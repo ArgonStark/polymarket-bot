@@ -613,43 +613,87 @@ class SignalGenerator:
             price_below_target = current_price < market.target_price
             price_above_target = current_price > market.target_price
 
-            # === EDGE BOOST LOGIC ===
-            # 1. Trend alignment boost
+            # === EDGE ADJUSTMENT LOGIC ===
+            # When chart analysis strongly disagrees with probability signal,
+            # we both BOOST the aligned side and PENALIZE the opposite side
+
+            # 1. Strong trend: boost aligned side, penalize opposite
             if avg_trend > 0.3 and price_below_target:
+                # Uptrend + below target: boost UP
                 trend_boost = min(0.05, avg_trend * 0.1)
                 edge_up += trend_boost
                 logger.info(
                     f"📈 TREND [{market.asset}]: UP trend ({avg_trend:.2f}) + below target → UP +{trend_boost:.1%}"
                 )
             elif avg_trend < -0.3 and price_above_target:
+                # Downtrend + above target: boost DOWN, penalize UP
                 trend_boost = min(0.05, abs(avg_trend) * 0.1)
                 edge_down += trend_boost
+                # PENALTY: Strong downtrend means UP signal is risky
+                trend_penalty = min(0.15, abs(avg_trend) * 0.2)  # Up to 15% penalty
+                edge_up -= trend_penalty
                 logger.info(
-                    f"📉 TREND [{market.asset}]: DOWN trend ({avg_trend:.2f}) + above target → DOWN +{trend_boost:.1%}"
+                    f"📉 TREND [{market.asset}]: DOWN trend ({avg_trend:.2f}) + above target → DOWN +{trend_boost:.1%}, UP -{trend_penalty:.1%}"
+                )
+            elif avg_trend > 0.3 and price_above_target:
+                # Uptrend but price already above target: penalize DOWN
+                trend_penalty = min(0.10, avg_trend * 0.15)
+                edge_down -= trend_penalty
+                logger.info(
+                    f"📈 TREND [{market.asset}]: UP trend ({avg_trend:.2f}) + above target → DOWN -{trend_penalty:.1%}"
+                )
+            elif avg_trend < -0.3 and price_below_target:
+                # Downtrend but price below target: penalize UP
+                trend_penalty = min(0.10, abs(avg_trend) * 0.15)
+                edge_up -= trend_penalty
+                logger.info(
+                    f"📉 TREND [{market.asset}]: DOWN trend ({avg_trend:.2f}) + below target → UP -{trend_penalty:.1%}"
                 )
 
-            # 2. Chart bias boost (from comprehensive analysis)
+            # 2. Chart bias: boost aligned, penalize opposite
             if chart_analysis and chart_confidence > 0.6:
                 bias_boost = (chart_confidence - 0.5) * 0.1  # Up to 5% boost
-                if chart_bias == "bullish" and price_below_target:
-                    edge_up += bias_boost
-                    logger.info(f"📊 BIAS [{market.asset}]: Bullish ({chart_confidence:.0%}) → UP +{bias_boost:.1%}")
-                elif chart_bias == "bearish" and price_above_target:
-                    edge_down += bias_boost
-                    logger.info(f"📊 BIAS [{market.asset}]: Bearish ({chart_confidence:.0%}) → DOWN +{bias_boost:.1%}")
+                bias_penalty = (chart_confidence - 0.5) * 0.15  # Up to 7.5% penalty
+                if chart_bias == "bullish":
+                    if price_below_target:
+                        edge_up += bias_boost
+                        logger.info(f"📊 BIAS [{market.asset}]: Bullish ({chart_confidence:.0%}) → UP +{bias_boost:.1%}")
+                    else:
+                        # Bullish but above target - penalize DOWN slightly
+                        edge_down -= bias_penalty * 0.5
+                elif chart_bias == "bearish":
+                    if price_above_target:
+                        edge_down += bias_boost
+                        # CRITICAL: Penalize UP when bearish and above target
+                        edge_up -= bias_penalty
+                        logger.info(f"📊 BIAS [{market.asset}]: Bearish ({chart_confidence:.0%}) → DOWN +{bias_boost:.1%}, UP -{bias_penalty:.1%}")
+                    else:
+                        # Bearish but below target - penalize UP
+                        edge_up -= bias_penalty * 0.5
 
-            # 3. RSI extremes boost (oversold/overbought)
+            # 3. RSI extremes: boost reversal side, penalize continuation
             if chart_analysis:
-                if rsi < 25 and price_below_target:
-                    rsi_boost = 0.03  # Oversold bounce expected
-                    edge_up += rsi_boost
-                    logger.info(f"📉 RSI [{market.asset}]: Oversold ({rsi:.0f}) → UP +{rsi_boost:.1%}")
-                elif rsi > 75 and price_above_target:
-                    rsi_boost = 0.03  # Overbought pullback expected
-                    edge_down += rsi_boost
-                    logger.info(f"📈 RSI [{market.asset}]: Overbought ({rsi:.0f}) → DOWN +{rsi_boost:.1%}")
+                if rsi < 25:
+                    # Oversold - expect bounce
+                    if price_below_target:
+                        rsi_boost = 0.03
+                        edge_up += rsi_boost
+                        logger.info(f"📉 RSI [{market.asset}]: Oversold ({rsi:.0f}) → UP +{rsi_boost:.1%}")
+                    # Even if above target, oversold means DOWN is risky
+                    edge_down -= 0.02
+                elif rsi > 75:
+                    # Overbought - expect pullback
+                    if price_above_target:
+                        rsi_boost = 0.03
+                        edge_down += rsi_boost
+                        # Overbought means UP is risky
+                        edge_up -= 0.03
+                        logger.info(f"📈 RSI [{market.asset}]: Overbought ({rsi:.0f}) → DOWN +{rsi_boost:.1%}, UP -3.0%")
+                    else:
+                        # Overbought but below target - still penalize UP
+                        edge_up -= 0.02
 
-            # 4. Pattern recognition boost
+            # 4. Pattern recognition: boost aligned, penalize opposite
             if is_bullish_pattern and price_below_target:
                 pattern_boost = 0.02
                 edge_up += pattern_boost
@@ -657,9 +701,10 @@ class SignalGenerator:
             elif is_bearish_pattern and price_above_target:
                 pattern_boost = 0.02
                 edge_down += pattern_boost
-                logger.info(f"🕯️ PATTERN [{market.asset}]: Bearish pattern → DOWN +{pattern_boost:.1%}")
+                edge_up -= 0.02  # Bearish pattern means UP is risky
+                logger.info(f"🕯️ PATTERN [{market.asset}]: Bearish pattern → DOWN +{pattern_boost:.1%}, UP -2.0%")
 
-            # 5. Trend reversal signal (major boost)
+            # 5. Trend reversal signal (major adjustment)
             if trend_change == "bullish_reversal" and price_below_target:
                 reversal_boost = 0.04
                 edge_up += reversal_boost
@@ -667,7 +712,51 @@ class SignalGenerator:
             elif trend_change == "bearish_reversal" and price_above_target:
                 reversal_boost = 0.04
                 edge_down += reversal_boost
-                logger.info(f"🔄 REVERSAL [{market.asset}]: Bearish reversal → DOWN +{reversal_boost:.1%}")
+                edge_up -= 0.05  # Bearish reversal means UP is very risky
+                logger.info(f"🔄 REVERSAL [{market.asset}]: Bearish reversal → DOWN +{reversal_boost:.1%}, UP -5.0%")
+
+            # === 6. STRONG TREND OVERRIDE ===
+            # When chart shows VERY strong bearish/bullish signal and price is barely
+            # across target, don't trust the probability calculation - the trend
+            # is likely to push price back across target within the 15-min window
+            if chart_analysis:
+                market_type = chart_analysis.market_type.value
+
+                # Strong downtrend + bearish bias + price barely above target
+                if ("strong_downtrend" in market_type or "downtrend" in market_type) and \
+                   chart_bias == "bearish" and chart_confidence >= 0.7:
+                    # Calculate how far price is from target (as % of target)
+                    distance_pct = abs(current_price - market.target_price) / market.target_price
+                    if price_above_target and distance_pct < 0.005:  # Within 0.5% of target
+                        # Price is barely above target in a strong downtrend
+                        # Apply massive penalty to UP - trend will likely push it back down
+                        override_penalty = 0.30  # 30% penalty
+                        edge_up -= override_penalty
+                        logger.info(
+                            f"⚠️ STRONG TREND OVERRIDE [{market.asset}]: "
+                            f"Strong bearish ({market_type}, {chart_bias} {chart_confidence:.0%}) + "
+                            f"price barely above target ({distance_pct:.2%}) → UP -{override_penalty:.0%}"
+                        )
+
+                # Strong uptrend + bullish bias + price barely below target
+                if ("strong_uptrend" in market_type or "uptrend" in market_type) and \
+                   chart_bias == "bullish" and chart_confidence >= 0.7:
+                    distance_pct = abs(current_price - market.target_price) / market.target_price
+                    if price_below_target and distance_pct < 0.005:  # Within 0.5% of target
+                        # Price is barely below target in a strong uptrend
+                        override_penalty = 0.30
+                        edge_down -= override_penalty
+                        logger.info(
+                            f"⚠️ STRONG TREND OVERRIDE [{market.asset}]: "
+                            f"Strong bullish ({market_type}, {chart_bias} {chart_confidence:.0%}) + "
+                            f"price barely below target ({distance_pct:.2%}) → DOWN -{override_penalty:.0%}"
+                        )
+
+            # Log final edge values after all adjustments
+            logger.debug(
+                f"FINAL EDGES [{market.asset}]: edge_up={edge_up:.1%}, edge_down={edge_down:.1%} "
+                f"(trend={avg_trend:.2f}, bias={chart_bias})"
+            )
 
         except Exception as e:
             logger.debug(f"Trend-following analysis failed for {market.asset}: {e}")
