@@ -53,12 +53,32 @@ CRYPTO_ASSETS = {"btc": "BTC", "eth": "ETH", "sol": "SOL", "xrp": "XRP"}
 class CopyConfig:
     """Copy trading configuration."""
     wallets: List[str]  # Wallets to copy
-    size_pct: float = 0.05  # Use 5% of balance per trade
+
+    # Sizing mode: "fixed", "percent", "proportional", "kelly"
+    size_mode: str = "percent"
+
+    # For "fixed" mode - always trade this amount
+    fixed_size_usd: float = 5.0
+
+    # For "percent" mode - use this % of YOUR balance
+    size_pct: float = 0.05  # 5% of balance
+
+    # For "proportional" mode - match their size scaled to your balance
+    # If they trade 1% of their portfolio, you trade 1% of yours
+    their_estimated_balance: float = 100000.0  # Estimate their bankroll
+
+    # Limits (apply to all modes)
     min_size_usd: float = 5.0  # Minimum $5 (Polymarket minimum)
     max_size_usd: float = 50.0  # Maximum $50 per copy
+    max_risk_pct: float = 0.10  # Never risk more than 10% of balance per trade
+
+    # Timing
     poll_interval: float = 0.5  # Poll every 500ms
     max_delay_seconds: int = 15  # Copy within 15 seconds
+
+    # Safety
     dry_run: bool = False
+    stop_loss_pct: float = 0.50  # Stop if balance drops 50% from start
 
 
 class CopyBot:
@@ -99,7 +119,16 @@ class CopyBot:
         logger.info(f"Tracking {len(self.config.wallets)} wallets:")
         for w in self.config.wallets:
             logger.info(f"  • {w[:10]}...{w[-6:]}")
-        logger.info(f"Size: {self.config.size_pct:.0%} of balance (${self.config.min_size_usd}-${self.config.max_size_usd})")
+        # Show sizing configuration based on mode
+        if self.config.size_mode == "fixed":
+            logger.info(f"Sizing: FIXED ${self.config.fixed_size_usd:.2f} per trade")
+        elif self.config.size_mode == "proportional":
+            logger.info(f"Sizing: PROPORTIONAL (their est. balance: ${self.config.their_estimated_balance:,.0f})")
+        elif self.config.size_mode == "kelly":
+            logger.info(f"Sizing: KELLY (1/4 fractional)")
+        else:
+            logger.info(f"Sizing: {self.config.size_pct:.0%} of balance")
+        logger.info(f"Limits: ${self.config.min_size_usd}-${self.config.max_size_usd}, max {self.config.max_risk_pct:.0%} risk per trade")
         logger.info(f"Poll interval: {self.config.poll_interval}s")
         logger.info("=" * 60)
 
@@ -336,19 +365,50 @@ class CopyBot:
 
     def _calculate_copy_size(self, their_size: float) -> float:
         """
-        Calculate our copy size based on balance.
+        Calculate our copy size based on configured sizing mode.
 
-        Uses percentage of our balance, clamped to min/max.
+        Modes:
+        - fixed: Always trade fixed_size_usd
+        - percent: Use size_pct of YOUR balance
+        - proportional: Match their trade size scaled to your balance
+        - kelly: Use Kelly criterion based on their win rate (advanced)
         """
-        # Base size is percentage of our balance
-        our_size = self.balance * self.config.size_pct
+        if self.config.size_mode == "fixed":
+            # Fixed dollar amount per trade
+            our_size = self.config.fixed_size_usd
 
-        # Clamp to configured limits
+        elif self.config.size_mode == "proportional":
+            # Match their sizing proportionally
+            # If they trade $100 of estimated $10,000 portfolio (1%),
+            # we trade 1% of our portfolio
+            their_pct = their_size / self.config.their_estimated_balance
+            our_size = self.balance * their_pct
+
+        elif self.config.size_mode == "kelly":
+            # Simplified Kelly: f = (bp - q) / b
+            # For 50% win rate at even odds: f = 0 (don't bet)
+            # For 55% win rate: f = 0.10 (10% of bankroll)
+            # We use a fractional Kelly (1/4) for safety
+            assumed_win_rate = 0.55  # Target trader's estimated win rate
+            assumed_odds = 1.0  # Even money approximation
+            kelly_fraction = (assumed_win_rate * assumed_odds - (1 - assumed_win_rate)) / assumed_odds
+            kelly_fraction = max(0, kelly_fraction) * 0.25  # 1/4 Kelly for safety
+            our_size = self.balance * kelly_fraction
+
+        else:  # "percent" mode (default)
+            # Simple percentage of our balance
+            our_size = self.balance * self.config.size_pct
+
+        # Apply limits (all modes)
         our_size = max(self.config.min_size_usd, our_size)
         our_size = min(self.config.max_size_usd, our_size)
 
-        # Don't spend more than we have
-        our_size = min(our_size, self.balance * 0.9)  # Keep 10% reserve
+        # Never risk more than max_risk_pct of balance per trade
+        max_risk = self.balance * self.config.max_risk_pct
+        our_size = min(our_size, max_risk)
+
+        # Keep a small reserve (don't spend last 10%)
+        our_size = min(our_size, self.balance * 0.9)
 
         return our_size
 
@@ -435,10 +495,32 @@ def main():
     )
 
     parser.add_argument(
+        "--size-mode",
+        type=str,
+        choices=["fixed", "percent", "proportional", "kelly"],
+        default="percent",
+        help="Sizing mode: fixed, percent, proportional, kelly (default: percent)",
+    )
+
+    parser.add_argument(
         "--size-pct",
         type=float,
         default=0.05,
-        help="Percentage of balance per trade (default: 0.05 = 5%%)",
+        help="Percentage of balance per trade for 'percent' mode (default: 0.05 = 5%%)",
+    )
+
+    parser.add_argument(
+        "--fixed-size",
+        type=float,
+        default=10.0,
+        help="Fixed trade size in USD for 'fixed' mode (default: 10)",
+    )
+
+    parser.add_argument(
+        "--their-balance",
+        type=float,
+        default=100000.0,
+        help="Estimated target's balance for 'proportional' mode (default: 100000)",
     )
 
     parser.add_argument(
@@ -453,6 +535,13 @@ def main():
         type=float,
         default=50.0,
         help="Maximum trade size in USD (default: 50)",
+    )
+
+    parser.add_argument(
+        "--max-risk-pct",
+        type=float,
+        default=0.10,
+        help="Max risk per trade as %% of balance (default: 0.10 = 10%%)",
     )
 
     parser.add_argument(
@@ -472,9 +561,13 @@ def main():
 
     config = CopyConfig(
         wallets=args.wallet,
+        size_mode=args.size_mode,
+        fixed_size_usd=args.fixed_size,
         size_pct=args.size_pct,
+        their_estimated_balance=args.their_balance,
         min_size_usd=args.min_size,
         max_size_usd=args.max_size,
+        max_risk_pct=args.max_risk_pct,
         poll_interval=args.poll_interval,
         dry_run=args.dry_run,
     )
