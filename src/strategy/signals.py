@@ -726,8 +726,73 @@ class SignalGenerator:
             chart_says_down = False
             chart_signal_strength = 0.0  # 0 to 1
 
-            # Strong bearish signals
-            if chart_bias == "bearish" and chart_confidence >= 0.6:
+            # === SHORT-TERM MOMENTUM DETECTION ===
+            # For 15-min Polymarket markets, short-term momentum is KEY
+            # We can catch bounces in downtrends and pullbacks in uptrends
+            short_term_trend = 0.0
+            if chart_analysis:
+                # Weight short-term trends more heavily (1m=0.4, 5m=0.35, 15m=0.25)
+                short_term_trend = (
+                    chart_analysis.trend_1m * 0.4 +
+                    chart_analysis.trend_5m * 0.35 +
+                    chart_analysis.trend_15m * 0.25
+                )
+
+            # Check for SHORT-TERM BOUNCE in a downtrend
+            # This is when 1h/4h are bearish but 1m/5m show a bounce
+            is_short_term_bounce = (
+                short_term_trend > 0.3 and  # Short-term bullish
+                trend_1h < -0.2  # But 1h is bearish (we're in a downtrend)
+            )
+
+            # Check for SHORT-TERM PULLBACK in an uptrend
+            # This is when 1h/4h are bullish but 1m/5m show a pullback
+            is_short_term_pullback = (
+                short_term_trend < -0.3 and  # Short-term bearish
+                trend_1h > 0.2  # But 1h is bullish (we're in an uptrend)
+            )
+
+            # === PATTERN-BASED SIGNALS ===
+            # Bullish/bearish patterns can also signal counter-trend opportunities
+            pattern_says_up = is_bullish_pattern
+            pattern_says_down = is_bearish_pattern
+
+            # === DETERMINE CHART SIGNAL ===
+
+            # SHORT-TERM BOUNCE: Trade UP even in downtrend
+            if is_short_term_bounce:
+                chart_says_up = True
+                chart_signal_strength = min(1.0, abs(short_term_trend) * 1.5)
+                logger.info(
+                    f"📈 SHORT-TERM BOUNCE [{market.asset}]: "
+                    f"1m/5m bullish ({short_term_trend:+.2f}) in 1h downtrend ({trend_1h:+.2f}) → UP signal"
+                )
+
+            # SHORT-TERM PULLBACK: Trade DOWN even in uptrend
+            elif is_short_term_pullback:
+                chart_says_down = True
+                chart_signal_strength = min(1.0, abs(short_term_trend) * 1.5)
+                logger.info(
+                    f"📉 SHORT-TERM PULLBACK [{market.asset}]: "
+                    f"1m/5m bearish ({short_term_trend:+.2f}) in 1h uptrend ({trend_1h:+.2f}) → DOWN signal"
+                )
+
+            # PATTERN-BASED SIGNAL (can override trend)
+            elif pattern_says_up and short_term_trend > 0:
+                chart_says_up = True
+                chart_signal_strength = 0.7
+                logger.info(
+                    f"🕯️ BULLISH PATTERN [{market.asset}]: {chart_analysis.pattern_name if chart_analysis else 'unknown'} → UP signal"
+                )
+            elif pattern_says_down and short_term_trend < 0:
+                chart_says_down = True
+                chart_signal_strength = 0.7
+                logger.info(
+                    f"🕯️ BEARISH PATTERN [{market.asset}]: {chart_analysis.pattern_name if chart_analysis else 'unknown'} → DOWN signal"
+                )
+
+            # Strong bearish signals (traditional)
+            elif chart_bias == "bearish" and chart_confidence >= 0.6:
                 chart_says_down = True
                 chart_signal_strength = chart_confidence
 
@@ -737,7 +802,7 @@ class SignalGenerator:
                 if "strong_downtrend" in market_type:
                     chart_signal_strength = min(1.0, chart_signal_strength + 0.2)
 
-            # Strong bullish signals
+            # Strong bullish signals (traditional)
             elif chart_bias == "bullish" and chart_confidence >= 0.6:
                 chart_says_up = True
                 chart_signal_strength = chart_confidence

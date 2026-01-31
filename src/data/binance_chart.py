@@ -919,7 +919,12 @@ class BinanceChartAnalyzer:
 
     def detect_patterns(self, candles: List[Candle]) -> tuple[bool, bool, str]:
         """
-        Detect bullish/bearish candlestick patterns.
+        Detect bullish/bearish candlestick patterns for SHORT-TERM trading.
+
+        For 15-minute Polymarket markets, we want to catch:
+        - Bullish bounces even in a downtrend (dead cat bounces are tradeable)
+        - Bearish pullbacks even in an uptrend
+        - Any short-term reversal signal
 
         Returns:
             Tuple of (is_bullish, is_bearish, pattern_name)
@@ -931,21 +936,50 @@ class BinanceChartAnalyzer:
         prev = candles[-2]
         prev2 = candles[-3]
 
-        # Bullish Engulfing
+        # === BULLISH PATTERNS (detect bounces, even in downtrend) ===
+
+        # Bullish Engulfing - strong short-term reversal signal
         if (prev.is_bearish and last.is_bullish and
             last.open < prev.close and last.close > prev.open):
             return True, False, "bullish_engulfing"
+
+        # Hammer (bullish) - rejection of lower prices
+        if (last.is_bullish and
+            last.lower_wick > last.body_size * 2 and
+            last.upper_wick < last.body_size * 0.5):
+            return True, False, "hammer"
+
+        # Three White Soldiers (bullish)
+        if (prev2.is_bullish and prev.is_bullish and last.is_bullish and
+            prev.close > prev2.close and last.close > prev.close):
+            return True, False, "three_white_soldiers"
+
+        # Morning Star (bullish reversal)
+        if (prev2.is_bearish and prev.body_percentage < 0.3 and last.is_bullish and
+            last.close > (prev2.open + prev2.close) / 2):
+            return True, False, "morning_star"
+
+        # Bullish Harami - potential bounce
+        if (prev.is_bearish and last.is_bullish and
+            last.open > prev.close and last.close < prev.open and
+            last.body_size < prev.body_size * 0.5):
+            return True, False, "bullish_harami"
+
+        # Double bottom hint (two consecutive lows at similar level)
+        if len(candles) >= 5:
+            recent_lows = [c.low for c in candles[-5:]]
+            min_low = min(recent_lows)
+            if (last.is_bullish and
+                abs(last.low - min_low) / min_low < 0.002 and  # Within 0.2%
+                last.close > last.open):
+                return True, False, "double_bottom_hint"
+
+        # === BEARISH PATTERNS (detect pullbacks, even in uptrend) ===
 
         # Bearish Engulfing
         if (prev.is_bullish and last.is_bearish and
             last.open > prev.close and last.close < prev.open):
             return False, True, "bearish_engulfing"
-
-        # Hammer (bullish)
-        if (last.is_bullish and
-            last.lower_wick > last.body_size * 2 and
-            last.upper_wick < last.body_size * 0.5):
-            return True, False, "hammer"
 
         # Shooting Star (bearish)
         if (last.is_bearish and
@@ -953,25 +987,30 @@ class BinanceChartAnalyzer:
             last.lower_wick < last.body_size * 0.5):
             return False, True, "shooting_star"
 
-        # Three White Soldiers (bullish)
-        if (prev2.is_bullish and prev.is_bullish and last.is_bullish and
-            prev.close > prev2.close and last.close > prev.close):
-            return True, False, "three_white_soldiers"
-
         # Three Black Crows (bearish)
         if (prev2.is_bearish and prev.is_bearish and last.is_bearish and
             prev.close < prev2.close and last.close < prev.close):
             return False, True, "three_black_crows"
 
-        # Morning Star (bullish)
-        if (prev2.is_bearish and prev.body_percentage < 0.3 and last.is_bullish and
-            last.close > (prev2.open + prev2.close) / 2):
-            return True, False, "morning_star"
-
         # Evening Star (bearish)
         if (prev2.is_bullish and prev.body_percentage < 0.3 and last.is_bearish and
             last.close < (prev2.open + prev2.close) / 2):
             return False, True, "evening_star"
+
+        # Bearish Harami - potential pullback
+        if (prev.is_bullish and last.is_bearish and
+            last.open < prev.close and last.close > prev.open and
+            last.body_size < prev.body_size * 0.5):
+            return False, True, "bearish_harami"
+
+        # Double top hint (two consecutive highs at similar level)
+        if len(candles) >= 5:
+            recent_highs = [c.high for c in candles[-5:]]
+            max_high = max(recent_highs)
+            if (last.is_bearish and
+                abs(last.high - max_high) / max_high < 0.002 and  # Within 0.2%
+                last.close < last.open):
+                return False, True, "double_top_hint"
 
         return False, False, ""
 
