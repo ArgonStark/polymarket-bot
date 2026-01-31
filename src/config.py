@@ -269,53 +269,6 @@ class TradingConfig:
 
 
 @dataclass
-class CopyTradingConfig:
-    """Copy trading settings - follow successful traders."""
-
-    # Enable copy trading (disabled by default)
-    enabled: bool = field(
-        default_factory=lambda: os.getenv("COPY_TRADING_ENABLED", "false").lower() == "true"
-    )
-
-    # Comma-separated list of wallet addresses to copy
-    wallets: list = field(
-        default_factory=lambda: [
-            w.strip() for w in os.getenv("COPY_WALLETS", "").split(",") if w.strip()
-        ]
-    )
-
-    # Minimum win rate to copy from a trader (55% default)
-    min_win_rate: float = field(
-        default_factory=lambda: float(os.getenv("COPY_MIN_WIN_RATE", "0.55"))
-    )
-
-    # Minimum total trades for a trader to be copyable
-    min_trades: int = field(
-        default_factory=lambda: int(os.getenv("COPY_MIN_TRADES", "10"))
-    )
-
-    # Fixed position size for copy trades (USD)
-    copy_size_usd: float = field(
-        default_factory=lambda: float(os.getenv("COPY_SIZE_USD", "10.0"))
-    )
-
-    # Maximum delay to copy a trade (seconds)
-    max_copy_delay: int = field(
-        default_factory=lambda: int(os.getenv("COPY_MAX_DELAY", "30"))
-    )
-
-    # Maximum copy trades per 15-min period
-    max_copies_per_period: int = field(
-        default_factory=lambda: int(os.getenv("COPY_MAX_PER_PERIOD", "3"))
-    )
-
-    # Poll interval for checking new trades (seconds)
-    poll_interval: float = field(
-        default_factory=lambda: float(os.getenv("COPY_POLL_INTERVAL", "5.0"))
-    )
-
-
-@dataclass
 class VolatilityConfig:
     """Default volatility assumptions for each asset (15-minute)."""
 
@@ -526,7 +479,6 @@ class BotConfig:
     trend_protection: TrendProtectionConfig = field(default_factory=TrendProtectionConfig)
     endpoints: EndpointsConfig = field(default_factory=EndpointsConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
-    copy_trading: CopyTradingConfig = field(default_factory=CopyTradingConfig)
 
     # Supported assets for 15-minute markets
     supported_assets: list = field(

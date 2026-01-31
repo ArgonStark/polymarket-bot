@@ -33,11 +33,6 @@ from .strategy.ml_predictor import (
     calculate_price_trend,
 )
 from .strategy.trade_history import get_trade_history
-from .strategy.copy_trading import (
-    CopyTradingManager,
-    CopyTradingConfig as CopyConfig,
-    get_copy_trading_manager,
-)
 from .utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
 
 # Import Binance chart analyzer for ML features
@@ -109,28 +104,6 @@ class TradingBot:
             )
         else:
             logger.info("🤖 ML disabled (set ML_ENABLED=true to enable)")
-
-        # Copy Trading Manager
-        self.copy_manager: Optional[CopyTradingManager] = None
-        if config.copy_trading.enabled:
-            copy_config = CopyConfig(
-                wallets=config.copy_trading.wallets,
-                min_win_rate=config.copy_trading.min_win_rate,
-                min_trades=config.copy_trading.min_trades,
-                fixed_size_usd=config.copy_trading.copy_size_usd,
-                max_copy_delay_seconds=config.copy_trading.max_copy_delay,
-                poll_interval_seconds=config.copy_trading.poll_interval,
-                max_copies_per_period=config.copy_trading.max_copies_per_period,
-                enabled=True,
-                fast_mode=True,  # Always use fast mode
-            )
-            self.copy_manager = CopyTradingManager(copy_config)
-            logger.info(
-                f"📋 Copy trading enabled: tracking {len(config.copy_trading.wallets)} wallets | "
-                f"Poll: {config.copy_trading.poll_interval}s | Size: ${config.copy_trading.copy_size_usd}"
-            )
-        else:
-            logger.info("📋 Copy trading disabled (set COPY_TRADING_ENABLED=true)")
 
         # Market state - three-stage lifecycle
         self.markets: dict[str, MarketState] = {}  # Active trading markets
@@ -817,11 +790,6 @@ class TradingBot:
             else:
                 logger.info("Using Polymarket's bundled Binance prices (BINANCE_DIRECT=false)")
 
-            # Add copy trading loop if enabled
-            if self.copy_manager:
-                logger.info("Starting FAST copy trading loop...")
-                tasks.append(self._run_copy_trading_loop())
-
             # Run all components concurrently
             await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
@@ -1166,143 +1134,6 @@ class TradingBot:
                 await asyncio.sleep(5.0)
 
         logger.info("Settlement loop stopped")
-
-    async def _run_copy_trading_loop(self):
-        """
-        Fast copy trading loop - polls tracked wallets and copies trades.
-
-        Runs at high frequency (every 500ms) to detect and copy trades ASAP.
-        """
-        if not self.copy_manager:
-            return
-
-        logger.info("Copy trading loop started (FAST MODE)")
-
-        while self._running:
-            try:
-                # Poll all tracked wallets for new trades
-                new_trades = self.copy_manager.poll_all_wallets()
-
-                for trade in new_trades:
-                    # Get copy signal
-                    signal = self.copy_manager.get_copy_signal(trade)
-                    if not signal:
-                        continue
-
-                    # Execute copy trade immediately
-                    await self._execute_copy_trade(signal)
-
-                # Fast polling - 500ms intervals
-                await asyncio.sleep(self.config.copy_trading.poll_interval)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Copy trading loop error: {e}")
-                await asyncio.sleep(1.0)
-
-        logger.info("Copy trading loop stopped")
-
-    async def _execute_copy_trade(self, signal: dict):
-        """
-        Execute a copy trade as fast as possible.
-
-        Uses market orders for immediate fill.
-        """
-        asset = signal["asset"]
-        side = signal["side"]
-        size_usd = signal["size_usd"]
-        condition_id = signal["condition_id"]
-
-        start_time = time.time()
-
-        try:
-            # Find the market
-            market = None
-            for m in self.markets.values():
-                if m.condition_id == condition_id or m.asset == asset:
-                    market = m
-                    break
-
-            if not market:
-                logger.warning(f"Copy trade failed: market not found for {asset}")
-                return
-
-            # Check if we can trade
-            can_trade, reason = self.risk_manager.can_trade()
-            if not can_trade:
-                logger.warning(f"Copy trade blocked: {reason}")
-                return
-
-            # Calculate shares
-            if side == "UP":
-                price = market.best_ask
-                token_id = market.up_token_id
-            else:
-                price = market.best_bid
-                token_id = market.down_token_id
-
-            if price <= 0:
-                logger.warning(f"Copy trade failed: invalid price for {asset} {side}")
-                return
-
-            shares = size_usd / price
-            if shares < 5:  # Polymarket minimum
-                shares = 5
-
-            # Execute with market order for speed
-            if self.executor and not self.config.dry_run:
-                from py_clob_client.clob_types import OrderArgs, OrderType
-                from py_clob_client.order_builder.constants import BUY
-
-                # Build order
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=price,
-                    size=shares,
-                    side=BUY,
-                )
-
-                # Execute immediately
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.executor.execute_order(order_args, market_order=True),
-                )
-
-                exec_time = int((time.time() - start_time) * 1000)
-
-                if result.success:
-                    logger.info(
-                        f"⚡ COPY EXECUTED [{asset}]: {side} {shares:.1f} shares @ ${price:.3f} | "
-                        f"Total: ${size_usd:.2f} | Time: {exec_time}ms | "
-                        f"Source: {signal['source_wallet'][:8]}..."
-                    )
-
-                    # Track position
-                    from .strategy.risk import Position, Side as PosSide
-                    position = Position(
-                        market=market,
-                        side=PosSide.UP if side == "UP" else PosSide.DOWN,
-                        shares=result.filled_size or shares,
-                        entry_price=result.filled_price or price,
-                        entry_time=datetime.now(timezone.utc),
-                    )
-                    self.risk_manager.positions[market.condition_id] = position
-
-                else:
-                    logger.warning(
-                        f"❌ COPY FAILED [{asset}]: {result.error_message} | Time: {exec_time}ms"
-                    )
-            else:
-                exec_time = int((time.time() - start_time) * 1000)
-                logger.info(
-                    f"⚡ COPY (DRY) [{asset}]: {side} {shares:.1f} shares @ ${price:.3f} | "
-                    f"Time: {exec_time}ms | Source: {signal['source_wallet'][:8]}..."
-                )
-
-        except Exception as e:
-            exec_time = int((time.time() - start_time) * 1000)
-            logger.error(f"Copy trade error: {e} | Time: {exec_time}ms")
 
     def _capture_period_boundary_prices(self, period_ts: int):
         """
