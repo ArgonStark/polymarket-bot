@@ -535,6 +535,44 @@ class SignalGenerator:
                 f"Watching for Chainlink to follow..."
             )
 
+        # === TREND-FOLLOWING EDGE BOOST ===
+        # Trade WITH the trend: boost edge when trend aligns with price position
+        try:
+            trends = get_multi_timeframe_trends(market.asset)
+            trend_1h = trends.get("trend_1h", 0.0)
+            trend_4h = trends.get("trend_4h", 0.0)
+            trend_1d = trends.get("trend_1d", 0.0)
+
+            # Calculate average trend strength (-1 to +1)
+            avg_trend = (trend_1h + trend_4h + trend_1d) / 3
+
+            # Determine price position relative to target
+            price_below_target = current_price < market.target_price
+            price_above_target = current_price > market.target_price
+
+            # Strong UP trend (avg > 0.3) + price below target = boost UP
+            # Logic: price is trending up and below target, likely to rise above
+            if avg_trend > 0.3 and price_below_target:
+                trend_boost = min(0.05, avg_trend * 0.1)  # Up to 5% boost
+                edge_up += trend_boost
+                logger.info(
+                    f"📈 TREND-FOLLOWING [{market.asset}]: UP trend ({avg_trend:.2f}) + "
+                    f"price below target → UP edge +{trend_boost:.1%}"
+                )
+
+            # Strong DOWN trend (avg < -0.3) + price above target = boost DOWN
+            # Logic: price is trending down and above target, likely to fall below
+            elif avg_trend < -0.3 and price_above_target:
+                trend_boost = min(0.05, abs(avg_trend) * 0.1)  # Up to 5% boost
+                edge_down += trend_boost
+                logger.info(
+                    f"📉 TREND-FOLLOWING [{market.asset}]: DOWN trend ({avg_trend:.2f}) + "
+                    f"price above target → DOWN edge +{trend_boost:.1%}"
+                )
+
+        except Exception as e:
+            logger.debug(f"Trend-following analysis failed for {market.asset}: {e}")
+
         if edge_up > edge_down and edge_up >= min_edge:
             side = Side.UP
             edge = edge_up
