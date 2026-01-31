@@ -771,6 +771,22 @@ class TradingBot:
         logger.info("║     POLYMARKET 15-MIN CRYPTO ARBITRAGE BOT                     ║")
         logger.info("║     Made by Argon Stark                                        ║")
         logger.info("╚════════════════════════════════════════════════════════════════╝")
+
+        # LIVE TRADING WARNING
+        if not self.config.dry_run:
+            logger.warning("╔════════════════════════════════════════════════════════════════╗")
+            logger.warning("║  ⚠️  LIVE TRADING MODE - REAL MONEY AT RISK ⚠️                  ║")
+            logger.warning("╠════════════════════════════════════════════════════════════════╣")
+            logger.warning(f"║  Max positions: {self.config.trading.max_concurrent_positions}                                              ║")
+            max_exp = getattr(self.config.trading, 'max_total_exposure_pct', 0.25)
+            logger.warning(f"║  Max exposure: {max_exp:.0%} of bankroll                                 ║")
+            logger.warning(f"║  Bankroll: ${self.risk_manager.current_bankroll:.2f}                                       ║")
+            logger.warning("║                                                                ║")
+            logger.warning("║  Use --dry-run to test without real trades                     ║")
+            logger.warning("╚════════════════════════════════════════════════════════════════╝")
+        else:
+            logger.info("🔸 DRY RUN MODE - No real trades will be placed")
+
         logger.info("Starting trading bot...")
 
         try:
@@ -3818,6 +3834,35 @@ class TradingBot:
                 logger.info(
                     f"[{asset}] ❌ POSITION LIMIT: {total_positions} positions "
                     f"({filled_positions} filled + {pending_orders} pending) >= {max_positions} max"
+                )
+            return
+
+        # Check total capital at risk (filled positions + pending orders + new order)
+        current_exposure = 0.0
+        # Add value of filled positions
+        for pos in self.risk_manager.positions.values():
+            current_exposure += pos.shares * pos.entry_price
+        # Add value of pending orders
+        for order_data in self._pending_orders.values():
+            order_size = order_data.get("size", 0) * order_data.get("price", 0)
+            current_exposure += order_size
+        # Add proposed new order
+        new_order_value = signal.size_usd
+        total_exposure = current_exposure + new_order_value
+
+        # Calculate max allowed exposure
+        bankroll = self.risk_manager.current_bankroll
+        max_exposure_pct = getattr(self.config.trading, 'max_total_exposure_pct', 0.25)
+        max_exposure = bankroll * max_exposure_pct
+
+        if total_exposure > max_exposure:
+            exposure_key = f"global:exposure_limit"
+            if exposure_key not in self._logged_rejections:
+                self._logged_rejections.add(exposure_key)
+                logger.info(
+                    f"[{asset}] ❌ EXPOSURE LIMIT: ${total_exposure:.2f} "
+                    f"(current ${current_exposure:.2f} + new ${new_order_value:.2f}) > "
+                    f"${max_exposure:.2f} max ({max_exposure_pct:.0%} of ${bankroll:.2f})"
                 )
             return
 

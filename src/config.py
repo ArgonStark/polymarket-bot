@@ -82,15 +82,22 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.10"))
     )
 
-    # Maximum concurrent positions (higher = parallel trading)
+    # Maximum concurrent positions (filled + pending orders)
+    # WARNING: Lower = safer. Each position risks max_position_pct of bankroll
     max_concurrent_positions: int = field(
-        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "8"))
+        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "2"))
+    )
+
+    # Maximum total capital at risk (as % of bankroll)
+    # Prevents over-exposure even if individual position limits are met
+    max_total_exposure_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.25"))
     )
 
     # Cooldown between trades for SAME asset (seconds)
-    # Lower = faster trading, but risk of duplicate orders
+    # Higher = safer, prevents duplicate orders
     order_cooldown_seconds: int = field(
-        default_factory=lambda: int(os.getenv("ORDER_COOLDOWN_SECONDS", "5"))
+        default_factory=lambda: int(os.getenv("ORDER_COOLDOWN_SECONDS", "30"))
     )
 
     # Asset priority - higher priority assets get checked first
