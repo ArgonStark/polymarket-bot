@@ -2750,6 +2750,11 @@ class TradingBot:
 
         Removes stale positions that no longer exist on Polymarket.
         This prevents the bot from blocking new trades due to ghost positions.
+
+        IMPORTANT: Only clears positions that are both:
+        1. Not found on Polymarket API
+        2. Older than 5 minutes (grace period for API delays)
+        3. Market has passed settlement time
         """
         if not self.client:
             return
@@ -2776,27 +2781,52 @@ class TradingBot:
             # Check internal positions against API
             internal_positions = list(self.risk_manager.positions.keys())
             cleared_count = 0
+            now = datetime.now(timezone.utc)
+            grace_period_seconds = 300  # 5 minutes grace period
 
             for market_key in internal_positions:
+                position = self.risk_manager.positions.get(market_key)
+                if not position:
+                    continue
+
+                # Skip if position was opened recently (within grace period)
+                # This prevents clearing positions before API has time to sync
+                if hasattr(position, 'entry_time') and position.entry_time:
+                    age = (now - position.entry_time).total_seconds()
+                    if age < grace_period_seconds:
+                        logger.debug(
+                            f"Skipping position sync for {position.market.asset if hasattr(position, 'market') else '???'}: "
+                            f"opened {age:.0f}s ago (grace period: {grace_period_seconds}s)"
+                        )
+                        continue
+
+                # Skip if market hasn't settled yet
+                if hasattr(position, 'market') and position.market:
+                    time_remaining = position.market.time_remaining
+                    if time_remaining > -30:  # 30 second buffer after settlement
+                        logger.debug(
+                            f"Skipping position sync for {position.market.asset}: "
+                            f"market still active ({time_remaining:.0f}s remaining)"
+                        )
+                        continue
+
                 if market_key not in api_condition_ids:
                     # Position exists internally but not on Polymarket - it's been settled
-                    position = self.risk_manager.positions.get(market_key)
-                    if position:
-                        asset = position.market.asset if hasattr(position, 'market') else "???"
-                        side = position.side.value if hasattr(position, 'side') else "???"
+                    asset = position.market.asset if hasattr(position, 'market') else "???"
+                    side = position.side.value if hasattr(position, 'side') else "???"
 
-                        logger.info(
-                            f"🧹 Clearing stale position: {asset} {side} | "
-                            f"Not found on Polymarket"
-                        )
+                    logger.info(
+                        f"🧹 Clearing stale position: {asset} {side} | "
+                        f"Not found on Polymarket (market settled)"
+                    )
 
-                        # Remove from risk manager (assume break-even if unknown)
-                        self.risk_manager.positions.pop(market_key, None)
-                        cleared_count += 1
+                    # Remove from risk manager (assume break-even if unknown)
+                    self.risk_manager.positions.pop(market_key, None)
+                    cleared_count += 1
 
-                        # Also clear any asset-level tracking
-                        if hasattr(self, '_api_positions') and asset in self._api_positions:
-                            del self._api_positions[asset]
+                    # Also clear any asset-level tracking
+                    if hasattr(self, '_api_positions') and asset in self._api_positions:
+                        del self._api_positions[asset]
 
             if cleared_count > 0:
                 logger.info(f"🧹 Cleared {cleared_count} stale positions from tracking")
