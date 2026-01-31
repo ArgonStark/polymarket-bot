@@ -139,18 +139,20 @@ class TradingConfig:
     # === Machine Learning Settings ===
 
     # Enable ML signal filtering
+    # DISABLED by default - let bot trade and learn first
     ml_enabled: bool = field(
-        default_factory=lambda: os.getenv("ML_ENABLED", "true").lower() == "true"
+        default_factory=lambda: os.getenv("ML_ENABLED", "false").lower() == "true"
     )
 
     # Minimum ML confidence to take a trade (0.5 = 50%)
     ml_min_confidence: float = field(
-        default_factory=lambda: float(os.getenv("ML_MIN_CONFIDENCE", "0.55"))
+        default_factory=lambda: float(os.getenv("ML_MIN_CONFIDENCE", "0.52"))
     )
 
     # Minimum training samples before ML filtering kicks in
+    # Higher = longer learning period before ML can block trades
     ml_min_samples: int = field(
-        default_factory=lambda: int(os.getenv("ML_MIN_SAMPLES", "10"))
+        default_factory=lambda: int(os.getenv("ML_MIN_SAMPLES", "50"))
     )
 
     # === Trade History Review Settings ===
@@ -317,8 +319,9 @@ class TrendProtectionConfig:
     """Trend protection settings to avoid trading against strong market trends."""
 
     # Master enable/disable switch
+    # DISABLED by default - let bot trade freely initially
     enabled: bool = field(
-        default_factory=lambda: os.getenv("TREND_PROTECTION_ENABLED", "true").lower() == "true"
+        default_factory=lambda: os.getenv("TREND_PROTECTION_ENABLED", "false").lower() == "true"
     )
 
     # === Trend Alignment Filter ===

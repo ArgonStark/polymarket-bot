@@ -614,7 +614,7 @@ class SignalGenerator:
                 edge = trend_result.adjusted_edge
 
         # === SMART TREND-FOLLOWING CHECK ===
-        # Use technical analysis to validate trade direction
+        # Use technical analysis to boost edge (not block trades)
         try:
             smart_decision = get_smart_trading_decision(
                 asset=market.asset,
@@ -625,24 +625,12 @@ class SignalGenerator:
                 original_edge=edge,
             )
 
+            # NOTE: Smart trend only provides BOOST, does NOT block trades
+            # Blocking was too aggressive and prevented profitable opportunities
             if not smart_decision.should_trade:
-                logger.info(
-                    f"📊 SMART TREND BLOCKED [{market.asset}]: "
-                    f"{side.value} signal blocked | {smart_decision.reason}"
-                )
-                return Signal(
-                    market=market,
-                    side=Side.NONE,
-                    edge=edge,
-                    true_prob=true_prob,
-                    market_prob=market_prob,
-                    recommended_action=OrderAction.SKIP,
-                    recommended_price=0.0,
-                    size_usd=0.0,
-                    size_shares=0.0,
-                    chainlink_price=current_price,
-                    time_remaining=time_remaining,
-                    reasoning=f"[SMART TREND] {smart_decision.reason}",
+                logger.debug(
+                    f"📊 SMART TREND INFO [{market.asset}]: "
+                    f"{side.value} - {smart_decision.reason} (not blocking)"
                 )
 
             # Apply edge boost from smart analysis
@@ -706,33 +694,24 @@ class SignalGenerator:
         """
         Determine order action based on edge and urgency.
 
-        UPDATED: Conservative near expiry to avoid losses.
-        Getting stuck in a position with no time to recover is costly.
-
-        Decision matrix:
-        - time < 60s: SKIP (too risky, not enough time for order to fill/profit)
-        - time < 90s AND edge < 10%: SKIP (need strong edge for short time)
-        - time < 90s AND edge >= 10%: MARKET (urgent, take the opportunity)
-        - time >= 90s AND edge >= 3%: LIMIT (normal trading)
+        Decision matrix (uses config min_time_remaining):
+        - time < min_time_remaining: SKIP (handled by caller, shouldn't reach here)
+        - time < 60s AND edge < 5%: SKIP (need some edge for short time)
+        - time < 60s AND edge >= 5%: MARKET (urgent, take the opportunity)
+        - time >= 60s: Use LIMIT orders for reliable execution
         - Otherwise -> SKIP
         """
         trading = self.config.trading
 
-        # Very short time: Skip entirely (too risky)
+        # Short time (30-60s): Require moderate edge, use MARKET orders
         if time_remaining < 60:
-            logger.debug(f"Skipping trade: only {time_remaining:.0f}s remaining (< 60s minimum)")
-            return OrderAction.SKIP
-
-        # Short time (60-90s): Require strong edge, use MARKET orders
-        if time_remaining < 90:
-            if edge >= 0.10:  # 10% edge minimum for short time trades
+            if edge >= 0.05:  # 5% edge minimum for short time trades
                 logger.debug(f"Short time trade: {time_remaining:.0f}s, edge={edge:.1%} - using MARKET")
                 return OrderAction.MARKET
             else:
-                logger.debug(f"Skipping: {time_remaining:.0f}s remaining, edge {edge:.1%} < 10% required")
+                logger.debug(f"Skipping: {time_remaining:.0f}s remaining, edge {edge:.1%} < 5% required")
                 return OrderAction.SKIP
 
-        # Normal time (90s+): Standard logic
         # MARKET orders: Use when we have high edge AND limited time
         if edge >= trading.edge_for_market and time_remaining < 120:
             return OrderAction.MARKET
