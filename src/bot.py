@@ -3788,6 +3788,39 @@ class TradingBot:
                     logger.info(f"[{asset}] ❌ COOLDOWN: {remaining:.0f}s remaining (last order {elapsed:.0f}s ago)")
                 return
 
+        # Check for existing PENDING orders for this asset (prevents duplicate unfilled orders)
+        for order_id, order_data in self._pending_orders.items():
+            if order_data.get("asset") == asset:
+                pending_key = f"{signal.market.condition_id}:pending_order"
+                if pending_key not in self._logged_rejections:
+                    self._logged_rejections.add(pending_key)
+                    placed_time = order_data.get("placed_time")
+                    if placed_time:
+                        age = (now - placed_time).total_seconds()
+                        logger.info(
+                            f"[{asset}] ❌ PENDING ORDER EXISTS: Order {order_id[:8]}... "
+                            f"placed {age:.0f}s ago @ {order_data.get('price', 0):.3f} - waiting for fill"
+                        )
+                    else:
+                        logger.info(f"[{asset}] ❌ PENDING ORDER EXISTS: Order {order_id[:8]}... - waiting for fill")
+                return
+
+        # Check total positions (filled + pending) against max concurrent limit
+        filled_positions = len(self.risk_manager.positions)
+        pending_orders = len(self._pending_orders)
+        total_positions = filled_positions + pending_orders
+        max_positions = self.config.trading.max_concurrent_positions
+
+        if total_positions >= max_positions:
+            limit_key = f"global:position_limit"
+            if limit_key not in self._logged_rejections:
+                self._logged_rejections.add(limit_key)
+                logger.info(
+                    f"[{asset}] ❌ POSITION LIMIT: {total_positions} positions "
+                    f"({filled_positions} filled + {pending_orders} pending) >= {max_positions} max"
+                )
+            return
+
         # Check for existing positions from API (prevents duplicate trades)
         existing_position = self._get_active_position(asset)
         if existing_position:
