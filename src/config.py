@@ -272,9 +272,9 @@ class TradingConfig:
 class VolatilityConfig:
     """Default volatility assumptions for each asset (15-minute)."""
 
-    # Conservative volatility estimates (as decimals)
-    btc: float = 0.0035  # 0.35%
-    eth: float = 0.0045  # 0.45%
+    # Volatility estimates (as decimals) - adjusted for more balanced trading
+    btc: float = 0.0050  # 0.50% (was 0.35%)
+    eth: float = 0.0055  # 0.55% (was 0.45%)
     sol: float = 0.0070  # 0.70%
     xrp: float = 0.0060  # 0.60%
 
