@@ -6,6 +6,8 @@ support for maker (rebate) and taker orders.
 """
 
 import logging
+import traceback
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -18,6 +20,34 @@ from ..config import BotConfig
 
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_error_details(e: Exception) -> str:
+    """Extract detailed error information from an exception."""
+    details = [str(e)]
+
+    # Try to get more info from common exception attributes
+    if hasattr(e, 'response'):
+        resp = e.response
+        if hasattr(resp, 'status_code'):
+            details.append(f"status={resp.status_code}")
+        if hasattr(resp, 'text'):
+            try:
+                details.append(f"body={resp.text[:200]}")
+            except:
+                pass
+
+    if hasattr(e, 'status_code') and e.status_code:
+        details.append(f"status={e.status_code}")
+
+    if hasattr(e, 'error_message') and e.error_message:
+        details.append(f"msg={e.error_message}")
+
+    # Get the underlying cause if it's a chained exception
+    if e.__cause__:
+        details.append(f"cause={e.__cause__}")
+
+    return " | ".join(details)
 
 
 def _validate_order_response(response: dict) -> tuple[bool, str]:
@@ -207,43 +237,74 @@ class OrderExecutor:
                 filled_price=price,
             )
 
-        try:
-            price = max(0.01, min(0.99, price))
-            size_shares = max(0.01, size_shares)
+        price = max(0.01, min(0.99, price))
+        size_shares = max(0.01, size_shares)
 
-            order_args = OrderArgs(
-                price=price,
-                size=size_shares,
-                side=BUY if side.upper() == "BUY" else SELL,
-                token_id=token_id,
-            )
+        # Retry logic for network errors
+        max_retries = 3
+        last_error = None
 
-            signed_order = self.client.create_order(order_args)
-            response = self.client.post_order(signed_order, OrderType.GTC)
+        for attempt in range(max_retries):
+            try:
+                order_args = OrderArgs(
+                    price=price,
+                    size=size_shares,
+                    side=BUY if side.upper() == "BUY" else SELL,
+                    token_id=token_id,
+                )
 
-            # Log raw response for debugging
-            logger.debug(f"Order API response: {response}")
+                signed_order = self.client.create_order(order_args)
+                response = self.client.post_order(signed_order, OrderType.GTC)
 
-            # Validate response
-            is_valid, error_msg = _validate_order_response(response)
-            if not is_valid:
-                logger.warning(f"Order rejected. Response: {response}")
-                return TradeResult(success=False, error_message=error_msg)
+                # Log raw response for debugging
+                logger.debug(f"Order API response: {response}")
 
-            order_id = response.get("orderID") or response.get("order_id", "")
-            return TradeResult(
-                success=True,
-                order_id=order_id,
-                filled_size=0.0,
-                filled_price=price,
-            )
+                # Validate response
+                is_valid, error_msg = _validate_order_response(response)
+                if not is_valid:
+                    logger.warning(f"Order rejected. Response: {response}")
+                    return TradeResult(success=False, error_message=error_msg)
 
-        except Exception as e:
-            logger.error(f"Failed to place limit order: {e}")
-            return TradeResult(
-                success=False,
-                error_message=str(e),
-            )
+                order_id = response.get("orderID") or response.get("order_id", "")
+                return TradeResult(
+                    success=True,
+                    order_id=order_id,
+                    filled_size=0.0,
+                    filled_price=price,
+                )
+
+            except Exception as e:
+                last_error = e
+                error_details = _extract_error_details(e)
+
+                # Check if it's a network/request error worth retrying
+                error_str = str(e).lower()
+                is_network_error = any(x in error_str for x in [
+                    "request exception", "timeout", "connection",
+                    "network", "ssl", "socket"
+                ])
+
+                if is_network_error and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2  # 2s, 4s backoff
+                    logger.warning(
+                        f"Order failed (attempt {attempt + 1}/{max_retries}): {error_details} | "
+                        f"Retrying in {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Log full details on final failure
+                    logger.error(
+                        f"Failed to place limit order: {error_details} | "
+                        f"Token: {token_id[:16]}... | Price: {price} | Size: {size_shares}"
+                    )
+                    logger.debug(f"Full traceback: {traceback.format_exc()}")
+                    break
+
+        return TradeResult(
+            success=False,
+            error_message=_extract_error_details(last_error) if last_error else "Unknown error",
+        )
 
     def place_market_order(
         self,
@@ -502,7 +563,7 @@ class OrderExecutor:
 
     def cancel_order(self, order_id: str) -> bool:
         """
-        Cancel a specific order.
+        Cancel a specific order with retry logic.
 
         Args:
             order_id: ID of order to cancel
@@ -514,17 +575,45 @@ class OrderExecutor:
             logger.info(f"[DRY RUN] Cancel order {order_id[:16]}...")
             return True
 
-        try:
-            self.client.cancel(order_id=order_id)
-            logger.info(f"Cancelled order: {order_id[:16]}...")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to cancel order {order_id}: {e}")
-            return False
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.client.cancel(order_id=order_id)
+                logger.info(f"Cancelled order: {order_id[:16]}...")
+                return True
+            except Exception as e:
+                error_details = _extract_error_details(e)
+                error_str = str(e).lower()
+
+                # Check if order doesn't exist (already filled/cancelled)
+                if "not found" in error_str or "does not exist" in error_str:
+                    logger.info(f"Order {order_id[:16]}... already cancelled or filled")
+                    return True
+
+                # Check if it's a network error worth retrying
+                is_network_error = any(x in error_str for x in [
+                    "request exception", "timeout", "connection",
+                    "network", "ssl", "socket"
+                ])
+
+                if is_network_error and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    logger.warning(
+                        f"Cancel failed (attempt {attempt + 1}/{max_retries}): {error_details} | "
+                        f"Retrying in {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Failed to cancel order {order_id[:16]}...: {error_details}")
+                    logger.debug(f"Full traceback: {traceback.format_exc()}")
+                    return False
+
+        return False
 
     def cancel_all_orders(self) -> bool:
         """
-        Cancel all open orders.
+        Cancel all open orders with retry logic.
 
         Returns:
             True if successful
@@ -533,13 +622,35 @@ class OrderExecutor:
             logger.info("[DRY RUN] Cancel all orders")
             return True
 
-        try:
-            self.client.cancel_all()
-            logger.info("Cancelled all orders")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to cancel all orders: {e}")
-            return False
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.client.cancel_all()
+                logger.info("Cancelled all orders")
+                return True
+            except Exception as e:
+                error_details = _extract_error_details(e)
+                error_str = str(e).lower()
+
+                is_network_error = any(x in error_str for x in [
+                    "request exception", "timeout", "connection",
+                    "network", "ssl", "socket"
+                ])
+
+                if is_network_error and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    logger.warning(
+                        f"Cancel all failed (attempt {attempt + 1}/{max_retries}): {error_details} | "
+                        f"Retrying in {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Failed to cancel all orders: {error_details}")
+                    logger.debug(f"Full traceback: {traceback.format_exc()}")
+                    return False
+
+        return False
 
     def get_order_status(self, order_id: str) -> Optional[Order]:
         """
@@ -556,12 +667,31 @@ class OrderExecutor:
             if not order_info:
                 return None
 
+            # Log the raw status for debugging
+            raw_status = order_info.get("status", "")
+            logger.debug(f"Order {order_id[:8]}... raw status: {raw_status}")
+
+            # Polymarket uses different status values than expected:
+            # MATCHED = Trade matched, being executed
+            # MINED = Transaction mined into blockchain
+            # CONFIRMED = Trade successful (finalized) - treat as FILLED
+            # RETRYING = Transaction failed, being retried
+            # FAILED = Trade failed permanently - treat as CANCELLED
+            # LIVE = Order is live on the book (not yet matched)
             status_map = {
+                # Standard statuses
                 "OPEN": OrderStatus.OPEN,
+                "LIVE": OrderStatus.OPEN,  # Polymarket uses LIVE for open orders
                 "FILLED": OrderStatus.FILLED,
                 "CANCELLED": OrderStatus.CANCELLED,
                 "EXPIRED": OrderStatus.EXPIRED,
                 "PARTIAL": OrderStatus.PARTIAL,
+                # Polymarket-specific statuses
+                "MATCHED": OrderStatus.PARTIAL,  # Being executed, not yet confirmed
+                "MINED": OrderStatus.PARTIAL,    # Mined but not confirmed
+                "CONFIRMED": OrderStatus.FILLED,  # Successfully filled
+                "RETRYING": OrderStatus.OPEN,     # Still trying
+                "FAILED": OrderStatus.CANCELLED,  # Failed permanently
             }
 
             return Order(

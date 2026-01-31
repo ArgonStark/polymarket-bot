@@ -210,6 +210,11 @@ class Position:
     ml_ask_depth: Optional[float] = None
     ml_price_trend: Optional[float] = None
     ml_distance_from_target: Optional[float] = None
+    ml_binance_lead_pct: Optional[float] = None
+    ml_binance_confirmation: Optional[str] = None
+    ml_trend_1h: Optional[float] = None
+    ml_trend_4h: Optional[float] = None
+    ml_trend_1d: Optional[float] = None
 
     @property
     def cost_basis(self) -> float:

@@ -197,17 +197,28 @@ class ArbitrageDetector:
         yes_price = market.best_ask
         no_price = 1 - market.best_bid
 
-        # Calculate "fair" prices based on where Chainlink price is
-        # relative to target
+        # Calculate distance from target as percentage
         distance_pct = (chainlink_price - market.target_price) / market.target_price
+        abs_distance = abs(distance_pct)
 
-        # If price is significantly above target, YES should be expensive
-        # If YES is still cheap, that's an opportunity
-        if distance_pct > 0.001:  # Price above target
-            # YES should be favored, check if it's still cheap
-            fair_yes = min(0.70, 0.50 + abs(distance_pct) * 10)
-            if yes_price < fair_yes - 0.10:  # YES is too cheap
-                edge = fair_yes - yes_price - 0.02  # minus fee
+        # Minimum distance to consider (0.1% = 10 basis points)
+        if abs_distance < 0.001:
+            return None
+
+        # Fair value calculation:
+        # - Base: 0.50 (50/50)
+        # - Add premium based on distance from target
+        # - Use moderate scaling: distance * 5 (balanced approach)
+        # - Cap at 0.65 to avoid unrealistic edges
+        fair_value = min(0.65, 0.50 + abs_distance * 5)
+
+        # If price is above target, YES should win
+        if distance_pct > 0.001:
+            fair_yes = fair_value
+            mispricing = fair_yes - yes_price
+            # Require meaningful mispricing (> 5%)
+            if mispricing > 0.05:
+                edge = mispricing - 0.02  # minus 2% fee
                 if edge >= self.min_spread_profit:
                     return {
                         "type": "asymmetric",
@@ -221,11 +232,12 @@ class ArbitrageDetector:
                         ),
                     }
 
-        elif distance_pct < -0.001:  # Price below target
-            # NO should be favored, check if it's still cheap
-            fair_no = min(0.70, 0.50 + abs(distance_pct) * 10)
-            if no_price < fair_no - 0.10:  # NO is too cheap
-                edge = fair_no - no_price - 0.02
+        elif distance_pct < -0.001:
+            fair_no = fair_value
+            mispricing = fair_no - no_price
+            # Require meaningful mispricing (> 5%)
+            if mispricing > 0.05:
+                edge = mispricing - 0.02
                 if edge >= self.min_spread_profit:
                     return {
                         "type": "asymmetric",

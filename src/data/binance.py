@@ -74,6 +74,7 @@ class BinanceFeed:
     _ws: Optional[websocket.WebSocketApp] = None
     _prices: dict[str, float] = field(default_factory=dict)
     _last_update: dict[str, datetime] = field(default_factory=dict)
+    _price_history: dict[str, list] = field(default_factory=dict)  # symbol -> [(timestamp, price), ...]
     _connected: bool = False
     _reconnect_delay: float = field(init=False)
     _max_reconnect_delay: float = field(init=False)
@@ -81,6 +82,7 @@ class BinanceFeed:
     _retry_count: int = 0
     _circuit_open: bool = False  # Circuit breaker state
     _shutdown: bool = False  # Graceful shutdown flag
+    _max_history_size: int = 100  # Max price history entries per symbol
 
     def __post_init__(self):
         """Initialize WebSocket settings from config."""
@@ -136,6 +138,50 @@ class BinanceFeed:
             return age
         return None
 
+    def get_price_history(self, asset: str, limit: int = 20) -> list:
+        """
+        Get recent price history for an asset.
+
+        Args:
+            asset: Asset symbol like "BTC"
+            limit: Maximum number of entries to return
+
+        Returns:
+            List of (timestamp, price) tuples, newest last
+        """
+        symbol = BINANCE_SYMBOLS.get(asset.upper())
+        if symbol and symbol in self._price_history:
+            return self._price_history[symbol][-limit:]
+        return []
+
+    def get_velocity(self, asset: str, window: int = 10) -> float:
+        """
+        Calculate price velocity (rate of change) for an asset.
+
+        Args:
+            asset: Asset symbol like "BTC"
+            window: Number of recent prices to use
+
+        Returns:
+            Velocity as percentage change per second.
+            Positive = price increasing, negative = decreasing.
+        """
+        history = self.get_price_history(asset, window)
+        if len(history) < 2:
+            return 0.0
+
+        first_time, first_price = history[0]
+        last_time, last_price = history[-1]
+
+        # Calculate time difference in seconds
+        time_diff = (last_time - first_time).total_seconds()
+        if time_diff <= 0 or first_price <= 0:
+            return 0.0
+
+        # Velocity as percentage change per second
+        price_change = (last_price - first_price) / first_price
+        return price_change / time_diff
+
     def _build_stream_url(self) -> str:
         """Build the combined stream URL for all assets."""
         # Use combined stream for all assets in one connection
@@ -186,6 +232,15 @@ class BinanceFeed:
                         timestamp = datetime.now(timezone.utc)
 
                     self._last_update[symbol] = timestamp
+
+                    # Update price history
+                    if symbol not in self._price_history:
+                        self._price_history[symbol] = []
+                    self._price_history[symbol].append((timestamp, price))
+
+                    # Keep only last N entries
+                    if len(self._price_history[symbol]) > self._max_history_size:
+                        self._price_history[symbol] = self._price_history[symbol][-self._max_history_size:]
 
                     # Create price object
                     binance_price = BinancePrice(
@@ -328,3 +383,164 @@ class BinanceFeed:
             self._ws.close()
             self._connected = False
             logger.info("Binance WebSocket disconnected")
+
+
+# ============================================================================
+# Multi-Timeframe Trend Analysis (REST API)
+# ============================================================================
+
+import requests
+from datetime import timedelta
+
+# Cache for klines data to avoid repeated API calls
+_klines_cache: dict = {}
+_cache_expiry: dict = {}
+CACHE_DURATION = timedelta(minutes=5)  # Refresh every 5 minutes
+
+
+def fetch_klines(
+    asset: str,
+    interval: str = "1h",
+    limit: int = 2,
+) -> list[dict]:
+    """
+    Fetch historical klines (candlestick) data from Binance REST API.
+
+    Args:
+        asset: Asset symbol (BTC, ETH, SOL, XRP)
+        interval: Kline interval (1h, 4h, 1d)
+        limit: Number of candles to fetch
+
+    Returns:
+        List of kline dicts with open, high, low, close, volume
+    """
+    symbol = BINANCE_SYMBOLS.get(asset.upper())
+    if not symbol:
+        return []
+
+    cache_key = f"{symbol}:{interval}"
+    now = datetime.now(timezone.utc)
+
+    # Check cache
+    if cache_key in _klines_cache:
+        expiry = _cache_expiry.get(cache_key)
+        if expiry and now < expiry:
+            return _klines_cache[cache_key]
+
+    # Fetch from Binance API
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "limit": limit,
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=5)
+        response.raise_for_status()
+        raw_klines = response.json()
+
+        # Parse klines into dict format
+        # [open_time, open, high, low, close, volume, close_time, ...]
+        klines = []
+        for k in raw_klines:
+            klines.append({
+                "open_time": k[0],
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+                "close_time": k[6],
+            })
+
+        # Cache the result
+        _klines_cache[cache_key] = klines
+        _cache_expiry[cache_key] = now + CACHE_DURATION
+
+        return klines
+
+    except Exception as e:
+        logger.debug(f"Failed to fetch klines for {asset} {interval}: {e}")
+        return []
+
+
+def calculate_trend_from_klines(klines: list[dict]) -> float:
+    """
+    Calculate trend direction from klines data.
+
+    Returns:
+        Trend value between -1 (strong downtrend) and +1 (strong uptrend)
+        Based on price change percentage, capped at ±5%
+    """
+    if not klines or len(klines) < 1:
+        return 0.0
+
+    # Use most recent completed candle
+    latest = klines[-1]
+    open_price = latest["open"]
+    close_price = latest["close"]
+
+    if open_price <= 0:
+        return 0.0
+
+    # Calculate percentage change
+    pct_change = (close_price - open_price) / open_price
+
+    # Normalize to -1 to +1 range (±5% = ±1.0)
+    # This means 5% move = max trend strength
+    trend = pct_change / 0.05
+    trend = max(-1.0, min(1.0, trend))
+
+    return trend
+
+
+def get_multi_timeframe_trends(asset: str) -> dict:
+    """
+    Get trend data across multiple timeframes for an asset.
+
+    Args:
+        asset: Asset symbol (BTC, ETH, SOL, XRP)
+
+    Returns:
+        Dict with trend_1h, trend_4h, trend_1d values (-1 to +1)
+    """
+    result = {
+        "trend_1h": 0.0,
+        "trend_4h": 0.0,
+        "trend_1d": 0.0,
+    }
+
+    # Fetch klines for each timeframe
+    for interval, key in [("1h", "trend_1h"), ("4h", "trend_4h"), ("1d", "trend_1d")]:
+        klines = fetch_klines(asset, interval, limit=2)
+        if klines:
+            result[key] = calculate_trend_from_klines(klines)
+
+    return result
+
+
+def get_trend_alignment(trends: dict) -> str:
+    """
+    Determine if multiple timeframes are aligned.
+
+    Args:
+        trends: Dict with trend_1h, trend_4h, trend_1d
+
+    Returns:
+        "BULLISH" if all positive, "BEARISH" if all negative,
+        "MIXED" if conflicting signals
+    """
+    t1h = trends.get("trend_1h", 0)
+    t4h = trends.get("trend_4h", 0)
+    t1d = trends.get("trend_1d", 0)
+
+    positive = sum(1 for t in [t1h, t4h, t1d] if t > 0.1)
+    negative = sum(1 for t in [t1h, t4h, t1d] if t < -0.1)
+
+    if positive >= 2 and negative == 0:
+        return "BULLISH"
+    elif negative >= 2 and positive == 0:
+        return "BEARISH"
+    else:
+        return "MIXED"

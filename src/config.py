@@ -67,23 +67,41 @@ class TradingConfig:
     )
 
     # Minimum time remaining before market close (seconds)
+    # 60s gives enough buffer for order execution and price movement
     min_time_remaining: float = field(
-        default_factory=lambda: float(os.getenv("MIN_TIME_REMAINING", "30"))
+        default_factory=lambda: float(os.getenv("MIN_TIME_REMAINING", "60"))
     )
 
-    # Base position size in USD
+    # Base position size in USD (smaller = more trades, less risk per trade)
     base_position_size: float = field(
-        default_factory=lambda: float(os.getenv("BASE_POSITION_SIZE", "25"))
+        default_factory=lambda: float(os.getenv("BASE_POSITION_SIZE", "10"))
     )
 
     # Maximum position as percentage of bankroll
     max_position_pct: float = field(
-        default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.15"))
+        default_factory=lambda: float(os.getenv("MAX_POSITION_PCT", "0.10"))
     )
 
-    # Maximum concurrent positions
+    # Maximum concurrent positions (higher = parallel trading)
     max_concurrent_positions: int = field(
-        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "2"))
+        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "8"))
+    )
+
+    # Cooldown between trades for SAME asset (seconds)
+    # Lower = faster trading, but risk of duplicate orders
+    order_cooldown_seconds: int = field(
+        default_factory=lambda: int(os.getenv("ORDER_COOLDOWN_SECONDS", "5"))
+    )
+
+    # Asset priority - higher priority assets get checked first
+    # BTC and ETH are most liquid, best for arbitrage
+    asset_priority: list = field(
+        default_factory=lambda: os.getenv("ASSET_PRIORITY", "BTC,ETH,SOL,XRP").split(",")
+    )
+
+    # Enable parallel market processing (faster but more API calls)
+    parallel_execution: bool = field(
+        default_factory=lambda: os.getenv("PARALLEL_EXECUTION", "true").lower() == "true"
     )
 
     # Daily loss limit as percentage of starting bankroll
@@ -295,6 +313,106 @@ class WebSocketConfig:
 
 
 @dataclass
+class TrendProtectionConfig:
+    """Trend protection settings to avoid trading against strong market trends."""
+
+    # Master enable/disable switch
+    enabled: bool = field(
+        default_factory=lambda: os.getenv("TREND_PROTECTION_ENABLED", "true").lower() == "true"
+    )
+
+    # === Trend Alignment Filter ===
+    # Block trades against strong trends
+    max_opposite_trend_1d: float = field(
+        default_factory=lambda: float(os.getenv("MAX_OPPOSITE_TREND_1D", "0.25"))
+    )  # Block if 1d trend > 25% against signal
+
+    max_opposite_trend_1h: float = field(
+        default_factory=lambda: float(os.getenv("MAX_OPPOSITE_TREND_1H", "0.40"))
+    )  # Block if 1h trend > 40% against signal
+
+    # === Price Velocity Guard ===
+    # Skip trades when price moving too fast
+    velocity_guard_enabled: bool = field(
+        default_factory=lambda: os.getenv("VELOCITY_GUARD_ENABLED", "true").lower() == "true"
+    )
+
+    # Max velocity per asset (% per second) - skip if exceeded
+    velocity_btc: float = field(
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_BTC", "0.00017"))
+    )  # ~1% per minute
+
+    velocity_eth: float = field(
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_ETH", "0.00025"))
+    )  # ~1.5% per minute
+
+    velocity_sol: float = field(
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_SOL", "0.00033"))
+    )  # ~2% per minute
+
+    velocity_xrp: float = field(
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_XRP", "0.00030"))
+    )  # ~1.8% per minute
+
+    # === Multi-Timeframe Agreement ===
+    timeframe_agreement_enabled: bool = field(
+        default_factory=lambda: os.getenv("TIMEFRAME_AGREEMENT_ENABLED", "true").lower() == "true"
+    )
+
+    edge_boost_all_aligned: float = field(
+        default_factory=lambda: float(os.getenv("EDGE_BOOST_ALL_ALIGNED", "0.01"))
+    )  # +1% when all 3 timeframes agree
+
+    edge_penalty_mixed: float = field(
+        default_factory=lambda: float(os.getenv("EDGE_PENALTY_MIXED", "0.01"))
+    )  # -1% when signals mixed
+
+    # === Binance Momentum ===
+    binance_momentum_enabled: bool = field(
+        default_factory=lambda: os.getenv("BINANCE_MOMENTUM_ENABLED", "true").lower() == "true"
+    )
+
+    binance_velocity_threshold: float = field(
+        default_factory=lambda: float(os.getenv("BINANCE_VELOCITY_THRESHOLD", "0.001"))
+    )  # 0.1% per second
+
+    binance_momentum_boost: float = field(
+        default_factory=lambda: float(os.getenv("BINANCE_MOMENTUM_BOOST", "0.02"))
+    )  # +2% edge boost for strong momentum
+
+    # === Dynamic Edge Requirement ===
+    dynamic_edge_enabled: bool = field(
+        default_factory=lambda: os.getenv("DYNAMIC_EDGE_ENABLED", "true").lower() == "true"
+    )
+
+    dynamic_edge_min: float = field(
+        default_factory=lambda: float(os.getenv("DYNAMIC_EDGE_MIN", "0.015"))
+    )  # Never go below 1.5%
+
+    dynamic_edge_max: float = field(
+        default_factory=lambda: float(os.getenv("DYNAMIC_EDGE_MAX", "0.05"))
+    )  # Never exceed 5%
+
+    # === Consecutive Move Detection ===
+    consecutive_enabled: bool = field(
+        default_factory=lambda: os.getenv("CONSECUTIVE_ENABLED", "true").lower() == "true"
+    )
+
+    consecutive_min_moves: int = field(
+        default_factory=lambda: int(os.getenv("CONSECUTIVE_MIN_MOVES", "3"))
+    )  # Minimum moves to trigger boost
+
+    consecutive_boost_max: float = field(
+        default_factory=lambda: float(os.getenv("CONSECUTIVE_BOOST_MAX", "0.02"))
+    )  # Max +2% edge boost
+
+    def get_max_velocity(self, asset: str) -> float:
+        """Get maximum allowed velocity for an asset."""
+        asset_lower = asset.lower()
+        return getattr(self, f"velocity_{asset_lower}", 0.0003)
+
+
+@dataclass
 class EndpointsConfig:
     """API and WebSocket endpoints."""
 
@@ -313,6 +431,12 @@ class EndpointsConfig:
 
     # Binance WebSocket for fast price updates (leading indicator)
     binance_ws_url: str = "wss://stream.binance.com:9443"
+
+    # Use direct Binance WebSocket connection (requires external network access)
+    # If false, uses Binance prices bundled via Polymarket's WebSocket (recommended)
+    binance_direct_enabled: bool = field(
+        default_factory=lambda: os.getenv("BINANCE_DIRECT", "false").lower() == "true"
+    )
 
 
 @dataclass
@@ -349,6 +473,7 @@ class BotConfig:
     trading: TradingConfig = field(default_factory=TradingConfig)
     volatility: VolatilityConfig = field(default_factory=VolatilityConfig)
     websocket: WebSocketConfig = field(default_factory=WebSocketConfig)
+    trend_protection: TrendProtectionConfig = field(default_factory=TrendProtectionConfig)
     endpoints: EndpointsConfig = field(default_factory=EndpointsConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
 
@@ -357,8 +482,10 @@ class BotConfig:
         default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"]
     )
 
-    # Trading loop interval (seconds)
-    loop_interval: float = 0.5
+    # Trading loop interval (seconds) - lower = faster signal detection
+    loop_interval: float = field(
+        default_factory=lambda: float(os.getenv("LOOP_INTERVAL", "0.25"))
+    )
 
     # Market refresh interval (seconds)
     market_refresh_interval: float = 60.0

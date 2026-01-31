@@ -8,6 +8,7 @@ bid/ask updates and trade executions.
 import json
 import asyncio
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Callable, Optional
 from dataclasses import dataclass, field
@@ -47,6 +48,7 @@ class CLOBFeed:
     _retry_count: int = 0
     _circuit_open: bool = False  # Circuit breaker state
     _shutdown: bool = False  # Graceful shutdown flag
+    _orderbook_lock: threading.Lock = field(default_factory=threading.Lock)  # Thread-safe orderbook access
 
     def __post_init__(self):
         """Initialize WebSocket settings from config."""
@@ -65,23 +67,37 @@ class CLOBFeed:
         """
         Get current order book for a token.
 
+        Returns a thread-safe snapshot of the orderbook.
+
         Args:
             token_id: Token ID to get order book for
 
         Returns:
             OrderBook or None if not available
         """
-        return self._orderbooks.get(token_id)
+        with self._orderbook_lock:
+            ob = self._orderbooks.get(token_id)
+            if ob is None:
+                return None
+            # Return a snapshot copy to avoid race conditions with WebSocket thread
+            return OrderBook(
+                token_id=ob.token_id,
+                bids=list(ob.bids),
+                asks=list(ob.asks),
+                timestamp=ob.timestamp,
+            )
 
     def get_best_bid(self, token_id: str) -> Optional[float]:
-        """Get best bid price for a token."""
-        ob = self._orderbooks.get(token_id)
-        return ob.best_bid if ob else None
+        """Get best bid price for a token (thread-safe)."""
+        with self._orderbook_lock:
+            ob = self._orderbooks.get(token_id)
+            return ob.best_bid if ob else None
 
     def get_best_ask(self, token_id: str) -> Optional[float]:
-        """Get best ask price for a token."""
-        ob = self._orderbooks.get(token_id)
-        return ob.best_ask if ob else None
+        """Get best ask price for a token (thread-safe)."""
+        with self._orderbook_lock:
+            ob = self._orderbooks.get(token_id)
+            return ob.best_ask if ob else None
 
     def _on_open(self, ws):
         """Handle WebSocket connection opened."""
@@ -116,9 +132,10 @@ class CLOBFeed:
         """
         self._subscribed_tokens.add(token_id)
 
-        # Initialize empty order book
-        if token_id not in self._orderbooks:
-            self._orderbooks[token_id] = OrderBook(token_id=token_id)
+        # Initialize empty order book (thread-safe)
+        with self._orderbook_lock:
+            if token_id not in self._orderbooks:
+                self._orderbooks[token_id] = OrderBook(token_id=token_id)
 
         # If connected, send subscription immediately
         if self._ws and self._connected:
@@ -222,7 +239,9 @@ class CLOBFeed:
             timestamp=datetime.now(timezone.utc),
         )
 
-        self._orderbooks[asset_id] = orderbook
+        # Thread-safe assignment
+        with self._orderbook_lock:
+            self._orderbooks[asset_id] = orderbook
 
         logger.debug(
             f"Book snapshot {asset_id[:16]}: "
@@ -236,30 +255,36 @@ class CLOBFeed:
     def _handle_price_change(self, data: dict):
         """Handle price level update."""
         asset_id = data.get("asset_id")
-        if not asset_id or asset_id not in self._orderbooks:
+        if not asset_id:
             return
 
-        orderbook = self._orderbooks[asset_id]
         side = data.get("side")  # "BUY" or "SELL"
         price = float(data.get("price", 0))
         size = float(data.get("size", 0))
 
-        if side == "BUY":
-            # Update bids
-            orderbook.bids = [b for b in orderbook.bids if b.price != price]
-            if size > 0:
-                orderbook.bids.append(OrderBookLevel(price=price, size=size))
-                orderbook.bids.sort(key=lambda x: x.price, reverse=True)
-        elif side == "SELL":
-            # Update asks
-            orderbook.asks = [a for a in orderbook.asks if a.price != price]
-            if size > 0:
-                orderbook.asks.append(OrderBookLevel(price=price, size=size))
-                orderbook.asks.sort(key=lambda x: x.price)
+        # Thread-safe orderbook modification
+        with self._orderbook_lock:
+            if asset_id not in self._orderbooks:
+                return
 
-        orderbook.timestamp = datetime.now(timezone.utc)
+            orderbook = self._orderbooks[asset_id]
 
-        # Notify callback
+            if side == "BUY":
+                # Update bids
+                orderbook.bids = [b for b in orderbook.bids if b.price != price]
+                if size > 0:
+                    orderbook.bids.append(OrderBookLevel(price=price, size=size))
+                    orderbook.bids.sort(key=lambda x: x.price, reverse=True)
+            elif side == "SELL":
+                # Update asks
+                orderbook.asks = [a for a in orderbook.asks if a.price != price]
+                if size > 0:
+                    orderbook.asks.append(OrderBookLevel(price=price, size=size))
+                    orderbook.asks.sort(key=lambda x: x.price)
+
+            orderbook.timestamp = datetime.now(timezone.utc)
+
+        # Notify callback (outside lock to avoid blocking)
         if self.on_orderbook_update:
             self.on_orderbook_update(asset_id, orderbook)
 

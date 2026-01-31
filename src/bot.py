@@ -19,10 +19,11 @@ from .data import (
     BinanceFeed,
     fetch_all_historical_prices,
     prepopulate_price_histories,
+    get_data_api,
 )
 from .data.binance import BinancePrice
 from .execution import create_trading_client, OrderExecutor
-from .execution.client import get_account_balance
+from .execution.client import get_account_balance, get_trades
 from .strategy import SignalGenerator, RiskManager
 from .strategy.ml_predictor import (
     get_ml_predictor,
@@ -87,6 +88,12 @@ class TradingBot:
             self.ml_predictor = get_ml_predictor()
             self.ml_predictor.min_confidence = config.trading.ml_min_confidence
             self.ml_predictor.min_training_samples = config.trading.ml_min_samples
+            logger.info(
+                f"🤖 ML enabled: {self.ml_predictor.training_samples} samples loaded | "
+                f"Model: {self.ml_predictor.model_path}"
+            )
+        else:
+            logger.info("🤖 ML disabled (set ML_ENABLED=true to enable)")
 
         # Market state - three-stage lifecycle
         self.markets: dict[str, MarketState] = {}  # Active trading markets
@@ -97,12 +104,14 @@ class TradingBot:
         # Token-to-market mapping for fast lookups
         self._token_to_market: dict[str, str] = {}  # token_id -> condition_id
 
-        # Track logged rejections to avoid spam
+        # Track logged rejections to avoid spam (cleared periodically)
         self._logged_rejections: set[str] = set()
+        self._last_rejection_clear: Optional[datetime] = None
+        self._rejection_clear_interval = 30.0  # Clear rejections every 30s to re-log
 
         # Cooldown tracking - prevent duplicate orders per asset
         self._last_order_time: dict[str, datetime] = {}  # asset -> last order time
-        self._order_cooldown_seconds = 120  # 2 minutes cooldown per asset
+        self._order_cooldown_seconds = config.trading.order_cooldown_seconds  # Configurable (default 15s)
 
         # Cached API positions (updated by _sync_existing_orders)
         self._api_positions: dict[str, dict] = {}  # asset -> position info
@@ -112,6 +121,10 @@ class TradingBot:
         self._pending_orders: dict[str, dict] = {}
         self._order_check_interval = 5.0  # Check pending orders every 5 seconds
         self.last_order_check = None
+
+        # Thread-safe locks for concurrent access to shared dictionaries
+        self._pending_orders_lock = asyncio.Lock()
+        self._last_order_time_lock = asyncio.Lock()
 
         # Timing trackers
         self.last_market_refresh = None
@@ -123,15 +136,22 @@ class TradingBot:
         # When a period boundary is crossed, we need to refresh markets with new target prices
         self._current_period_ts: int = 0  # Current 15-min period timestamp
         self._period_transition_wait_until: Optional[datetime] = None  # Wait for price data
+        self._captured_period_prices: dict[str, float] = {}  # asset -> price captured at period boundary
 
         # Intervals (seconds)
         self.settlement_check_interval = 5.0  # Check settlements frequently
         self.market_discovery_interval = 15.0  # Discover new markets every 15s
         self.balance_sync_interval = 30.0  # Sync balance every 30s
         self.orders_sync_interval = 60.0  # Sync open orders every 60s
-        self.period_transition_delay = 5.0  # Seconds to wait after period boundary for price data
+        self.period_transition_delay = 2.0  # Reduced: only wait 2s for real-time price capture
         self.position_log_interval = 30.0  # Log position status every 30s
         self.last_position_log = None  # Track last position log time
+
+        # ML Sync from Polymarket API - bypasses internal position tracking
+        # This ensures ML learns from actual trades even if internal tracking fails
+        self._ml_synced_trades: set[str] = set()  # Set of trade IDs already synced to ML
+        self.ml_sync_interval = 60.0  # Sync ML every 60 seconds
+        self.last_ml_sync = None  # Track last ML sync time
 
         # Control flags
         self._running = False
@@ -195,6 +215,17 @@ class TradingBot:
         # Fetch historical price data to pre-populate price histories
         # This allows the bot to make better decisions immediately
         await self._fetch_historical_prices()
+
+        # Initial ML sync from Polymarket API - backfill from trade history
+        # This ensures ML model learns from all past trades immediately on startup
+        if self.ml_predictor and self.client:
+            logger.info("🤖 Syncing ML model from Polymarket trade history...")
+            await self._sync_ml_from_polymarket(force=True)
+            stats = self.ml_predictor.get_model_stats()
+            logger.info(
+                f"🤖 ML Model: {stats['training_samples']} samples | "
+                f"Mode: {'ACTIVE' if stats['is_active'] else 'LEARNING'}"
+            )
 
         logger.info("Trading bot initialized successfully")
         return True
@@ -361,32 +392,42 @@ class TradingBot:
         if self.client is None or self.executor is None:
             return
 
+        # Log that we're checking pending orders
+        logger.debug(f"Checking {len(self._pending_orders)} pending orders...")
+
         orders_to_remove = []
 
         for order_id, order_data in list(self._pending_orders.items()):
             try:
+                asset = order_data.get("asset", "???")
+                placed_time = order_data.get("placed_time")
+                wait_time = (now - placed_time).total_seconds() if placed_time else 0
+
                 # Check order status
                 order_info = self.executor.get_order_status(order_id)
 
                 if order_info is None:
                     # Order not found - might have been filled or cancelled
-                    # Check how long we've been waiting
-                    placed_time = order_data.get("placed_time")
-                    if placed_time:
-                        wait_time = (now - placed_time).total_seconds()
-                        if wait_time > 120:  # 2 minutes timeout
-                            logger.warning(
-                                f"Order {order_id[:16]}... not found after {wait_time:.0f}s - removing"
-                            )
-                            orders_to_remove.append(order_id)
-                            # Restore cooldown to allow new order
-                            asset = order_data.get("asset")
-                            if asset and asset in self._last_order_time:
-                                del self._last_order_time[asset]
+                    if wait_time > 60:  # 1 minute timeout (reduced from 2)
+                        logger.warning(
+                            f"⚠️ Order {order_id[:8]}... ({asset}) not found after {wait_time:.0f}s - removing"
+                        )
+                        orders_to_remove.append(order_id)
+                        # Restore cooldown to allow new order
+                        if asset in self._last_order_time:
+                            del self._last_order_time[asset]
+                    else:
+                        logger.debug(f"Order {order_id[:8]}... ({asset}) status unknown, waiting {wait_time:.0f}s")
                     continue
 
                 signal = order_data.get("signal")
                 asset = order_data.get("asset", signal.market.asset if signal else "???")
+
+                # Log the status we received
+                logger.info(
+                    f"📋 Order {order_id[:8]}... ({asset}): status={order_info.status.value} | "
+                    f"filled={order_info.filled_size:.2f} | wait={wait_time:.0f}s"
+                )
 
                 if order_info.status.value == "FILLED":
                     # Order filled - record the position
@@ -397,6 +438,7 @@ class TradingBot:
 
                     if signal:
                         # Record position with risk manager
+                        logger.info(f"📍 Recording position for {asset} {signal.side.value}")
                         self.risk_manager.record_position_open(
                             signal=signal,
                             entry_price=order_info.price,
@@ -410,17 +452,92 @@ class TradingBot:
                             ml_ask_depth=order_data.get("ml_ask_depth"),
                             ml_price_trend=order_data.get("ml_price_trend"),
                             ml_distance_from_target=order_data.get("ml_distance_from_target"),
+                            ml_binance_lead_pct=order_data.get("ml_binance_lead_pct"),
+                            ml_binance_confirmation=order_data.get("ml_binance_confirmation"),
+                            ml_trend_1h=order_data.get("ml_trend_1h"),
+                            ml_trend_4h=order_data.get("ml_trend_4h"),
+                            ml_trend_1d=order_data.get("ml_trend_1d"),
                         )
+
+                        # Record in trade history
+                        trade_history = get_trade_history()
+                        current_price = self.signal_generator.get_price(signal.market.asset)
+                        trade_history.record_open(
+                            asset=asset,
+                            side=signal.side.value,
+                            entry_price=order_info.price,
+                            shares=order_info.filled_size,
+                            target_price=signal.market.target_price,
+                            chainlink_price=current_price,
+                            market_id=signal.market.condition_id,
+                            predicted_prob=order_data.get("ml_confidence"),
+                            arb_type=order_data.get("ml_arb_type") or "none",
+                            edge=signal.edge,
+                        )
+
+                    else:
+                        logger.warning(f"⚠️ Order filled but signal is None - cannot record position for {asset}")
 
                     orders_to_remove.append(order_id)
 
                 elif order_info.status.value == "PARTIAL":
-                    # Partially filled - log progress
+                    # Partially filled - check if essentially complete
                     fill_pct = order_info.fill_pct * 100
-                    logger.info(
-                        f"⏳ ORDER PARTIAL: {asset} | "
-                        f"Filled: {fill_pct:.0f}% ({order_info.filled_size:.2f} shares)"
-                    )
+                    original_size = order_data.get("size", 0)
+
+                    # If 95%+ filled, treat as FILLED (blockchain confirmation pending)
+                    if fill_pct >= 95 or (original_size > 0 and order_info.filled_size >= original_size * 0.95):
+                        logger.info(
+                            f"✅ ORDER FILLED (via PARTIAL 100%): {asset} | "
+                            f"Shares: {order_info.filled_size:.2f} @ {order_info.price:.4f}"
+                        )
+
+                        if signal:
+                            # Record position with risk manager
+                            logger.info(f"📍 Recording position for {asset} {signal.side.value}")
+                            self.risk_manager.record_position_open(
+                                signal=signal,
+                                entry_price=order_info.price,
+                                shares=order_info.filled_size,
+                                ml_volatility=order_data.get("ml_volatility"),
+                                ml_momentum=order_data.get("ml_momentum"),
+                                ml_confidence=order_data.get("ml_confidence"),
+                                ml_arb_type=order_data.get("ml_arb_type"),
+                                ml_spread=order_data.get("ml_spread"),
+                                ml_bid_depth=order_data.get("ml_bid_depth"),
+                                ml_ask_depth=order_data.get("ml_ask_depth"),
+                                ml_price_trend=order_data.get("ml_price_trend"),
+                                ml_distance_from_target=order_data.get("ml_distance_from_target"),
+                                ml_binance_lead_pct=order_data.get("ml_binance_lead_pct"),
+                                ml_binance_confirmation=order_data.get("ml_binance_confirmation"),
+                                ml_trend_1h=order_data.get("ml_trend_1h"),
+                                ml_trend_4h=order_data.get("ml_trend_4h"),
+                                ml_trend_1d=order_data.get("ml_trend_1d"),
+                            )
+
+                            # Record in trade history
+                            trade_history = get_trade_history()
+                            current_price = self.signal_generator.get_price(signal.market.asset)
+                            trade_history.record_open(
+                                asset=asset,
+                                side=signal.side.value,
+                                entry_price=order_info.price,
+                                shares=order_info.filled_size,
+                                target_price=signal.market.target_price,
+                                chainlink_price=current_price,
+                                market_id=signal.market.condition_id,
+                                predicted_prob=order_data.get("ml_confidence"),
+                                arb_type=order_data.get("ml_arb_type") or "none",
+                                edge=signal.edge,
+                            )
+
+                        orders_to_remove.append(order_id)
+                    else:
+                        # Actually partial - log progress
+                        logger.info(
+                            f"⏳ ORDER PARTIAL: {asset} | "
+                            f"Filled: {fill_pct:.0f}% ({order_info.filled_size:.2f} shares)"
+                        )
 
                 elif order_info.status.value in ["CANCELLED", "EXPIRED", "REJECTED"]:
                     # Order failed - remove and allow retry
@@ -433,18 +550,18 @@ class TradingBot:
                     if asset in self._last_order_time:
                         del self._last_order_time[asset]
 
-                elif order_info.status.value == "OPEN":
-                    # Still open - check if we should cancel
+                elif order_info.status.value in ["OPEN", "PENDING"]:
+                    # Still open/pending - check if we should cancel
                     should_cancel = False
                     cancel_reason = ""
 
                     if signal:
                         market_id = signal.market.condition_id
 
-                        # Cancel if market is expiring soon
-                        if signal.market.time_remaining < 30:
+                        # Cancel if market is expiring soon (60s buffer for safety)
+                        if signal.market.time_remaining < 60:
                             should_cancel = True
-                            cancel_reason = "market expiring"
+                            cancel_reason = f"market expiring ({signal.market.time_remaining:.0f}s left)"
 
                         # Cancel if market is in expiring/settled queue (already expired)
                         elif market_id in self.expiring_markets or market_id in self.settled_markets:
@@ -456,23 +573,43 @@ class TradingBot:
                             should_cancel = True
                             cancel_reason = "market no longer active"
 
-                    # Also cancel if order is too old (over 2 minutes)
-                    placed_time = order_data.get("placed_time")
-                    if placed_time and (now - placed_time).total_seconds() > 120:
+                    # Also cancel if order is too old (over 90 seconds)
+                    if wait_time > 90:
                         should_cancel = True
-                        cancel_reason = "order timeout (2min)"
+                        cancel_reason = f"order timeout ({wait_time:.0f}s)"
 
                     if should_cancel:
                         logger.warning(
                             f"⚠️ Cancelling unfilled order for {asset} - {cancel_reason}"
                         )
-                        self.executor.cancel_order(order_id)
+                        try:
+                            self.executor.cancel_order(order_id)
+                        except Exception as cancel_err:
+                            logger.warning(f"Failed to cancel order: {cancel_err}")
+                        orders_to_remove.append(order_id)
+                        if asset in self._last_order_time:
+                            del self._last_order_time[asset]
+                    else:
+                        logger.debug(f"Order {order_id[:8]}... ({asset}) still {order_info.status.value}, waiting {wait_time:.0f}s")
+
+                else:
+                    # Unknown status - log and apply timeout
+                    logger.warning(f"Unknown order status '{order_info.status.value}' for {asset}")
+                    if wait_time > 90:
+                        logger.warning(f"⚠️ Removing stale order for {asset} with status {order_info.status.value}")
                         orders_to_remove.append(order_id)
                         if asset in self._last_order_time:
                             del self._last_order_time[asset]
 
             except Exception as e:
-                logger.error(f"Error checking order {order_id[:16]}...: {e}")
+                logger.error(f"Error checking order {order_id[:8]}...: {e}")
+                # On error, still remove stale orders
+                if wait_time > 120:
+                    logger.warning(f"⚠️ Removing errored order {order_id[:8]}... after {wait_time:.0f}s")
+                    orders_to_remove.append(order_id)
+                    asset = order_data.get("asset")
+                    if asset and asset in self._last_order_time:
+                        del self._last_order_time[asset]
 
         # Remove processed orders
         for order_id in orders_to_remove:
@@ -618,18 +755,33 @@ class TradingBot:
             return
 
         self._running = True
+
+        # Startup banner
+        logger.info("╔════════════════════════════════════════════════════════════════╗")
+        logger.info("║     POLYMARKET 15-MIN CRYPTO ARBITRAGE BOT                     ║")
+        logger.info("║     Made by Argon Stark                                        ║")
+        logger.info("╚════════════════════════════════════════════════════════════════╝")
         logger.info("Starting trading bot...")
 
         try:
-            # Run all components concurrently
-            await asyncio.gather(
+            # Build list of tasks to run
+            tasks = [
                 self._run_chainlink_feed(),
                 self._run_clob_feed(),
-                self._run_binance_feed(),  # Fast price feed for leading indicator
                 self._run_trading_loop(),
-                self._run_settlement_loop(),  # New: dedicated settlement checker
-                return_exceptions=True,
-            )
+                self._run_settlement_loop(),
+            ]
+
+            # Only add direct Binance feed if enabled
+            # Otherwise, Binance prices come via Polymarket's WebSocket (bundled in ChainlinkFeed)
+            if self.config.endpoints.binance_direct_enabled:
+                logger.info("Using DIRECT Binance WebSocket connection")
+                tasks.append(self._run_binance_feed())
+            else:
+                logger.info("Using Polymarket's bundled Binance prices (BINANCE_DIRECT=false)")
+
+            # Run all components concurrently
+            await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
             logger.info("Bot cancelled")
         except Exception as e:
@@ -650,13 +802,29 @@ class TradingBot:
         # Disconnect data feeds
         self.chainlink_feed.disconnect()
         self.clob_feed.disconnect()
-        self.binance_feed.disconnect()
+        if self.config.endpoints.binance_direct_enabled:
+            self.binance_feed.disconnect()
         self.gamma_api.close()
 
         # Shutdown notification thread pool
         shutdown_notification_executor()
 
         logger.info("Trading bot shutdown complete")
+
+    def _get_binance_prices(self) -> dict[str, float]:
+        """
+        Get Binance prices from appropriate source based on config.
+
+        If BINANCE_DIRECT=true: Uses direct Binance WebSocket (binance_feed)
+        If BINANCE_DIRECT=false: Uses Polymarket's bundled Binance prices (chainlink_feed)
+
+        Returns:
+            Dict of asset -> price (e.g., {"BTC": 104000.50, "ETH": 3200.25})
+        """
+        if self.config.endpoints.binance_direct_enabled:
+            return self.binance_feed.get_all_prices()
+        else:
+            return self.chainlink_feed.get_all_binance_prices()
 
     async def _get_initial_bankroll(self) -> float:
         """
@@ -745,7 +913,7 @@ class TradingBot:
                         # Log progress every 10 seconds
                         if int(elapsed) % 10 == 0 and int(elapsed) > 0:
                             chainlink_prices = self.chainlink_feed.get_all_prices()
-                            binance_prices = self.binance_feed.get_all_prices()
+                            binance_prices = self._get_binance_prices()
 
                             # Build price comparison string
                             price_info = []
@@ -774,7 +942,7 @@ class TradingBot:
                     else:
                         # Warm-up complete - verify data feeds
                         chainlink_prices = self.chainlink_feed.get_all_prices()
-                        binance_prices = self.binance_feed.get_all_prices()
+                        binance_prices = self._get_binance_prices()
 
                         # Check data availability
                         missing_chainlink = []
@@ -835,7 +1003,8 @@ class TradingBot:
                     logger.warning("CLOB feed circuit breaker open - trading with stale order books")
 
                 # Binance feed is optional (confirmation only) - just log if down
-                if self.binance_feed._circuit_open:
+                # Only check circuit breaker when using direct Binance connection
+                if self.config.endpoints.binance_direct_enabled and self.binance_feed._circuit_open:
                     logger.debug("Binance feed circuit breaker open - trading without confirmation signal")
 
                 # Discover and refresh markets
@@ -869,6 +1038,15 @@ class TradingBot:
                     await asyncio.sleep(60.0)
                     continue
 
+                # Periodically clear rejection log to re-show blocking reasons
+                now = datetime.now(timezone.utc)
+                if (self._last_rejection_clear is None or
+                    (now - self._last_rejection_clear).total_seconds() > self._rejection_clear_interval):
+                    if self._logged_rejections:
+                        logger.debug(f"Clearing {len(self._logged_rejections)} logged rejections for re-logging")
+                    self._logged_rejections.clear()
+                    self._last_rejection_clear = now
+
                 # Generate and execute signals for each active market
                 active_count = len(self.markets)
                 if active_count > 0:
@@ -877,8 +1055,30 @@ class TradingBot:
                     if random.random() < 0.02:
                         self._log_status_line()
 
-                for market in list(self.markets.values()):
-                    await self._process_market(market)
+                # Sort markets by asset priority (BTC/ETH first for better liquidity)
+                priority = self.config.trading.asset_priority
+                sorted_markets = sorted(
+                    self.markets.values(),
+                    key=lambda m: priority.index(m.asset) if m.asset in priority else 99
+                )
+
+                # Process markets - parallel or sequential based on config
+                if self.config.trading.parallel_execution:
+                    # Parallel execution - process all markets simultaneously
+                    results = await asyncio.gather(
+                        *[self._process_market(m) for m in sorted_markets],
+                        return_exceptions=True
+                    )
+                    # Log any exceptions that were silently returned
+                    for i, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            market = sorted_markets[i] if i < len(sorted_markets) else None
+                            asset = market.asset if market else "UNKNOWN"
+                            logger.error(f"[{asset}] Market processing error: {result}")
+                else:
+                    # Sequential execution
+                    for market in sorted_markets:
+                        await self._process_market(market)
 
                 # Wait before next iteration
                 await asyncio.sleep(self.config.loop_interval)
@@ -906,6 +1106,15 @@ class TradingBot:
         while self._running:
             try:
                 await self._check_settlements()
+
+                # Sync ML from Polymarket API - ensures ML learns from actual trades
+                # This bypasses internal position tracking which may fail
+                await self._sync_ml_from_polymarket()
+
+                # Sync positions from Polymarket API - clears stale positions
+                # that no longer exist (prevents blocking new trades)
+                await self._sync_positions_from_polymarket()
+
                 await asyncio.sleep(self.settlement_check_interval)
 
             except asyncio.CancelledError:
@@ -915,6 +1124,58 @@ class TradingBot:
                 await asyncio.sleep(5.0)
 
         logger.info("Settlement loop stopped")
+
+    def _capture_period_boundary_prices(self, period_ts: int):
+        """
+        Capture current Chainlink prices at period boundary.
+
+        At the exact moment a new 15-minute period starts, the current
+        Chainlink price becomes the target price for that period's markets.
+        This allows real-time transitions without waiting for the API.
+
+        Args:
+            period_ts: Unix timestamp of the new period start
+        """
+        self._captured_period_prices.clear()
+
+        for asset in self.config.supported_assets:
+            price = self.signal_generator.get_price(asset)
+            if price and price > 0:
+                self._captured_period_prices[asset] = price
+                logger.info(
+                    f"📍 Captured {asset} price at period boundary: ${price:,.2f}"
+                )
+            else:
+                logger.warning(f"⚠️ No Chainlink price available for {asset} at boundary")
+
+        if self._captured_period_prices:
+            logger.info(
+                f"✅ Captured {len(self._captured_period_prices)} prices for period {period_ts}"
+            )
+
+    def _inject_captured_prices_to_gamma(self, period_ts: int):
+        """
+        Inject captured prices into Gamma API cache.
+
+        This allows immediate market creation without waiting for
+        the Polymarket API to update with the new target prices.
+
+        Args:
+            period_ts: Unix timestamp of the period
+        """
+        if not self._captured_period_prices:
+            logger.debug("No captured prices to inject")
+            return
+
+        injected = 0
+        for asset, price in self._captured_period_prices.items():
+            cache_key = f"{asset}:{period_ts}"
+            self.gamma_api._target_price_cache[cache_key] = price
+            injected += 1
+            logger.debug(f"Injected {asset} target price ${price:,.2f} for period {period_ts}")
+
+        if injected > 0:
+            logger.info(f"💉 Injected {injected} target prices into cache for instant trading")
 
     async def _refresh_markets(self):
         """Refresh list of active 15-minute markets."""
@@ -927,30 +1188,33 @@ class TradingBot:
         # Detect period boundary crossing
         if self._current_period_ts > 0 and current_period_ts != self._current_period_ts:
             logger.info(
-                f"PERIOD BOUNDARY: Transitioning from {self._current_period_ts} "
+                f"⏰ PERIOD BOUNDARY: Transitioning from {self._current_period_ts} "
                 f"to {current_period_ts}"
             )
 
-            # Wait for new price data to become available
-            # The API needs a few seconds after period boundary to have closePrice
+            # REAL-TIME: Capture current Chainlink prices as target prices for new period
+            # This eliminates the need to wait for the API
+            self._capture_period_boundary_prices(current_period_ts)
+
+            # Brief wait to ensure price capture is stable (reduced from 15s to 2s)
             if self._period_transition_wait_until is None:
                 wait_seconds = self.period_transition_delay
                 self._period_transition_wait_until = now + timedelta(seconds=wait_seconds)
-                logger.info(
-                    f"Waiting {wait_seconds}s for new period price data..."
-                )
+                logger.debug(f"Brief {wait_seconds}s stabilization wait...")
 
             # If still waiting, don't refresh yet
             if now < self._period_transition_wait_until:
-                logger.debug(
-                    f"Still waiting for period transition "
-                    f"({(self._period_transition_wait_until - now).total_seconds():.1f}s remaining)"
-                )
                 return
 
-            # Wait period complete - clear old markets and reset transition state
-            logger.info("Period transition complete - refreshing markets with new prices")
+            # Transition complete - clear old data and proceed
+            logger.info("✅ Period transition complete - using captured prices")
             self._period_transition_wait_until = None
+
+            # Clear stale target price cache
+            self.gamma_api.clear_stale_price_cache(current_period_ts)
+
+            # Inject captured prices into gamma API cache for immediate use
+            self._inject_captured_prices_to_gamma(current_period_ts)
 
             # Clear markets from old period (they should be in expiring/settled by now)
             async with self._markets_lock:
@@ -1289,6 +1553,11 @@ class TradingBot:
                 ask_depth = position.ml_ask_depth or 0.0
                 price_trend = position.ml_price_trend or 0.0
                 distance_from_target = position.ml_distance_from_target or 0.0
+                binance_lead_pct = position.ml_binance_lead_pct or 0.0
+                binance_confirmation = position.ml_binance_confirmation or "NONE"
+                trend_1h = position.ml_trend_1h or 0.0
+                trend_4h = position.ml_trend_4h or 0.0
+                trend_1d = position.ml_trend_1d or 0.0
             else:
                 volatility = self.signal_generator.get_volatility(market.asset)
                 current_price = self.signal_generator.get_price(market.asset)
@@ -1304,13 +1573,38 @@ class TradingBot:
                 distance_from_target = 0.0
                 if current_price and market.target_price:
                     distance_from_target = abs(current_price - market.target_price) / market.target_price
+                binance_lead_pct = 0.0
+                binance_confirmation = "NONE"
+                trend_1h = 0.0
+                trend_4h = 0.0
+                trend_1d = 0.0
+                # Try to fetch trends if available
+                try:
+                    from .data.binance import get_multi_timeframe_trends
+                    trends = get_multi_timeframe_trends(market.asset)
+                    trend_1h = trends.get("trend_1h", 0.0)
+                    trend_4h = trends.get("trend_4h", 0.0)
+                    trend_1d = trends.get("trend_1d", 0.0)
+                except Exception:
+                    pass
 
             fake_signal = SimpleNamespace(
                 edge=0.0,
                 market=market,
                 side=position.side,
                 _arb_type=arb_type,
+                # Additional attributes needed by TraderModelLoader
+                recommended_price=position.entry_price,
+                size_shares=position.shares,
+                size_usd=position.shares * position.entry_price,
+                time_remaining=market.time_remaining,
             )
+
+            # Get price data for ML
+            current_price = self.signal_generator.get_price(market.asset) or 0.0
+            target_price = market.target_price or 0.0
+            price_high, price_low = self.signal_generator.get_price_range(market.asset)
+            price_velocity = self.signal_generator.get_price_velocity(market.asset)
 
             # Record with early exit flag
             self.ml_predictor.record_outcome(
@@ -1324,6 +1618,16 @@ class TradingBot:
                 ask_depth=ask_depth,
                 price_trend=price_trend,
                 distance_from_target=distance_from_target,
+                binance_lead_pct=binance_lead_pct,
+                binance_confirmation=binance_confirmation,
+                trend_1h=trend_1h,
+                trend_4h=trend_4h,
+                trend_1d=trend_1d,
+                current_price=current_price,
+                target_price=target_price,
+                price_high=price_high,
+                price_low=price_low,
+                price_velocity=price_velocity,
             )
 
         # Clear asset cooldown so we can trade again
@@ -1372,6 +1676,22 @@ class TradingBot:
                     # Unsubscribe from order book
                     self.clob_feed.unsubscribe(market.up_token_id)
                     self.clob_feed.unsubscribe(market.down_token_id)
+
+                    # IMPORTANT: Clear all tracking for this asset so new market can trade
+                    asset = market.asset
+
+                    # Clear cached API positions
+                    if hasattr(self, '_api_positions') and asset in self._api_positions:
+                        del self._api_positions[asset]
+                        logger.info(f"✅ Cleared cached position for {asset} after settlement")
+
+                    # Clear cooldown
+                    if asset in self._last_order_time:
+                        del self._last_order_time[asset]
+                        logger.debug(f"Cleared cooldown for {asset} after settlement")
+
+                    # Cancel any pending orders for this asset
+                    await self._cancel_pending_orders_for_asset(asset)
 
                     # Cleanup old settled markets (keep last 100)
                     if len(self.settled_markets) > 100:
@@ -1460,6 +1780,16 @@ class TradingBot:
         else:
             logger.debug(f"No position in {market.asset}, nothing to settle")
 
+        # ALWAYS record ML observation from expired markets (even without positions)
+        # This gives the ML model more training data by observing outcomes
+        if winning_outcome and resolution_price and self.ml_predictor:
+            self._record_ml_observation_from_expired_market(
+                market=market,
+                winning_outcome=winning_outcome,
+                resolution_price=resolution_price,
+                had_position=has_position,
+            )
+
         return True  # Settlement successful
 
     def _determine_outcome_locally(self, market: MarketState) -> tuple[Optional[str], Optional[float]]:
@@ -1492,6 +1822,121 @@ class TradingBot:
         else:
             return ("DOWN", current_price)
 
+    def _record_ml_observation_from_expired_market(
+        self,
+        market: MarketState,
+        winning_outcome: str,
+        resolution_price: float,
+        had_position: bool,
+    ):
+        """
+        Record ML training data from an expired market (observational learning).
+
+        This allows the ML model to learn from ALL expired markets, not just
+        the ones we traded. By observing outcomes, the model can learn patterns
+        without risking money.
+
+        Records two observations:
+        1. The winning side (UP or DOWN) - what would have won
+        2. The losing side - what would have lost
+
+        Args:
+            market: The expired market
+            winning_outcome: "UP" or "DOWN" - which side won
+            resolution_price: The final price at settlement
+            had_position: Whether we had a position (skip if already recorded)
+        """
+        # Skip if we already recorded this via position close
+        if had_position:
+            return
+
+        # Skip if ML predictor not available
+        if not self.ml_predictor:
+            return
+
+        try:
+            from types import SimpleNamespace
+            from .models import Side
+
+            # Get current market data for feature extraction
+            volatility = self.signal_generator.get_volatility(market.asset)
+            current_price = resolution_price
+
+            # Calculate how far price ended from target
+            target_price = market.target_price
+            distance_from_target = 0.0
+            if target_price and target_price > 0:
+                distance_from_target = (current_price - target_price) / target_price
+
+            # Get Binance trends if available
+            trend_1h, trend_4h, trend_1d = 0.0, 0.0, 0.0
+            try:
+                from .data.binance import get_multi_timeframe_trends
+                trends = get_multi_timeframe_trends(market.asset)
+                trend_1h = trends.get("trend_1h", 0.0)
+                trend_4h = trends.get("trend_4h", 0.0)
+                trend_1d = trends.get("trend_1d", 0.0)
+            except Exception:
+                pass
+
+            # Calculate price momentum based on outcome
+            # If UP won, price was trending up; if DOWN won, price was trending down
+            price_momentum = distance_from_target * 10  # Amplify for better signal
+            price_momentum = max(-1, min(1, price_momentum))
+
+            # Record BOTH sides for balanced learning:
+            # 1. Record the winning side as a WIN
+            # 2. Record the losing side as a LOSS
+            for side_value in ["UP", "DOWN"]:
+                side = Side.UP if side_value == "UP" else Side.DOWN
+                won = (side_value == winning_outcome)
+
+                # Create a fake signal for ML recording
+                fake_signal = SimpleNamespace(
+                    market=market,
+                    side=side,
+                    edge=0.0,  # Unknown edge for observation
+                    recommended_price=market.best_bid if side == Side.UP else market.best_ask,
+                    size_shares=0,
+                    size_usd=0,
+                    time_remaining=0,
+                    _arb_type="observation",  # Mark as observational data
+                )
+
+                # Record to ML model
+                self.ml_predictor.record_outcome(
+                    signal=fake_signal,
+                    volatility=volatility,
+                    price_momentum=price_momentum if side == Side.UP else -price_momentum,
+                    won=won,
+                    arb_type="observation",
+                    spread=market.best_ask - market.best_bid if market.best_ask and market.best_bid else 0.0,
+                    bid_depth=market.bid_depth,
+                    ask_depth=market.ask_depth,
+                    price_trend=price_momentum,
+                    distance_from_target=distance_from_target,
+                    binance_lead_pct=0.0,
+                    binance_confirmation="NONE",
+                    trend_1h=trend_1h,
+                    trend_4h=trend_4h,
+                    trend_1d=trend_1d,
+                    current_price=current_price,
+                    target_price=target_price,
+                    price_high=current_price * 1.005,
+                    price_low=current_price * 0.995,
+                    price_velocity=abs(price_momentum) * 0.001,
+                )
+
+            logger.info(
+                f"🤖 ML OBSERVATION: {market.asset} | "
+                f"Winner: {winning_outcome} | "
+                f"Price: ${resolution_price:,.2f} vs Target: ${target_price:,.2f} | "
+                f"+2 training samples"
+            )
+
+        except Exception as e:
+            logger.debug(f"Error recording ML observation: {e}")
+
     async def _close_position_on_settlement(
         self,
         market: MarketState,
@@ -1520,16 +1965,22 @@ class TradingBot:
             payout = 0.0
             pnl = -position.cost_basis
 
-        # Color the result
+        # Color and format the result
         result_color = Colors.BRIGHT_GREEN if won else Colors.BRIGHT_RED
         result_emoji = "🎉" if won else "💔"
-        logger.info(
-            f"{result_color}{result_emoji} POSITION CLOSED: {market.asset} {position_side} | "
-            f"{'WIN' if won else 'LOSS'} | "
-            f"Shares: {position.shares:.2f} | "
-            f"Entry: {position.entry_price:.4f} | "
-            f"P&L: ${pnl:+.2f}{Colors.RESET}"
-        )
+        result_text = "WIN" if won else "LOSS"
+        side_arrow = "▲" if position_side == "UP" else "▼"
+
+        # Calculate ROI
+        roi = (pnl / position.cost_basis * 100) if position.cost_basis > 0 else 0
+
+        # Box format for position close
+        logger.info(f"{result_color}╔══════════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        logger.info(f"{result_color}║  {result_emoji} POSITION CLOSED: {result_text:4}                                        ║{Colors.RESET}")
+        logger.info(f"{result_color}╠══════════════════════════════════════════════════════════════════╣{Colors.RESET}")
+        logger.info(f"{result_color}║{Colors.RESET}  Asset: {market.asset:4} {side_arrow}  │  Shares: {position.shares:>8.2f}  │  Entry: {position.entry_price:.4f}     {result_color}║{Colors.RESET}")
+        logger.info(f"{result_color}║{Colors.RESET}  P&L: {result_color}${pnl:>+10.2f}{Colors.RESET}  │  ROI: {result_color}{roi:>+7.1f}%{Colors.RESET}  │  Cost: ${position.cost_basis:.2f}     {result_color}║{Colors.RESET}")
+        logger.info(f"{result_color}╚══════════════════════════════════════════════════════════════════╝{Colors.RESET}")
 
         # Record with risk manager
         self.risk_manager.record_position_close(
@@ -1563,6 +2014,11 @@ class TradingBot:
                 ask_depth = position.ml_ask_depth or 0.0
                 price_trend = position.ml_price_trend or 0.0
                 distance_from_target = position.ml_distance_from_target or 0.0
+                binance_lead_pct = position.ml_binance_lead_pct or 0.0
+                binance_confirmation = position.ml_binance_confirmation or "NONE"
+                trend_1h = position.ml_trend_1h or 0.0
+                trend_4h = position.ml_trend_4h or 0.0
+                trend_1d = position.ml_trend_1d or 0.0
             else:
                 # Extract features now (for positions without stored ML data)
                 volatility = self.signal_generator.get_volatility(market.asset)
@@ -1579,6 +2035,20 @@ class TradingBot:
                 distance_from_target = 0.0
                 if current_price and market.target_price:
                     distance_from_target = abs(current_price - market.target_price) / market.target_price
+                binance_lead_pct = 0.0
+                binance_confirmation = "NONE"
+                trend_1h = 0.0
+                trend_4h = 0.0
+                trend_1d = 0.0
+                # Try to fetch trends if available
+                try:
+                    from .data.binance import get_multi_timeframe_trends
+                    trends = get_multi_timeframe_trends(market.asset)
+                    trend_1h = trends.get("trend_1h", 0.0)
+                    trend_4h = trends.get("trend_4h", 0.0)
+                    trend_1d = trends.get("trend_1d", 0.0)
+                except Exception:
+                    pass
 
                 logger.debug(f"Extracted ML features at settlement for {market.asset}")
 
@@ -1587,7 +2057,34 @@ class TradingBot:
                 market=market,
                 side=position.side,
                 _arb_type=arb_type,
+                # Additional attributes needed by TraderModelLoader
+                recommended_price=position.entry_price,
+                size_shares=position.shares,
+                size_usd=position.shares * position.entry_price,
+                time_remaining=market.time_remaining,
             )
+
+            # Log ML learning with prediction accuracy
+            ml_conf = position.ml_confidence
+            ml_prediction = "WIN" if ml_conf and ml_conf >= 0.5 else "LOSS" if ml_conf else None
+            actual_result = "WIN" if won else "LOSS"
+
+            if ml_prediction:
+                correct = ml_prediction == actual_result
+                correct_str = f"{Colors.BRIGHT_GREEN}✓ CORRECT{Colors.RESET}" if correct else f"{Colors.BRIGHT_RED}✗ WRONG{Colors.RESET}"
+                logger.info(
+                    f"🤖 ML EVAL: {market.asset} | "
+                    f"Predicted: {ml_prediction} ({ml_conf:.0%}) | Actual: {actual_result} | {correct_str}"
+                )
+            else:
+                logger.info(f"🤖 ML EVAL: {market.asset} | Actual: {actual_result} (learning mode - no prediction)")
+
+            # Get price data for ML
+            current_price = self.signal_generator.get_price(market.asset) or 0.0
+            target_price = market.target_price or 0.0
+            price_high, price_low = self.signal_generator.get_price_range(market.asset)
+            price_velocity = self.signal_generator.get_price_velocity(market.asset)
+
             self.ml_predictor.record_outcome(
                 signal=fake_signal,
                 volatility=volatility,
@@ -1599,7 +2096,713 @@ class TradingBot:
                 ask_depth=ask_depth,
                 price_trend=price_trend,
                 distance_from_target=distance_from_target,
+                binance_lead_pct=binance_lead_pct,
+                binance_confirmation=binance_confirmation,
+                trend_1h=trend_1h,
+                trend_4h=trend_4h,
+                trend_1d=trend_1d,
+                current_price=current_price,
+                target_price=target_price,
+                price_high=price_high,
+                price_low=price_low,
+                price_velocity=price_velocity,
             )
+
+    async def _sync_ml_from_polymarket(self, force: bool = False):
+        """
+        Sync ML model with actual trades from Polymarket Data API.
+
+        Uses multiple endpoints for comprehensive trade tracking:
+        - /activity (type=TRADE) - All trade activity with BUY/SELL
+        - /closed-positions - Completed trades with realized P&L
+        - /activity (type=REDEEM) - Redeemed positions (settled markets)
+
+        The ML learns from trades where we can determine the outcome (win/loss).
+
+        Args:
+            force: If True, bypass rate limiting (used on startup)
+        """
+        if not self.client or not self.ml_predictor:
+            return
+
+        # Rate limit: only sync every 5 minutes (unless forced)
+        now = datetime.now(timezone.utc)
+        if not hasattr(self, '_last_ml_sync_time'):
+            self._last_ml_sync_time = None
+
+        if not force and self._last_ml_sync_time and (now - self._last_ml_sync_time).total_seconds() < 300:
+            return
+
+        self._last_ml_sync_time = now
+
+        try:
+            # Get wallet address
+            wallet_address = self.client.get_address()
+            if not wallet_address:
+                logger.warning("Could not get wallet address for ML sync")
+                return
+
+            logger.info(f"🤖 ML Sync: Fetching trades for {wallet_address[:10]}...")
+            logger.info("─" * 50)
+
+            # Initialize Data API
+            data_api = get_data_api()
+
+            # Track what we've already synced (using condition_id + outcome + timestamp as key)
+            if not hasattr(self, '_synced_trades'):
+                self._synced_trades = set()
+
+            synced_count = 0
+            total_trades_found = 0
+            crypto_trades_found = 0
+            source_stats = {"clob": 0, "closed": 0, "activity": 0, "redeem": 0}
+
+            # === Method 0: CLOB Trades (direct from order book - most reliable) ===
+            try:
+                clob_trades = get_trades(self.client, limit=500)
+                logger.info(f"📊 [1/4] CLOB Trades: {len(clob_trades)} found")
+
+                # Count trades with Up/Down outcomes (15-min crypto indicators)
+                up_down_trades = [t for t in clob_trades if t.get("outcome", "").lower() in ["up", "down"]]
+                if up_down_trades:
+                    logger.info(f"     └─ {len(up_down_trades)} trades with Up/Down outcomes (15-min crypto)")
+
+                # Log sample trades for visibility
+                if clob_trades and len(clob_trades) > 0:
+                    for i, sample in enumerate(clob_trades[:3]):
+                        market_id = sample.get('market', '')[:12] + '...' if sample.get('market') else '?'
+                        logger.info(
+                            f"     └─ Trade {i+1}: {sample.get('side', '?'):4} | "
+                            f"Price: {sample.get('price', '?')} | "
+                            f"Size: {sample.get('size', '?')} | "
+                            f"Outcome: {sample.get('outcome', '?')} | "
+                            f"Market: {market_id}"
+                        )
+                    if len(clob_trades) > 3:
+                        logger.info(f"     └─ ... and {len(clob_trades) - 3} more")
+
+                # Process trades with market lookup
+                lookups_done = 0
+                for trade in clob_trades:
+                    result = self._process_clob_trade_for_ml(trade)
+                    if result == "synced":
+                        synced_count += 1
+                        crypto_trades_found += 1
+                        source_stats["clob"] += 1
+                    elif result == "crypto":
+                        crypto_trades_found += 1
+                    total_trades_found += 1
+
+                # Show market lookup stats
+                if hasattr(self, '_market_lookup_cache'):
+                    cache_size = len(self._market_lookup_cache)
+                    crypto_markets = sum(1 for v in self._market_lookup_cache.values() if v and v.get("asset"))
+                    if cache_size > 0:
+                        logger.info(f"     └─ Market lookups: {cache_size} total, {crypto_markets} 15-min crypto identified")
+            except Exception as e:
+                logger.info(f"📊 [1/4] CLOB Trades: Failed ({e})")
+
+            # === Method 1: Closed Positions (completed trades with P&L) ===
+            closed_positions = data_api.get_all_closed_positions(wallet_address, max_positions=500)
+            logger.info(f"📊 [2/4] Closed Positions: {len(closed_positions)} found")
+
+            # Log sample positions for visibility
+            crypto_closed = []
+            for pos in closed_positions:
+                slug = (pos.get("slug", "") or "").lower()
+                title = (pos.get("title", "") or "").lower()
+                if any(p in slug or p in title for p in ["15m", "15-min", "updown"]):
+                    crypto_closed.append(pos)
+
+            if crypto_closed:
+                for i, sample in enumerate(crypto_closed[:3]):
+                    pnl = float(sample.get('realizedPnl', 0) or 0)
+                    pnl_str = f"${pnl:+.2f}"
+                    result = "✓ WIN" if pnl > 0 else "✗ LOSS"
+                    logger.info(
+                        f"     └─ {sample.get('outcome', '?'):5} | "
+                        f"Avg: {sample.get('avgPrice', '?')} | "
+                        f"{result} {pnl_str}"
+                    )
+                if len(crypto_closed) > 3:
+                    logger.info(f"     └─ ... and {len(crypto_closed) - 3} more 15-min trades")
+            else:
+                logger.info(f"     └─ No 15-min crypto positions found")
+
+            for pos in closed_positions:
+                result = self._process_trade_for_ml(pos, "closed")
+                if result == "synced":
+                    synced_count += 1
+                    crypto_trades_found += 1
+                    source_stats["closed"] += 1
+                elif result == "crypto":
+                    crypto_trades_found += 1
+                total_trades_found += 1
+
+            # === Method 2: Trade Activity (all BUY/SELL activity) ===
+            trade_activity = data_api.get_all_activity(wallet_address, activity_type="TRADE", max_items=500)
+            logger.info(f"📊 [3/4] Trade Activity: {len(trade_activity)} found")
+
+            # Log sample activities for visibility
+            crypto_activity = []
+            for act in trade_activity:
+                slug = (act.get("slug", "") or "").lower()
+                title = (act.get("title", "") or "").lower()
+                if any(p in slug or p in title for p in ["15m", "15-min", "updown"]):
+                    crypto_activity.append(act)
+
+            if crypto_activity:
+                for i, sample in enumerate(crypto_activity[:3]):
+                    side_icon = "🟢" if sample.get('side') == "BUY" else "🔴"
+                    usdc = float(sample.get('usdcSize', 0) or 0)
+                    logger.info(
+                        f"     └─ {side_icon} {sample.get('side', '?'):4} {sample.get('outcome', '?'):5} | "
+                        f"Price: {sample.get('price', '?')} | "
+                        f"${usdc:.2f}"
+                    )
+                if len(crypto_activity) > 3:
+                    logger.info(f"     └─ ... and {len(crypto_activity) - 3} more 15-min trades")
+            else:
+                logger.info(f"     └─ No 15-min crypto activity found")
+
+            for trade in trade_activity:
+                result = self._process_trade_for_ml(trade, "activity")
+                if result == "synced":
+                    synced_count += 1
+                    crypto_trades_found += 1
+                    source_stats["activity"] += 1
+                elif result == "crypto":
+                    crypto_trades_found += 1
+                total_trades_found += 1
+
+            # === Method 3: Redeem Activity (claimed winnings) ===
+            redeem_activity = data_api.get_all_activity(wallet_address, activity_type="REDEEM", max_items=200)
+            logger.info(f"📊 [4/4] Redeem Activity: {len(redeem_activity)} found")
+
+            # Log sample redeems for visibility
+            crypto_redeems = []
+            for act in redeem_activity:
+                slug = (act.get("slug", "") or "").lower()
+                title = (act.get("title", "") or "").lower()
+                if any(p in slug or p in title for p in ["15m", "15-min", "updown"]):
+                    crypto_redeems.append(act)
+
+            if crypto_redeems:
+                for i, sample in enumerate(crypto_redeems[:3]):
+                    usdc = float(sample.get('usdcSize', 0) or 0)
+                    logger.info(
+                        f"     └─ 💰 {sample.get('outcome', '?'):5} redeemed | "
+                        f"${usdc:.2f}"
+                    )
+                if len(crypto_redeems) > 3:
+                    logger.info(f"     └─ ... and {len(crypto_redeems) - 3} more redeems")
+            else:
+                logger.info(f"     └─ No 15-min crypto redeems found")
+
+            for redeem in redeem_activity:
+                result = self._process_trade_for_ml(redeem, "redeem")
+                if result == "synced":
+                    synced_count += 1
+                    crypto_trades_found += 1
+                    source_stats["redeem"] += 1
+                elif result == "crypto":
+                    crypto_trades_found += 1
+
+            # Summary logging
+            logger.info("─" * 50)
+            if synced_count > 0:
+                sources_used = [f"{k}:{v}" for k, v in source_stats.items() if v > 0]
+                logger.info(
+                    f"✅ ML SYNCED: {synced_count} new trades | "
+                    f"Sources: {', '.join(sources_used) or 'none'}"
+                )
+                logger.info(
+                    f"📈 Total ML samples: {self.ml_predictor.training_samples}"
+                )
+            elif crypto_trades_found > 0:
+                logger.info(
+                    f"ℹ️  Found {crypto_trades_found} crypto trades (already synced or pending settlement)"
+                )
+            else:
+                logger.info(
+                    f"⚠️  No 15-min crypto trades found in {total_trades_found} total activities"
+                )
+                logger.info(
+                    f"    Hint: Make sure you have traded 15-min crypto markets (BTC/ETH/SOL/XRP)"
+                )
+
+        except Exception as e:
+            logger.error(f"ML sync from Polymarket failed: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+    def _process_trade_for_ml(self, trade_data: dict, source: str) -> str:
+        """
+        Process a single trade/position for ML learning.
+
+        Args:
+            trade_data: Trade or position data from API
+            source: Source type ("closed", "activity", "redeem")
+
+        Returns:
+            "synced" if successfully synced, "crypto" if crypto but already synced,
+            "skip" if not a 15-min crypto trade
+        """
+        try:
+            # Extract identifiers
+            condition_id = trade_data.get("conditionId", "")
+            outcome = trade_data.get("outcome", "")
+            timestamp = trade_data.get("timestamp", "")
+            tx_hash = trade_data.get("transactionHash", "")
+
+            # Create unique key for deduplication
+            trade_key = f"{condition_id}:{outcome}:{timestamp}:{tx_hash}"
+
+            # Skip if already synced
+            if trade_key in self._synced_trades:
+                return "skip"
+
+            # Extract market info
+            slug = trade_data.get("slug", "") or trade_data.get("eventSlug", "")
+            title = trade_data.get("title", "")
+            slug_lower = slug.lower()
+            title_lower = title.lower()
+
+            # Comprehensive 15-min crypto market detection
+            is_15min = any(p in slug_lower or p in title_lower for p in [
+                "updown-15m", "-15m-", "15min", "15-min", "15m",
+                "up-down-15m", "updown15m", "crypto-15"
+            ])
+
+            if not is_15min:
+                return "skip"
+
+            # Identify asset
+            asset = None
+            asset_patterns = {
+                "btc": "BTC", "bitcoin": "BTC",
+                "eth": "ETH", "ethereum": "ETH",
+                "sol": "SOL", "solana": "SOL",
+                "xrp": "XRP", "ripple": "XRP",
+            }
+            for pattern, asset_name in asset_patterns.items():
+                if pattern in slug_lower or pattern in title_lower:
+                    asset = asset_name
+                    break
+
+            if not asset:
+                return "skip"
+
+            # Get side (Up/Down)
+            if isinstance(outcome, str):
+                outcome_lower = outcome.lower()
+                if "up" in outcome_lower:
+                    side = Side.UP
+                elif "down" in outcome_lower:
+                    side = Side.DOWN
+                else:
+                    return "skip"
+            else:
+                return "skip"
+
+            # Determine win/loss based on source
+            won = None
+
+            if source == "closed":
+                # Closed positions have realized P&L
+                realized_pnl = float(trade_data.get("realizedPnl", 0) or 0)
+                won = realized_pnl > 0
+
+            elif source == "redeem":
+                # Redeems are always wins (you only redeem winning positions)
+                won = True
+
+            elif source == "activity":
+                # Trade activity - check if we can determine outcome
+                # For BUY trades, we need to check if the market settled in our favor
+                trade_side = trade_data.get("side", "")
+                if trade_side == "SELL":
+                    # SELL means we closed a position - check P&L from usdcSize vs size*price
+                    size = float(trade_data.get("size", 0) or 0)
+                    price = float(trade_data.get("price", 0) or 0)
+                    usdc_size = float(trade_data.get("usdcSize", 0) or 0)
+                    # If we sold, the P&L depends on our entry price (unknown)
+                    # Skip for now - closed positions will capture this
+                    return "crypto"
+                else:
+                    # BUY trade - need to check settlement
+                    # Skip for now - will be captured when position closes
+                    return "crypto"
+
+            if won is None:
+                return "crypto"
+
+            # Get trade details
+            avg_price = float(trade_data.get("avgPrice", 0) or trade_data.get("price", 0) or 0)
+            total_bought = float(trade_data.get("totalBought", 0) or trade_data.get("size", 0) or 0)
+
+            if avg_price <= 0 or total_bought <= 0:
+                return "skip"
+
+            # Create mock signal for ML recording
+            from types import SimpleNamespace
+
+            # ============================================================
+            # ENHANCED FEATURE EXTRACTION (same as learn_from_trader.py)
+            # ============================================================
+
+            # 1. Entry price deviation from 0.50 (market mid-point)
+            price_deviation = avg_price - 0.50
+
+            # 2. Estimate edge based on entry price and outcome
+            estimated_edge = (1.0 - avg_price) if won else (avg_price - 1.0)
+            estimated_edge = max(0.01, min(0.50, abs(estimated_edge)))
+
+            # 3. Position sizing (normalize by typical size)
+            position_size_normalized = min(total_bought / 100, 1.0)
+
+            # 4. Price momentum inference
+            inferred_momentum = 0.2 if (side == Side.UP and won) or (side == Side.DOWN and not won) else -0.2
+
+            # 5. Infer volatility from entry price
+            inferred_volatility = 0.5 - abs(price_deviation)
+            inferred_volatility = max(0.01, inferred_volatility * 0.1)
+
+            # 6. Distance from fair value (0.50)
+            distance_from_fair = abs(price_deviation)
+
+            fake_signal = SimpleNamespace(
+                edge=estimated_edge,
+                market=SimpleNamespace(
+                    asset=asset,
+                    condition_id="",
+                    target_price=1.0,
+                    time_remaining=450,
+                    best_bid=avg_price - 0.01,
+                    best_ask=avg_price + 0.01,
+                    bid_depth=1000 * position_size_normalized,
+                    ask_depth=1000 * position_size_normalized,
+                ),
+                side=side,
+                _arb_type="synced",
+                recommended_price=avg_price,
+                size_shares=total_bought,
+                size_usd=total_bought * avg_price,
+                time_remaining=450,
+            )
+
+            # Record to ML model with enhanced features
+            self.ml_predictor.record_outcome(
+                signal=fake_signal,
+                volatility=inferred_volatility,
+                price_momentum=inferred_momentum,
+                won=won,
+                arb_type="synced",
+                spread=0.02,
+                bid_depth=1000 * position_size_normalized,
+                ask_depth=1000 * position_size_normalized,
+                price_trend=inferred_momentum * 0.5,
+                distance_from_target=distance_from_fair,
+                binance_lead_pct=inferred_momentum * 0.005,
+                binance_confirmation="MEDIUM" if abs(inferred_momentum) > 0.1 else "NONE",
+                trend_1h=inferred_momentum * 0.3,
+                trend_4h=inferred_momentum * 0.2,
+                trend_1d=inferred_momentum * 0.1,
+                current_price=avg_price,
+                target_price=0.50,
+                price_high=avg_price + inferred_volatility,
+                price_low=avg_price - inferred_volatility,
+                price_velocity=abs(inferred_momentum) * 0.01,
+            )
+
+            # Mark as synced
+            self._synced_trades.add(trade_key)
+
+            result_str = "✓ WIN" if won else "✗ LOSS"
+            result_icon = "🟢" if won else "🔴"
+            logger.info(f"     {result_icon} ML +1: {asset} {side.value:4} {result_str} (from {source})")
+
+            return "synced"
+
+        except Exception as e:
+            logger.debug(f"Error processing trade for ML: {e}")
+            return "skip"
+
+    def _process_clob_trade_for_ml(self, trade: dict) -> str:
+        """
+        Process a CLOB trade for ML learning.
+
+        CLOB trades have format:
+        {
+            "id": "trade_id",
+            "market": "condition_id",
+            "asset_id": "token_id",
+            "side": "BUY" or "SELL",
+            "size": "100.5",
+            "price": "0.55",
+            "status": "MATCHED",
+            "match_time": "1234567890",
+            "outcome": "Yes" or "No" or "Up" or "Down",
+            "taker_order_id": "...",
+            "maker_address": "0x...",
+            "fee_rate_bps": "0",
+            ...
+        }
+
+        Args:
+            trade: CLOB trade data
+
+        Returns:
+            "synced" if successfully synced, "crypto" if crypto but needs settlement,
+            "skip" if not a 15-min crypto trade
+        """
+        try:
+            trade_id = trade.get("id", "")
+            market_id = trade.get("market", "")
+            asset_id = trade.get("asset_id", "")
+            match_time = trade.get("match_time", "")
+
+            # Create unique key
+            trade_key = f"clob:{trade_id}:{market_id}:{match_time}"
+
+            if trade_key in self._synced_trades:
+                return "skip"
+
+            # Try to identify if this is a 15-min crypto market
+            # CLOB trades don't have slug, so we need to check the market
+            outcome = trade.get("outcome", "")
+            side_str = trade.get("side", "")
+            price = float(trade.get("price", 0) or 0)
+            size = float(trade.get("size", 0) or 0)
+
+            if price <= 0 or size <= 0:
+                return "skip"
+
+            # Determine side from outcome (Up/Down for 15-min crypto markets)
+            outcome_lower = outcome.lower()
+            side = None
+            if outcome_lower in ["yes", "up"]:
+                side = Side.UP
+            elif outcome_lower in ["no", "down"]:
+                side = Side.DOWN
+            else:
+                return "skip"  # Not a 15-min crypto market
+
+            # For CLOB trades, we need to determine the asset
+            # First check if we have this market in our known markets
+            market = self.markets.get(market_id) or self.expiring_markets.get(market_id)
+            asset = None
+
+            if market:
+                # We have market info cached
+                asset = market.asset
+            else:
+                # Initialize market lookup cache if needed
+                if not hasattr(self, '_market_lookup_cache'):
+                    self._market_lookup_cache = {}
+
+                # Check cache first
+                if market_id in self._market_lookup_cache:
+                    cached = self._market_lookup_cache[market_id]
+                    if cached:
+                        asset = cached.get("asset")
+                else:
+                    # Look up market from Gamma API
+                    try:
+                        market_info = self.gamma_api.get_market_by_id(market_id)
+                        if market_info:
+                            slug = market_info.get("slug", "").lower()
+                            question = market_info.get("question", "").lower()
+
+                            # Check if this is a 15-min crypto market
+                            is_15min = any(p in slug or p in question for p in [
+                                "updown-15m", "-15m-", "15min", "15-min", "15m",
+                                "up-down-15m", "updown15m"
+                            ])
+
+                            if is_15min:
+                                # Identify asset from slug or question
+                                for pattern, asset_name in [
+                                    ("btc", "BTC"), ("bitcoin", "BTC"),
+                                    ("eth", "ETH"), ("ethereum", "ETH"),
+                                    ("sol", "SOL"), ("solana", "SOL"),
+                                    ("xrp", "XRP"), ("ripple", "XRP"),
+                                ]:
+                                    if pattern in slug or pattern in question:
+                                        asset = asset_name
+                                        break
+
+                            # Cache the result (even if not 15-min, to avoid re-lookup)
+                            self._market_lookup_cache[market_id] = {
+                                "asset": asset,
+                                "is_15min": is_15min,
+                                "slug": slug,
+                            }
+                        else:
+                            # Cache negative result
+                            self._market_lookup_cache[market_id] = None
+                    except Exception as e:
+                        logger.debug(f"Market lookup failed for {market_id[:16]}...: {e}")
+                        self._market_lookup_cache[market_id] = None
+
+            if not asset:
+                return "skip"
+
+            # For CLOB trades, we can't directly determine win/loss without settlement
+            # But we can track BUY trades and check if they've settled
+            if side_str == "SELL":
+                # SELL means closing position - this could be early exit or settlement
+                # Check if this was profitable (price > 0.5 for long, price < 0.5 for short)
+                # This is a heuristic since we don't have perfect info
+                if side == Side.UP:
+                    won = price > 0.5  # If we sold UP for > 0.5, likely winning
+                else:
+                    won = price < 0.5  # If we sold DOWN for < 0.5, likely winning
+            else:
+                # BUY - we need to wait for settlement to know outcome
+                # Skip for now, will be captured by closed-positions or redeem
+                return "crypto"
+
+            # ============================================================
+            # ENHANCED FEATURE EXTRACTION (same as learn_from_trader.py)
+            # ============================================================
+            from types import SimpleNamespace
+
+            # 1. Entry price deviation from 0.50 (market mid-point)
+            price_deviation = price - 0.50
+
+            # 2. Estimate edge based on entry price and outcome
+            estimated_edge = (1.0 - price) if won else (price - 1.0)
+            estimated_edge = max(0.01, min(0.50, abs(estimated_edge)))
+
+            # 3. Position sizing (normalize by typical size)
+            position_size_normalized = min(size / 100, 1.0)
+
+            # 4. Price momentum inference
+            inferred_momentum = 0.2 if (side == Side.UP and won) or (side == Side.DOWN and not won) else -0.2
+
+            # 5. Infer volatility from entry price
+            inferred_volatility = 0.5 - abs(price_deviation)
+            inferred_volatility = max(0.01, inferred_volatility * 0.1)
+
+            # 6. Distance from fair value (0.50)
+            distance_from_fair = abs(price_deviation)
+
+            fake_signal = SimpleNamespace(
+                edge=estimated_edge,
+                market=SimpleNamespace(
+                    asset=asset,
+                    condition_id="",
+                    target_price=1.0,
+                    time_remaining=450,
+                    best_bid=price - 0.01,
+                    best_ask=price + 0.01,
+                    bid_depth=1000 * position_size_normalized,
+                    ask_depth=1000 * position_size_normalized,
+                ),
+                side=side,
+                _arb_type="synced",
+                recommended_price=price,
+                size_shares=size,
+                size_usd=size * price,
+                time_remaining=450,
+            )
+
+            # Record to ML model with enhanced features
+            self.ml_predictor.record_outcome(
+                signal=fake_signal,
+                volatility=inferred_volatility,
+                price_momentum=inferred_momentum,
+                won=won,
+                arb_type="synced",
+                spread=0.02,
+                bid_depth=1000 * position_size_normalized,
+                ask_depth=1000 * position_size_normalized,
+                price_trend=inferred_momentum * 0.5,
+                distance_from_target=distance_from_fair,
+                binance_lead_pct=inferred_momentum * 0.005,
+                binance_confirmation="MEDIUM" if abs(inferred_momentum) > 0.1 else "NONE",
+                trend_1h=inferred_momentum * 0.3,
+                trend_4h=inferred_momentum * 0.2,
+                trend_1d=inferred_momentum * 0.1,
+                current_price=price,
+                target_price=0.50,
+                price_high=price + inferred_volatility,
+                price_low=price - inferred_volatility,
+                price_velocity=abs(inferred_momentum) * 0.01,
+            )
+
+            self._synced_trades.add(trade_key)
+
+            result_str = "✓ WIN" if won else "✗ LOSS"
+            result_icon = "🟢" if won else "🔴"
+            logger.info(f"     {result_icon} ML +1: {asset} {side.value:4} {result_str} (from CLOB)")
+
+            return "synced"
+
+        except Exception as e:
+            logger.debug(f"Error processing CLOB trade for ML: {e}")
+            return "skip"
+
+    async def _sync_positions_from_polymarket(self):
+        """
+        Sync internal position tracking with actual Polymarket positions.
+
+        Removes stale positions that no longer exist on Polymarket.
+        This prevents the bot from blocking new trades due to ghost positions.
+        """
+        if not self.client:
+            return
+
+        try:
+            # Get wallet address
+            wallet_address = self.client.get_address()
+            if not wallet_address:
+                return
+
+            # Initialize Data API
+            data_api = get_data_api()
+
+            # Get current positions from Polymarket
+            api_positions = data_api.get_positions(wallet_address, limit=100, size_threshold=0.1)
+
+            # Build set of condition IDs that actually have positions
+            api_condition_ids = set()
+            for pos in api_positions:
+                cid = pos.get("conditionId", "")
+                if cid:
+                    api_condition_ids.add(cid)
+
+            # Check internal positions against API
+            internal_positions = list(self.risk_manager.positions.keys())
+            cleared_count = 0
+
+            for market_key in internal_positions:
+                if market_key not in api_condition_ids:
+                    # Position exists internally but not on Polymarket - it's been settled
+                    position = self.risk_manager.positions.get(market_key)
+                    if position:
+                        asset = position.market.asset if hasattr(position, 'market') else "???"
+                        side = position.side.value if hasattr(position, 'side') else "???"
+
+                        logger.info(
+                            f"🧹 Clearing stale position: {asset} {side} | "
+                            f"Not found on Polymarket"
+                        )
+
+                        # Remove from risk manager (assume break-even if unknown)
+                        self.risk_manager.positions.pop(market_key, None)
+                        cleared_count += 1
+
+                        # Also clear any asset-level tracking
+                        if hasattr(self, '_api_positions') and asset in self._api_positions:
+                            del self._api_positions[asset]
+
+            if cleared_count > 0:
+                logger.info(f"🧹 Cleared {cleared_count} stale positions from tracking")
+
+        except Exception as e:
+            logger.debug(f"Position sync failed: {e}")
 
     async def _process_market(self, market: MarketState):
         """
@@ -1641,14 +2844,33 @@ class TradingBot:
             self._update_market_from_orderbook(market)
             return
 
-        # Check Binance price availability (used for confirmation signal - OPTIONAL)
+        # Check Binance price availability (used for confirmation signal - optional)
         binance_price = self.signal_generator.get_binance_price(market.asset)
         chainlink_price = self.signal_generator.get_price(market.asset)
 
-        # NOTE: Binance is optional - it provides confirmation signals but trading
-        # can proceed without it. Only Chainlink is required (for settlement).
+        # CRITICAL: Validate target price before trading
+        # After period transitions, the API may return stale target prices
+        if chainlink_price and market.target_price:
+            target_deviation = abs(chainlink_price - market.target_price) / market.target_price
+            # For a 15-min market, target price should be within ~5% of current price
+            # (crypto can move, but >5% in 15 mins is very unusual and suggests stale data)
+            max_deviation = 0.05  # 5% max deviation
+            if target_deviation > max_deviation:
+                stale_key = f"{market.condition_id}:stale_target"
+                if stale_key not in self._logged_rejections:
+                    self._logged_rejections.add(stale_key)
+                    logger.warning(
+                        f"⚠️ [{market.asset}] STALE TARGET PRICE DETECTED! "
+                        f"Target ${market.target_price:,.2f} deviates {target_deviation:.1%} "
+                        f"from Chainlink ${chainlink_price:,.2f} (max {max_deviation:.0%}). "
+                        f"Skipping trades until target price updates."
+                    )
+                return
 
-        # Log price comparison when both feeds available
+        # Binance is optional - used for confirmation signal boost, not required
+        # The signal generator handles missing Binance data gracefully
+
+        # Log price comparison when both prices are available
         if chainlink_price and binance_price:
             lead = binance_price - chainlink_price
             lead_pct = (lead / chainlink_price) * 100 if chainlink_price else 0
@@ -1670,25 +2892,33 @@ class TradingBot:
             logger.debug(f"SKIP {market.asset}: {signal.reasoning}")
             return
 
+        # Log signal details for debugging (only for actionable signals)
+        arb_type = getattr(signal, '_arb_type', 'probability')
+        logger.info(
+            f"📡 SIGNAL [{market.asset}]: {signal.side.value} | "
+            f"Edge: {signal.edge:.1%} | Type: {arb_type} | "
+            f"Size: ${signal.size_usd:.2f} | Action: {signal.recommended_action.value}"
+        )
+
         # Validate signal against risk limits
+        logger.info(f"[{market.asset}] ✓1 Risk validation")
         is_valid, reason = self.risk_manager.validate_signal(signal)
         if not is_valid:
-            # Only log each rejection reason once per market to avoid spam
+            # Always log the blocking reason (cleared every 30s to avoid spam)
             rejection_key = f"{market.condition_id}:{reason}"
             if rejection_key not in self._logged_rejections:
                 self._logged_rejections.add(rejection_key)
-                logger.info(f"[{market.asset}] Blocked: {reason}")
-            return
-
-        # Adjust size if needed
-        signal = self.risk_manager.adjust_signal_size(signal)
-
-        # Check if signal was rejected due to size
-        if signal.size_usd <= 0 or signal.size_shares <= 0:
-            logger.debug(f"Signal for {market.asset} rejected: size too small")
+                logger.info(
+                    f"[{market.asset}] ❌ BLOCKED: {reason} | "
+                    f"Bankroll: ${self.risk_manager.current_bankroll:.2f} | "
+                    f"Positions: {len(self.risk_manager.positions)}"
+                )
+            else:
+                logger.info(f"[{market.asset}] ⏸️ BLOCKED (repeat): {reason}")
             return
 
         # Trade history filter - check past performance for this asset/side
+        logger.info(f"[{market.asset}] ✓2 History filter")
         trade_history = get_trade_history()
         should_proceed, history_reason = trade_history.evaluate_trade(
             asset=market.asset,
@@ -1702,10 +2932,14 @@ class TradingBot:
             rejection_key = f"{market.condition_id}:history:{signal.side.value}"
             if rejection_key not in self._logged_rejections:
                 self._logged_rejections.add(rejection_key)
-                logger.info(f"[{market.asset}] 📊 History block: {history_reason}")
+                logger.info(f"[{market.asset}] ❌ HISTORY BLOCK: {history_reason}")
+            else:
+                logger.info(f"[{market.asset}] ⏸️ HISTORY (repeat): {history_reason}")
             return
 
-        # ML filter - check predicted win probability
+        # ML filter - check predicted win probability (do this BEFORE sizing for Kelly)
+        logger.info(f"[{market.asset}] ✓3 ML filter")
+        ml_confidence = None
         if self.ml_predictor:
             # Extract all ML features using the helper function
             ml_features = extract_ml_features_from_market(
@@ -1722,8 +2956,13 @@ class TradingBot:
                 rejection_key = f"{market.condition_id}:ml"
                 if rejection_key not in self._logged_rejections:
                     self._logged_rejections.add(rejection_key)
-                    logger.info(f"[{market.asset}] 🤖 {ml_reason}")
+                    logger.info(f"[{market.asset}] ❌ ML BLOCK: {ml_reason} | Confidence: {confidence:.1%}")
+                else:
+                    logger.info(f"[{market.asset}] ⏸️ ML (repeat): {ml_reason} | Conf: {confidence:.1%}")
                 return
+
+            # Store ML confidence for Kelly sizing
+            ml_confidence = confidence
 
             # Store all ML data with signal for outcome recording
             signal._ml_volatility = ml_features["volatility"]
@@ -1735,8 +2974,38 @@ class TradingBot:
             signal._ml_ask_depth = ml_features["ask_depth"]
             signal._ml_price_trend = ml_features["price_trend"]
             signal._ml_distance_from_target = ml_features["distance_from_target"]
+            signal._ml_binance_lead_pct = ml_features.get("binance_lead_pct", 0.0)
+            signal._ml_binance_confirmation = ml_features.get("binance_confirmation", "NONE")
+            signal._ml_trend_1h = ml_features.get("trend_1h", 0.0)
+            signal._ml_trend_4h = ml_features.get("trend_4h", 0.0)
+            signal._ml_trend_1d = ml_features.get("trend_1d", 0.0)
+
+        # Adjust size using Kelly criterion (with ML confidence for optimal sizing)
+        logger.info(f"[{market.asset}] ✓4 Kelly sizing (conf: {ml_confidence})")
+        signal = self.risk_manager.adjust_signal_size(
+            signal,
+            ml_confidence=ml_confidence,
+            use_kelly=True,
+        )
+
+        # Check if signal was rejected due to size
+        logger.info(f"[{market.asset}] ✓5 Size: ${signal.size_usd:.2f} ({signal.size_shares:.1f} shares)")
+        if signal.size_usd <= 0 or signal.size_shares <= 0:
+            size_key = f"{market.condition_id}:size_too_small"
+            if size_key not in self._logged_rejections:
+                self._logged_rejections.add(size_key)
+                max_size = self.risk_manager.current_bankroll * self.config.trading.max_position_pct
+                logger.info(
+                    f"[{market.asset}] ❌ SIZE TOO SMALL: "
+                    f"Max position ${max_size:.2f} (bankroll ${self.risk_manager.current_bankroll:.2f} × "
+                    f"{self.config.trading.max_position_pct:.0%}) < $3 minimum"
+                )
+            else:
+                logger.info(f"[{market.asset}] ⏸️ SIZE (repeat): too small")
+            return
 
         # Execute the signal
+        logger.info(f"[{market.asset}] ✓6 EXECUTING TRADE!")
         await self._execute_signal(signal)
 
     def _update_market_from_orderbook(self, market: MarketState):
@@ -1749,9 +3018,23 @@ class TradingBot:
             if up_book.best_ask is not None:
                 market.best_ask = up_book.best_ask
 
-            # Calculate depth
-            market.bid_depth = sum(level.size for level in up_book.bids)
-            market.ask_depth = sum(level.size for level in up_book.asks)
+            # Calculate depth - make thread-safe copies to avoid race conditions
+            # with WebSocket thread that may be modifying the orderbook
+            try:
+                bids_snapshot = list(up_book.bids)
+                asks_snapshot = list(up_book.asks)
+                # Validate sizes are numeric before summing (handle malformed data)
+                market.bid_depth = sum(
+                    level.size for level in bids_snapshot
+                    if hasattr(level, 'size') and isinstance(level.size, (int, float))
+                )
+                market.ask_depth = sum(
+                    level.size for level in asks_snapshot
+                    if hasattr(level, 'size') and isinstance(level.size, (int, float))
+                )
+            except Exception as e:
+                logger.debug(f"[{market.asset}] Orderbook depth calc error: {e}")
+                # Keep previous depth values on error
 
         market.last_updated = datetime.now(timezone.utc)
 
@@ -1839,9 +3122,13 @@ class TradingBot:
 
     def _log_position_status(self):
         """
-        Log detailed position status including unrealized P&L.
+        Log detailed position status including all tracking state.
 
-        Called periodically (every 30s) to give visibility into position performance.
+        Called periodically (every 30s) to give visibility into:
+        - Tracked positions (risk_manager.positions)
+        - API-discovered positions (_api_positions)
+        - Pending orders (_pending_orders)
+        - Active cooldowns (_last_order_time)
         """
         now = datetime.now(timezone.utc)
 
@@ -1853,54 +3140,175 @@ class TradingBot:
         self.last_position_log = now
 
         positions = self.risk_manager.positions
-        if not positions:
-            return  # Nothing to log
+        api_positions = getattr(self, '_api_positions', {})
+        pending_orders = getattr(self, '_pending_orders', {})
 
         # Calculate equity
         equity = self._calculate_equity()
         cash = self.risk_manager.current_bankroll
         unrealized_total = equity - cash
 
-        logger.info(f"{Colors.BRIGHT_CYAN}📊 POSITION STATUS{Colors.RESET}")
+        # Format P&L
+        if unrealized_total > 0:
+            pnl_color = Colors.BRIGHT_GREEN
+            pnl_icon = "📈"
+        elif unrealized_total < 0:
+            pnl_color = Colors.BRIGHT_RED
+            pnl_icon = "📉"
+        else:
+            pnl_color = Colors.DIM
+            pnl_icon = "➖"
+
+        # Box header
+        box_width = 64
+        logger.info(f"{Colors.BRIGHT_CYAN}┌{'─' * box_width}┐{Colors.RESET}")
+        logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  📊 POSITION STATUS                                              {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+        logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * box_width}┤{Colors.RESET}")
+
+        # Account summary line
         logger.info(
-            f"   Cash: ${cash:.2f} | Unrealized: ${unrealized_total:+.2f} | "
-            f"Equity: ${equity:.2f}"
+            f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  💰 Cash: {Colors.BRIGHT_WHITE}${cash:>10.2f}{Colors.RESET}  │  "
+            f"💎 Equity: {Colors.BRIGHT_WHITE}${equity:>10.2f}{Colors.RESET}  │  "
+            f"{pnl_icon} P&L: {pnl_color}${unrealized_total:>+9.2f}{Colors.RESET}  {Colors.BRIGHT_CYAN}│{Colors.RESET}"
         )
 
-        for market_key, position in positions.items():
-            market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
-            asset = position.market.asset if hasattr(position, 'market') else "???"
-            side = position.side.value
+        # Counts summary
+        pos_count = len(positions)
+        api_count = len(api_positions)
+        pending_count = len(pending_orders)
+        logger.info(
+            f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  📦 Positions: {Colors.BRIGHT_YELLOW}{pos_count}{Colors.RESET}  │  "
+            f"🔗 API: {Colors.BRIGHT_YELLOW}{api_count}{Colors.RESET}  │  "
+            f"⏳ Pending: {Colors.BRIGHT_YELLOW}{pending_count}{Colors.RESET}                       {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+        )
+        logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * box_width}┤{Colors.RESET}")
 
-            # Calculate unrealized P&L
-            current_price = None
-            if market:
-                if position.side == Side.UP:
-                    current_price = market.best_bid
-                else:
-                    current_price = 1.0 - market.best_ask if market.best_ask else None
+        # Log tracked positions with P&L and win probability
+        if positions:
+            for market_key, position in positions.items():
+                market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
+                asset = position.market.asset if hasattr(position, 'market') else "???"
+                side = position.side.value
 
-            if current_price and current_price > 0:
-                current_value = position.shares * current_price
-                unrealized_pnl = current_value - position.cost_basis
-                pnl_pct = (current_price - position.entry_price) / position.entry_price
-
-                # Color based on P&L
-                pnl_color = Colors.BRIGHT_GREEN if unrealized_pnl > 0 else Colors.BRIGHT_RED
-
-                # Time remaining
+                # Get Chainlink price and calculate win probability
+                chainlink_price = self.signal_generator.get_price(asset) if hasattr(self, 'signal_generator') else None
+                target_price = market.target_price if market else None
                 time_remaining = market.time_remaining if market else 0
+                our_win_prob = 0.5  # Default
 
+                if chainlink_price and target_price and market:
+                    # Calculate real-time win probability
+                    from .probability import calculate_true_probability
+                    volatility = self.signal_generator.get_volatility(asset)
+                    true_prob_up = calculate_true_probability(
+                        current_price=chainlink_price,
+                        target_price=target_price,
+                        time_remaining_sec=market.time_remaining,
+                        volatility_15min=volatility,
+                    )
+                    # Our win probability depends on our side
+                    our_win_prob = true_prob_up if side == "UP" else (1 - true_prob_up)
+
+                # Color and icon based on probability
+                if our_win_prob >= 0.7:
+                    prob_color = Colors.BRIGHT_GREEN
+                    prob_icon = "🟢"
+                elif our_win_prob >= 0.5:
+                    prob_color = Colors.BRIGHT_YELLOW
+                    prob_icon = "🟡"
+                else:
+                    prob_color = Colors.BRIGHT_RED
+                    prob_icon = "🔴"
+
+                # Calculate P&L - use settlement price for expired markets
+                current_market_price = None
+                if market:
+                    if time_remaining <= 0 and our_win_prob >= 0.99:
+                        current_market_price = 1.0
+                    elif time_remaining <= 0 and our_win_prob <= 0.01:
+                        current_market_price = 0.0
+                    else:
+                        if position.side == Side.UP:
+                            current_market_price = market.best_bid
+                        else:
+                            current_market_price = 1.0 - market.best_ask if market.best_ask else None
+
+                if current_market_price is not None and current_market_price >= 0:
+                    unrealized_pnl = (current_market_price - position.entry_price) * position.shares
+                    pnl_pct = ((current_market_price - position.entry_price) / position.entry_price * 100) if position.entry_price > 0 else 0
+                    pnl_color = Colors.BRIGHT_GREEN if unrealized_pnl > 0 else Colors.BRIGHT_RED
+
+                    # Format time remaining
+                    if time_remaining > 60:
+                        time_str = f"{int(time_remaining // 60)}m {int(time_remaining % 60)}s"
+                    else:
+                        time_str = f"{int(time_remaining)}s"
+
+                    # Settlement indicator
+                    status_str = "⏰ SETTLING" if time_remaining <= 0 else f"⏱️  {time_str}"
+
+                    # Side arrow
+                    side_arrow = "▲" if side == "UP" else "▼"
+                    side_color = Colors.BRIGHT_GREEN if side == "UP" else Colors.BRIGHT_RED
+
+                    logger.info(
+                        f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {side_color}{side_arrow} {asset:4}{Colors.RESET} │ "
+                        f"{position.shares:>6.1f} @ {position.entry_price:.3f} → {current_market_price:.3f} │ "
+                        f"{pnl_color}{unrealized_pnl:>+7.2f} ({pnl_pct:>+5.0f}%){Colors.RESET} │ "
+                        f"{prob_color}{prob_icon} {our_win_prob:>3.0%}{Colors.RESET} │ {status_str}  {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+                    )
+                else:
+                    side_arrow = "▲" if side == "UP" else "▼"
+                    side_color = Colors.BRIGHT_GREEN if side == "UP" else Colors.BRIGHT_RED
+                    logger.info(
+                        f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {side_color}{side_arrow} {asset:4}{Colors.RESET} │ "
+                        f"{position.shares:>6.1f} @ {position.entry_price:.3f}        │ "
+                        f"{'(no price)':^16} │ "
+                        f"{prob_color}{prob_icon} {our_win_prob:>3.0%}{Colors.RESET} │ ...      {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+                    )
+        else:
+            logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {Colors.DIM}No active positions{Colors.RESET}                                            {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+
+        # Log API-discovered positions (if any not already tracked)
+        tracked_assets = [p.market.asset for p in positions.values() if hasattr(p, 'market')]
+        untracked_api = {k: v for k, v in api_positions.items() if k not in tracked_assets}
+        if untracked_api:
+            logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * 64}┤{Colors.RESET}")
+            logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  🔗 API Positions (untracked):                                   {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+            for asset, pos_info in untracked_api.items():
                 logger.info(
-                    f"   {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} → "
-                    f"{current_price:.2f} | {pnl_color}P&L: ${unrealized_pnl:+.2f} ({pnl_pct:+.0%}){Colors.RESET} | "
-                    f"Time: {time_remaining:.0f}s"
+                    f"{Colors.BRIGHT_CYAN}│{Colors.RESET}     {asset}: {pos_info.get('size', 0):.1f} shares @ "
+                    f"${pos_info.get('price', 0):.2f}                                {Colors.BRIGHT_CYAN}│{Colors.RESET}"
                 )
-            else:
+
+        # Log pending orders
+        if pending_orders:
+            logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * 64}┤{Colors.RESET}")
+            logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  ⏳ Pending Orders:                                               {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+            for order_id, order_data in pending_orders.items():
+                asset = order_data.get("asset", "???")
+                side = order_data.get("side", "???")
+                size = order_data.get("size", 0)
                 logger.info(
-                    f"   {asset} {side}: {position.shares:.1f} shares @ {position.entry_price:.2f} | "
-                    f"(no price data)"
+                    f"{Colors.BRIGHT_CYAN}│{Colors.RESET}     {asset} {side}: {size:.1f} shares │ "
+                    f"Order: {order_id[:12]}...                   {Colors.BRIGHT_CYAN}│{Colors.RESET}"
                 )
+
+        # Log active cooldowns
+        active_cooldowns = []
+        for asset, last_time in self._last_order_time.items():
+            elapsed = (now - last_time).total_seconds()
+            remaining = self._order_cooldown_seconds - elapsed
+            if remaining > 0:
+                active_cooldowns.append(f"{asset}:{remaining:.0f}s")
+
+        if active_cooldowns:
+            logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * 64}┤{Colors.RESET}")
+            cooldown_str = ", ".join(active_cooldowns)
+            logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  ⏱️  Cooldowns: {cooldown_str:<48}{Colors.BRIGHT_CYAN}│{Colors.RESET}")
+
+        # Box footer
+        logger.info(f"{Colors.BRIGHT_CYAN}└{'─' * 64}┘{Colors.RESET}")
 
     def _has_active_position(self, asset: str) -> bool:
         """
@@ -1948,18 +3356,33 @@ class TradingBot:
             elapsed = (now - self._last_order_time[asset]).total_seconds()
             if elapsed < self._order_cooldown_seconds:
                 remaining = self._order_cooldown_seconds - elapsed
-                logger.debug(f"[{asset}] Cooldown: {remaining:.0f}s remaining")
+                # Log once per cooldown period at INFO level so user knows why trades aren't executing
+                cooldown_key = f"{signal.market.condition_id}:cooldown"
+                if cooldown_key not in self._logged_rejections:
+                    self._logged_rejections.add(cooldown_key)
+                    logger.info(f"[{asset}] ❌ COOLDOWN: {remaining:.0f}s remaining (last order {elapsed:.0f}s ago)")
                 return
 
         # Check for existing positions from API (prevents duplicate trades)
         if self._has_active_position(asset):
-            logger.debug(f"[{asset}] Already has active position - skipping")
+            # Log at INFO level - this is an important reason trades aren't executing
+            position_key = f"{signal.market.condition_id}:active_position"
+            if position_key not in self._logged_rejections:
+                self._logged_rejections.add(position_key)
+                logger.info(f"[{asset}] ❌ ACTIVE POSITION: Already has position - skipping signal")
             return
 
         # Check if we have enough balance before attempting
         available = self.risk_manager.current_bankroll * 0.90  # 10% buffer
         if signal.size_usd > available:
-            logger.debug(f"[{asset}] Insufficient balance: need ${signal.size_usd:.2f}, have ${available:.2f}")
+            # Log at INFO level - insufficient balance is critical info
+            balance_key = f"{signal.market.condition_id}:balance"
+            if balance_key not in self._logged_rejections:
+                self._logged_rejections.add(balance_key)
+                logger.info(
+                    f"[{asset}] ❌ INSUFFICIENT BALANCE: Need ${signal.size_usd:.2f}, "
+                    f"have ${available:.2f} (bankroll ${self.risk_manager.current_bankroll:.2f})"
+                )
             # Set a short cooldown to prevent spam
             self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
             return
@@ -1967,6 +3390,37 @@ class TradingBot:
         # Get current price for logging
         current_price = self.signal_generator.get_price(signal.market.asset)
         target = signal.market.target_price
+
+        # FINAL SAFETY CHECK: Validate target price at execution time
+        # This catches any stale target prices that slipped through earlier checks
+        if current_price and target:
+            deviation = abs(current_price - target) / target
+            # Calculate how long into the current period we are
+            current_ts = int(now.timestamp())
+            period_start = (current_ts // 900) * 900
+            seconds_into_period = current_ts - period_start
+
+            # In the first 60 seconds of a period, be extra strict about target price
+            # The target should be VERY close to current price at period start
+            if seconds_into_period < 60:
+                max_deviation = 0.02  # Only 2% deviation allowed in first 60 seconds
+                if deviation > max_deviation:
+                    logger.warning(
+                        f"⚠️ [{asset}] BLOCKING TRADE - Target price ${target:,.2f} "
+                        f"deviates {deviation:.1%} from Chainlink ${current_price:,.2f} "
+                        f"({seconds_into_period}s into period). Likely stale price from previous period."
+                    )
+                    return
+            else:
+                # After 60 seconds, use 5% threshold
+                max_deviation = 0.05
+                if deviation > max_deviation:
+                    logger.warning(
+                        f"⚠️ [{asset}] BLOCKING TRADE - Target price ${target:,.2f} "
+                        f"deviates {deviation:.1%} from Chainlink ${current_price:,.2f}. "
+                        f"Target price may be stale."
+                    )
+                    return
 
         # Log positions BEFORE trade
         api_pos_count = len(self._api_positions) if hasattr(self, '_api_positions') else 0
@@ -1976,11 +3430,57 @@ class TradingBot:
             f"Tracked positions={risk_pos_count} | Bankroll=${self.risk_manager.current_bankroll:.2f}"
         )
 
+        # === DETAILED TRADE ANALYSIS LOG ===
+        arb_type = getattr(signal, '_arb_type', 'unknown')
+        ml_confidence = getattr(signal, '_ml_confidence', None)
+        binance_conf = getattr(signal, '_ml_binance_confirmation', 'NONE')
+        binance_lead = getattr(signal, '_ml_binance_lead_pct', 0) or 0
+
+        # Price analysis
+        price_vs_target = "ABOVE" if current_price and target and current_price >= target else "BELOW"
+        distance_pct = abs(current_price - target) / target * 100 if current_price and target else 0
+
+        logger.info(f"{Colors.BRIGHT_CYAN}╔══════════════════════════════════════════════════════════════╗{Colors.RESET}")
+        logger.info(f"{Colors.BRIGHT_CYAN}║  📊 TRADE ANALYSIS: {asset} {signal.side.value:4}{Colors.RESET}")
+        logger.info(f"{Colors.BRIGHT_CYAN}╠══════════════════════════════════════════════════════════════╣{Colors.RESET}")
+
+        # Why this trade?
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  🎯 Signal Type: {arb_type.upper()}")
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  📝 Reasoning: {signal.reasoning}")
+
+        # Price info
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  💰 Chainlink: ${current_price:,.2f} ({price_vs_target} target by {distance_pct:.2f}%)")
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  🎯 Target: ${target:,.2f}")
+
+        # Market prices
+        market = signal.market
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  📈 UP price: bid={market.best_bid:.3f} / ask={market.best_ask:.3f}")
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  📉 DOWN price: bid={1-market.best_ask:.3f} / ask={1-market.best_bid:.3f}")
+
+        # Edge calculation
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  ✨ Edge: {signal.edge:.1%} (min required: {self.config.trading.min_edge:.1%})")
+
+        # Binance confirmation
+        if binance_conf != "NONE":
+            logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  🔗 Binance: {binance_conf} confirmation (lead: {binance_lead:+.3f}%)")
+
+        # ML prediction
+        if ml_confidence:
+            logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  🤖 ML Confidence: {ml_confidence:.0%} win probability")
+
+        # Time remaining
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  ⏱️  Time left: {signal.time_remaining:.0f}s")
+
+        # Position size
+        logger.info(f"{Colors.BRIGHT_CYAN}║{Colors.RESET}  💵 Size: ${signal.size_usd:.2f} ({signal.size_shares:.2f} shares @ {signal.recommended_price:.3f})")
+
+        logger.info(f"{Colors.BRIGHT_CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
+
         # Log the trade attempt with colors
         direction = "▲" if signal.side == Side.UP else "▼"
         side_color = Colors.BRIGHT_GREEN if signal.side == Side.UP else Colors.BRIGHT_RED
         logger.info(
-            f"{side_color}>>> {asset} {signal.side.value} {direction}{Colors.RESET} │ "
+            f"{side_color}>>> EXECUTING: {asset} {signal.side.value} {direction}{Colors.RESET} │ "
             f"Edge: {Colors.BRIGHT_YELLOW}{signal.edge:.0%}{Colors.RESET} │ "
             f"${current_price:,.0f} vs ${target:,.0f} │ "
             f"${signal.size_usd:.2f}"
@@ -2003,6 +3503,11 @@ class TradingBot:
             ml_ask_depth = getattr(signal, '_ml_ask_depth', None)
             ml_price_trend = getattr(signal, '_ml_price_trend', None)
             ml_distance_from_target = getattr(signal, '_ml_distance_from_target', None)
+            ml_binance_lead_pct = getattr(signal, '_ml_binance_lead_pct', None)
+            ml_binance_confirmation = getattr(signal, '_ml_binance_confirmation', None)
+            ml_trend_1h = getattr(signal, '_ml_trend_1h', None)
+            ml_trend_4h = getattr(signal, '_ml_trend_4h', None)
+            ml_trend_1d = getattr(signal, '_ml_trend_1d', None)
 
             conf_str = f" (ML: {ml_confidence:.0%})" if ml_confidence else ""
             arb_str = f" [{ml_arb_type}]" if ml_arb_type and ml_arb_type != "none" else ""
@@ -2023,6 +3528,11 @@ class TradingBot:
                     ml_ask_depth=ml_ask_depth,
                     ml_price_trend=ml_price_trend,
                     ml_distance_from_target=ml_distance_from_target,
+                    ml_binance_lead_pct=ml_binance_lead_pct,
+                    ml_binance_confirmation=ml_binance_confirmation,
+                    ml_trend_1h=ml_trend_1h,
+                    ml_trend_4h=ml_trend_4h,
+                    ml_trend_1d=ml_trend_1d,
                 )
 
                 # Record in trade history
@@ -2058,9 +3568,10 @@ class TradingBot:
                 self._pending_orders[result.order_id] = {
                     "signal": signal,
                     "asset": asset,
+                    "side": signal.side.value,  # "UP" or "DOWN"
                     "placed_time": now,
                     "price": signal.recommended_price,
-                    "size_shares": signal.size_shares,
+                    "size": signal.size_shares,  # For display in status logs
                     "ml_volatility": ml_volatility,
                     "ml_momentum": ml_momentum,
                     "ml_confidence": ml_confidence,
@@ -2070,6 +3581,11 @@ class TradingBot:
                     "ml_ask_depth": ml_ask_depth,
                     "ml_price_trend": ml_price_trend,
                     "ml_distance_from_target": ml_distance_from_target,
+                    "ml_binance_lead_pct": ml_binance_lead_pct,
+                    "ml_binance_confirmation": ml_binance_confirmation,
+                    "ml_trend_1h": ml_trend_1h,
+                    "ml_trend_4h": ml_trend_4h,
+                    "ml_trend_1d": ml_trend_1d,
                 }
 
                 logger.info(

@@ -90,7 +90,11 @@ class TradeHistory:
         self.trades.append(asdict(trade))
         self._save_history()
 
-        logger.debug(f"Trade recorded: {asset} {side} @ {entry_price:.4f}")
+        logger.info(
+            f"📝 TRADE RECORDED: {asset} {side} @ {entry_price:.4f} | "
+            f"Shares: {shares:.2f} | Target: ${target_price:,.2f} | "
+            f"Total trades: {len(self.trades)}"
+        )
         return str(len(self.trades) - 1)
 
     def record_close(
@@ -116,10 +120,20 @@ class TradeHistory:
                 trade["pnl"] = pnl
                 trade["exit_price"] = exit_price
                 self._save_history()
-                logger.debug(f"Trade closed: {trade['asset']} {trade['side']} - {'WIN' if won else 'LOSS'}")
+
+                # Count completed trades
+                completed = sum(1 for t in self.trades if t.get("actual_outcome") is not None)
+                wins = sum(1 for t in self.trades if t.get("actual_outcome") == "WIN")
+
+                result_emoji = "✅" if won else "❌"
+                logger.info(
+                    f"📝 TRADE CLOSED: {trade['asset']} {trade['side']} {result_emoji} | "
+                    f"P&L: ${pnl:+.2f} | "
+                    f"Record: {wins}W/{completed - wins}L ({wins/completed:.0%} win rate)"
+                )
                 return
 
-        logger.warning(f"Could not find open trade for market {market_id}")
+        logger.warning(f"Could not find open trade for market {market_id} - trade history may be incomplete")
 
     def get_stats(self) -> dict:
         """Get overall trading statistics."""
@@ -399,15 +413,17 @@ class TradeHistory:
         }
 
     def _save_history(self):
-        """Save history to disk."""
+        """Save history to disk immediately."""
         try:
             with open(self.history_path, "w") as f:
                 json.dump({
                     "trades": self.trades,
                     "last_updated": datetime.now(timezone.utc).isoformat(),
                 }, f, indent=2)
+                f.flush()  # Force write to disk
+            logger.debug(f"Trade history saved: {len(self.trades)} trades → {self.history_path}")
         except Exception as e:
-            logger.error(f"Failed to save trade history: {e}")
+            logger.error(f"Failed to save trade history to {self.history_path}: {e}")
 
     def _load_history(self):
         """Load history from disk."""
