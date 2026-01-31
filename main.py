@@ -83,6 +83,12 @@ Environment Variables:
         help="Base position size in USD",
     )
 
+    parser.add_argument(
+        "--reset-drawdown",
+        action="store_true",
+        help="Reset drawdown tracking (set peak to current balance)",
+    )
+
     return parser.parse_args()
 
 
@@ -150,6 +156,11 @@ async def main():
 
     # Create and run bot
     bot = TradingBot(config)
+
+    # Reset drawdown if requested
+    if args.reset_drawdown:
+        print("🔄 Resetting drawdown tracking...")
+        bot.risk_manager.reset_drawdown()
 
     try:
         await bot.start()

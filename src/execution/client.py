@@ -255,7 +255,8 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
             logger.debug("API returned no positions")
             return {}
 
-        logger.debug(f"API returned {len(all_positions)} total positions")
+        # Log at INFO level so user can see position data
+        logger.info(f"📡 API returned {len(all_positions)} total positions from Polymarket")
 
         current_time = int(time.time())
         positions = {}
@@ -284,13 +285,13 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
             if size <= 0:
                 continue
 
-            # Log all non-zero positions for debugging
-            logger.debug(f"Checking position: slug={slug[:50]}, title={title[:50]}, size={size}")
+            # Log all non-zero positions for debugging (at INFO level for visibility)
+            logger.info(f"  📍 Position found: slug={slug[:50]}, size={size:.2f}")
 
             # Check if this is a 15-min crypto market
             is_15m = "updown-15m" in slug or "15m" in title or "15-min" in title
             if not is_15m:
-                logger.debug(f"  -> Skipped: not a 15-min market")
+                logger.info(f"    ⏭️ Skipped: not a 15-min market (slug: {slug[:60]})")
                 continue
 
             # Identify asset first (before timestamp check)
@@ -334,7 +335,7 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
             settle_buffer = 60
             if current_time > market_ts + 900 + settle_buffer:
                 elapsed = current_time - market_ts - 900
-                logger.debug(f"  -> Skipped: market settled {elapsed:.0f}s ago")
+                logger.info(f"    ⏭️ Skipped: market already settled {elapsed:.0f}s ago")
                 continue
 
             # Track position (only one per asset)
