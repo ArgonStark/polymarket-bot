@@ -231,6 +231,12 @@ class Position:
     ml_chart_bullish_pattern: Optional[float] = None
     ml_chart_bearish_pattern: Optional[float] = None
 
+    # Averaging down tracking
+    times_averaged: int = 0  # How many times we've added to this position
+    original_entry_price: Optional[float] = None  # First entry price before averaging
+    total_cost: float = 0.0  # Total USD spent on position
+    last_average_time: Optional[datetime] = None  # When we last averaged down
+
     @property
     def cost_basis(self) -> float:
         """Get total cost basis."""
