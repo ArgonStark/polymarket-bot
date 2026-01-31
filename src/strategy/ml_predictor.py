@@ -787,13 +787,9 @@ class MLSignalPredictor:
 
         Uses a gradual ramp-up to collect more diverse training data
         before applying strict filtering:
-        - 0-30 samples: Learning mode (allow all) - reduced for faster learning
+        - 0-30 samples: Learning mode (allow all)
         - 30-50 samples: 50% threshold (coin flip minimum)
-        - 50-75 samples: 52% threshold (slight edge required)
-        - 75+ samples: 55% threshold (meaningful edge required)
-
-        IMPORTANT: A threshold below 50% means trading when the model
-        predicts you'll LOSE more often than win. That's irrational.
+        - 50+ samples: Use configured min_confidence (from ML_MIN_CONFIDENCE)
 
         Returns:
             Current confidence threshold (0.0 to 1.0)
@@ -801,13 +797,12 @@ class MLSignalPredictor:
         samples = self.training_samples
 
         if samples < 30:
-            return 0.0  # Learning mode - allow all (reduced window)
+            return 0.0  # Learning mode - allow all
         elif samples < 50:
             return 0.50  # Minimum: don't trade if model predicts loss
-        elif samples < 75:
-            return 0.52  # Require slight predicted edge
         else:
-            return 0.55  # Require meaningful predicted edge
+            # Use configured threshold (default 0.50, can be set via ML_MIN_CONFIDENCE)
+            return self.min_confidence
 
     def should_trade(
         self,
