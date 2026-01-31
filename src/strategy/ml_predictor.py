@@ -1005,6 +1005,32 @@ class MLSignalPredictor:
             if side_value == "UP" and price_above_target_pct < -0.15:
                 return (False, 0.0, f"SANITY BLOCK: Price ${current_price:,.0f} is {abs(price_above_target_pct):.2f}% BELOW target ${target_price:,.0f} - UP bet would likely lose")
 
+        # ============================================================
+        # CHART ANALYSIS SANITY CHECK: Block trades against strong chart signals
+        # ============================================================
+        # Determine if chart shows strong directional signal
+        chart_says_down = (chart_bias_bearish > 0 and chart_confidence >= 0.6) or \
+                          (chart_is_downtrend > 0 and chart_trend_strength >= 0.5)
+        chart_says_up = (chart_bias_bullish > 0 and chart_confidence >= 0.6) or \
+                        (chart_is_uptrend > 0 and chart_trend_strength >= 0.5)
+
+        # Calculate signal strength
+        chart_signal_strength = max(chart_confidence, chart_trend_strength)
+
+        # Strong chart signal (>70% confidence) blocks trades going against it
+        if chart_signal_strength >= 0.7:
+            if chart_says_down and side_value == "UP":
+                return (False, 0.0,
+                    f"CHART BLOCK: UP bet against strong BEARISH chart "
+                    f"(conf={chart_confidence:.0%}, trend_str={chart_trend_strength:.0%}, "
+                    f"downtrend={chart_is_downtrend}, bearish={chart_bias_bearish})")
+
+            if chart_says_up and side_value == "DOWN":
+                return (False, 0.0,
+                    f"CHART BLOCK: DOWN bet against strong BULLISH chart "
+                    f"(conf={chart_confidence:.0%}, trend_str={chart_trend_strength:.0%}, "
+                    f"uptrend={chart_is_uptrend}, bullish={chart_bias_bullish})")
+
         # Get current threshold based on training samples
         threshold = self._get_gradual_threshold()
 
@@ -1040,13 +1066,35 @@ class MLSignalPredictor:
             confidence = self.model.predict_proba(feature_vector)
             model_type = "LR"
 
+        # ============================================================
+        # CHART ANALYSIS CONFIDENCE ADJUSTMENT
+        # Penalize confidence when chart disagrees with trade direction
+        # ============================================================
+        chart_penalty = 0.0
+        chart_penalty_reason = ""
+
+        # Moderate chart disagreement (not strong enough to block, but penalize)
+        if chart_signal_strength >= 0.5 and chart_signal_strength < 0.7:
+            if chart_says_down and side_value == "UP":
+                chart_penalty = chart_signal_strength * 0.15  # Up to 10.5% penalty
+                chart_penalty_reason = f" [CHART DISAGREE: bearish {chart_signal_strength:.0%} vs UP]"
+            elif chart_says_up and side_value == "DOWN":
+                chart_penalty = chart_signal_strength * 0.15
+                chart_penalty_reason = f" [CHART DISAGREE: bullish {chart_signal_strength:.0%} vs DOWN]"
+
+        # Apply chart penalty to confidence
+        original_confidence = confidence
+        confidence = max(0.0, confidence - chart_penalty)
+
+        if chart_penalty > 0:
+            logger.info(
+                f"🤖 ML CHART PENALTY [{market.asset if market else 'UNK'}]: "
+                f"Conf {original_confidence:.0%} → {confidence:.0%} (-{chart_penalty:.0%}){chart_penalty_reason}"
+            )
+
         # Log feature importance info for debugging
         arb_info = f" [ARB: {arb_type}]" if arb_type != "none" else ""
         bn_info = f" [BN: {binance_confirmation}]" if binance_confirmation != "NONE" else ""
-
-        # NOTE: Removed "strong signal bypass" - ML predictions should ALWAYS be respected
-        # A 40% confidence means the model predicts you'll LOSE 60% of the time
-        # Bypassing that because of "strong signal" is irrational
 
         if confidence < threshold:
             return (False, confidence, f"{model_type} rejected: {confidence:.0%} < {threshold:.0%}{arb_info}{bn_info}")
