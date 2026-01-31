@@ -875,6 +875,47 @@ class SignalGenerator:
                         edge_up -= 0.05
                         logger.info(f"⚠️ TIMEFRAME CONFLICT [{market.asset}]: UP signal against 1h bearish → UP -5%")
 
+            # === SUPPLY/DEMAND ZONE ANALYSIS ===
+            # Boost edge when price is at a strong zone, penalize when going against it
+            if chart_analysis:
+                # Price at demand zone (support) - bullish bias
+                if chart_analysis.in_demand_zone:
+                    zone_boost = min(0.05, chart_analysis.demand_zone_strength * 0.02)
+                    edge_up += zone_boost
+                    edge_down -= zone_boost * 0.5
+                    logger.info(
+                        f"📍 DEMAND ZONE [{market.asset}]: Price at support (strength={chart_analysis.demand_zone_strength}) → "
+                        f"UP +{zone_boost:.1%}, DOWN -{zone_boost*0.5:.1%}"
+                    )
+
+                # Price at supply zone (resistance) - bearish bias
+                elif chart_analysis.in_supply_zone:
+                    zone_boost = min(0.05, chart_analysis.supply_zone_strength * 0.02)
+                    edge_down += zone_boost
+                    edge_up -= zone_boost * 0.5
+                    logger.info(
+                        f"📍 SUPPLY ZONE [{market.asset}]: Price at resistance (strength={chart_analysis.supply_zone_strength}) → "
+                        f"DOWN +{zone_boost:.1%}, UP -{zone_boost*0.5:.1%}"
+                    )
+
+                # Price approaching demand zone - bullish if bouncing
+                elif chart_analysis.nearest_demand and chart_says_up:
+                    distance_to_demand = (current_price - chart_analysis.nearest_demand) / current_price
+                    if distance_to_demand < 0.005:  # Within 0.5% of demand zone
+                        edge_up += 0.02
+                        logger.info(
+                            f"📍 NEAR DEMAND [{market.asset}]: Price near support ${chart_analysis.nearest_demand:,.2f} → UP +2%"
+                        )
+
+                # Price approaching supply zone - bearish if rejecting
+                elif chart_analysis.nearest_supply and chart_says_down:
+                    distance_to_supply = (chart_analysis.nearest_supply - current_price) / current_price
+                    if distance_to_supply < 0.005:  # Within 0.5% of supply zone
+                        edge_down += 0.02
+                        logger.info(
+                            f"📍 NEAR SUPPLY [{market.asset}]: Price near resistance ${chart_analysis.nearest_supply:,.2f} → DOWN +2%"
+                        )
+
             # Log final decision
             logger.info(
                 f"📈 FINAL EDGES [{market.asset}]: UP={edge_up:.1%}, DOWN={edge_down:.1%} | "

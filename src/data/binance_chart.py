@@ -72,6 +72,46 @@ class TrendChange(Enum):
 
 
 @dataclass
+class SupplyDemandZone:
+    """
+    A supply or demand zone on the chart.
+
+    Supply zones (resistance): Areas where price was rejected down
+    Demand zones (support): Areas where price bounced up
+    """
+    zone_type: str  # "supply" or "demand"
+    price_low: float  # Lower boundary of zone
+    price_high: float  # Upper boundary of zone
+    strength: int  # Number of times price reacted at this zone
+    timeframe: str  # "15m", "1h", "4h"
+    last_tested: datetime  # When zone was last tested
+    broken: bool = False  # True if price has decisively broken through
+
+    @property
+    def midpoint(self) -> float:
+        """Get the zone midpoint price."""
+        return (self.price_low + self.price_high) / 2
+
+    @property
+    def width(self) -> float:
+        """Get zone width as a price."""
+        return self.price_high - self.price_low
+
+    def contains_price(self, price: float) -> bool:
+        """Check if price is within this zone."""
+        return self.price_low <= price <= self.price_high
+
+    def distance_from_price(self, price: float) -> float:
+        """Get distance from zone (negative if inside)."""
+        if price < self.price_low:
+            return self.price_low - price
+        elif price > self.price_high:
+            return price - self.price_high
+        else:
+            return 0.0  # Inside zone
+
+
+@dataclass
 class Candle:
     """Single candlestick data."""
     timestamp: datetime
@@ -195,6 +235,16 @@ class ChartAnalysis:
     consecutive_candles_same_dir: int = 0  # Count of candles in same direction
     resume_ready: bool = True  # False during pause, True when safe to resume
     resume_confidence: float = 1.0  # Confidence in resuming (0-1)
+
+    # Supply/Demand Zones
+    supply_zones: List[SupplyDemandZone] = field(default_factory=list)  # Resistance areas
+    demand_zones: List[SupplyDemandZone] = field(default_factory=list)  # Support areas
+    nearest_supply: Optional[float] = None  # Nearest supply zone price
+    nearest_demand: Optional[float] = None  # Nearest demand zone price
+    in_supply_zone: bool = False  # True if price is in a supply zone
+    in_demand_zone: bool = False  # True if price is in a demand zone
+    supply_zone_strength: int = 0  # Strength of nearest supply zone
+    demand_zone_strength: int = 0  # Strength of nearest demand zone
 
     # Recommendation
     bias: str = "neutral"  # "bullish", "bearish", "neutral"
@@ -948,6 +998,167 @@ class BinanceChartAnalyzer:
 
         return support, resistance
 
+    def find_supply_demand_zones(
+        self,
+        candles: List[Candle],
+        timeframe: str = "15m",
+        min_touches: int = 2,
+    ) -> tuple[List[SupplyDemandZone], List[SupplyDemandZone]]:
+        """
+        Find supply (resistance) and demand (support) zones.
+
+        Supply zones: Areas where price dropped after testing
+        Demand zones: Areas where price bounced after testing
+
+        Args:
+            candles: List of candles to analyze
+            timeframe: Timeframe label for zones
+            min_touches: Minimum touches to confirm a zone
+
+        Returns:
+            Tuple of (supply_zones, demand_zones)
+        """
+        if len(candles) < 30:
+            return [], []
+
+        supply_zones = []
+        demand_zones = []
+        current_price = candles[-1].close
+        now = candles[-1].timestamp
+
+        # Calculate ATR for zone width
+        atr = self.calculate_atr(candles)
+        zone_width = atr * 0.5  # Zone is half ATR wide
+
+        # Find swing highs (potential supply zones)
+        # A swing high is a candle whose high is higher than neighbors
+        for i in range(5, len(candles) - 5):
+            candle = candles[i]
+
+            # Check if this is a swing high
+            is_swing_high = all(
+                candle.high >= candles[j].high
+                for j in range(i - 3, i + 4)
+                if j != i and 0 <= j < len(candles)
+            )
+
+            if is_swing_high:
+                zone_high = candle.high
+                zone_low = candle.high - zone_width
+
+                # Count how many times price touched this zone and reversed
+                touches = 0
+                for j in range(i + 1, len(candles)):
+                    test_candle = candles[j]
+                    # Price entered zone
+                    if test_candle.high >= zone_low and test_candle.high <= zone_high + zone_width:
+                        # And then price fell (bearish candle or next candle lower)
+                        if test_candle.close < test_candle.open or (j + 1 < len(candles) and candles[j + 1].close < test_candle.close):
+                            touches += 1
+
+                if touches >= min_touches:
+                    # Check if zone is broken
+                    broken = current_price > zone_high + zone_width
+
+                    supply_zones.append(SupplyDemandZone(
+                        zone_type="supply",
+                        price_low=zone_low,
+                        price_high=zone_high,
+                        strength=touches,
+                        timeframe=timeframe,
+                        last_tested=candles[-1].timestamp,
+                        broken=broken,
+                    ))
+
+            # Check if this is a swing low (potential demand zone)
+            is_swing_low = all(
+                candle.low <= candles[j].low
+                for j in range(i - 3, i + 4)
+                if j != i and 0 <= j < len(candles)
+            )
+
+            if is_swing_low:
+                zone_low = candle.low
+                zone_high = candle.low + zone_width
+
+                # Count how many times price touched this zone and bounced
+                touches = 0
+                for j in range(i + 1, len(candles)):
+                    test_candle = candles[j]
+                    # Price entered zone
+                    if test_candle.low <= zone_high and test_candle.low >= zone_low - zone_width:
+                        # And then price rose (bullish candle or next candle higher)
+                        if test_candle.close > test_candle.open or (j + 1 < len(candles) and candles[j + 1].close > test_candle.close):
+                            touches += 1
+
+                if touches >= min_touches:
+                    # Check if zone is broken
+                    broken = current_price < zone_low - zone_width
+
+                    demand_zones.append(SupplyDemandZone(
+                        zone_type="demand",
+                        price_low=zone_low,
+                        price_high=zone_high,
+                        strength=touches,
+                        timeframe=timeframe,
+                        last_tested=candles[-1].timestamp,
+                        broken=broken,
+                    ))
+
+        # Remove duplicate/overlapping zones, keeping strongest
+        supply_zones = self._merge_overlapping_zones(supply_zones)
+        demand_zones = self._merge_overlapping_zones(demand_zones)
+
+        # Sort by distance from current price
+        supply_zones.sort(key=lambda z: z.midpoint - current_price if z.midpoint > current_price else float('inf'))
+        demand_zones.sort(key=lambda z: current_price - z.midpoint if z.midpoint < current_price else float('inf'))
+
+        # Keep only top 3 closest zones
+        supply_zones = supply_zones[:3]
+        demand_zones = demand_zones[:3]
+
+        return supply_zones, demand_zones
+
+    def _merge_overlapping_zones(self, zones: List[SupplyDemandZone]) -> List[SupplyDemandZone]:
+        """Merge overlapping zones, keeping the strongest."""
+        if not zones:
+            return []
+
+        # Sort by price_low
+        zones = sorted(zones, key=lambda z: z.price_low)
+        merged = [zones[0]]
+
+        for zone in zones[1:]:
+            last = merged[-1]
+            # Check if zones overlap
+            if zone.price_low <= last.price_high:
+                # Merge: extend the zone and combine strength
+                if zone.strength > last.strength:
+                    # Replace with stronger zone
+                    merged[-1] = SupplyDemandZone(
+                        zone_type=zone.zone_type,
+                        price_low=min(last.price_low, zone.price_low),
+                        price_high=max(last.price_high, zone.price_high),
+                        strength=zone.strength + last.strength,
+                        timeframe=zone.timeframe,
+                        last_tested=zone.last_tested,
+                        broken=zone.broken and last.broken,
+                    )
+                else:
+                    merged[-1] = SupplyDemandZone(
+                        zone_type=last.zone_type,
+                        price_low=min(last.price_low, zone.price_low),
+                        price_high=max(last.price_high, zone.price_high),
+                        strength=zone.strength + last.strength,
+                        timeframe=last.timeframe,
+                        last_tested=last.last_tested,
+                        broken=zone.broken and last.broken,
+                    )
+            else:
+                merged.append(zone)
+
+        return merged
+
     def analyze(self, asset: str) -> Optional[ChartAnalysis]:
         """
         Perform comprehensive chart analysis.
@@ -1028,6 +1239,47 @@ class BinanceChartAnalyzer:
 
             # Find support/resistance
             support, resistance = self.find_support_resistance(candles_15m)
+
+            # Find supply/demand zones (multi-timeframe)
+            supply_zones_15m, demand_zones_15m = self.find_supply_demand_zones(candles_15m, "15m")
+            supply_zones_1h, demand_zones_1h = [], []
+            supply_zones_4h, demand_zones_4h = [], []
+            if candles_1h:
+                supply_zones_1h, demand_zones_1h = self.find_supply_demand_zones(candles_1h, "1h", min_touches=1)
+            if candles_4h:
+                supply_zones_4h, demand_zones_4h = self.find_supply_demand_zones(candles_4h, "4h", min_touches=1)
+
+            # Combine all zones
+            all_supply_zones = supply_zones_15m + supply_zones_1h + supply_zones_4h
+            all_demand_zones = demand_zones_15m + demand_zones_1h + demand_zones_4h
+
+            # Find nearest zones to current price
+            nearest_supply = None
+            nearest_demand = None
+            in_supply_zone = False
+            in_demand_zone = False
+            supply_zone_strength = 0
+            demand_zone_strength = 0
+
+            for zone in all_supply_zones:
+                if not zone.broken:
+                    if zone.contains_price(current_price):
+                        in_supply_zone = True
+                        supply_zone_strength = max(supply_zone_strength, zone.strength)
+                    elif zone.midpoint > current_price:
+                        if nearest_supply is None or zone.midpoint < nearest_supply:
+                            nearest_supply = zone.midpoint
+                            supply_zone_strength = zone.strength
+
+            for zone in all_demand_zones:
+                if not zone.broken:
+                    if zone.contains_price(current_price):
+                        in_demand_zone = True
+                        demand_zone_strength = max(demand_zone_strength, zone.strength)
+                    elif zone.midpoint < current_price:
+                        if nearest_demand is None or zone.midpoint > nearest_demand:
+                            nearest_demand = zone.midpoint
+                            demand_zone_strength = zone.strength
 
             # Calculate momentum
             momentum = (trend_1m + trend_5m + trend_15m) / 3
@@ -1172,6 +1424,15 @@ class BinanceChartAnalyzer:
                 consecutive_candles_same_dir=consecutive_candles,
                 resume_ready=resume_ready,
                 resume_confidence=resume_confidence,
+                # Supply/Demand zones
+                supply_zones=all_supply_zones,
+                demand_zones=all_demand_zones,
+                nearest_supply=nearest_supply,
+                nearest_demand=nearest_demand,
+                in_supply_zone=in_supply_zone,
+                in_demand_zone=in_demand_zone,
+                supply_zone_strength=supply_zone_strength,
+                demand_zone_strength=demand_zone_strength,
                 # Bias
                 bias=bias,
                 confidence=confidence,

@@ -514,6 +514,21 @@ class RiskManager:
         self.halt_reason = None
         logger.info("Trading resumed")
 
+    def reset_drawdown(self):
+        """
+        Reset the drawdown tracking by setting peak to current bankroll.
+
+        Use this when you want to restart fresh after a losing streak,
+        or when manually adding/removing funds.
+        """
+        old_peak = self.peak_bankroll
+        self.peak_bankroll = self.current_bankroll
+        self.consecutive_losses = 0
+        logger.info(
+            f"🔄 DRAWDOWN RESET: Peak ${old_peak:.2f} → ${self.current_bankroll:.2f} | "
+            f"Trading can resume"
+        )
+
     def get_open_positions(self) -> list[Position]:
         """Get list of open positions."""
         return list(self.positions.values())
