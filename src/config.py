@@ -101,9 +101,10 @@ class TradingConfig:
     )
 
     # Asset priority - higher priority assets get checked first
-    # BTC and ETH are most liquid, best for arbitrage
+    # BTC and ETH are most liquid, SOL has good volume
+    # XRP removed from default - less correlated with BTC, more volatile
     asset_priority: list = field(
-        default_factory=lambda: os.getenv("ASSET_PRIORITY", "BTC,ETH,SOL,XRP").split(",")
+        default_factory=lambda: os.getenv("ASSET_PRIORITY", "BTC,ETH,SOL").split(",")
     )
 
     # Enable parallel market processing (faster but more API calls)

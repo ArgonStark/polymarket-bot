@@ -916,6 +916,38 @@ class SignalGenerator:
                             f"📍 NEAR SUPPLY [{market.asset}]: Price near resistance ${chart_analysis.nearest_supply:,.2f} → DOWN +2%"
                         )
 
+            # === BTC CORRELATION FOR ALTCOINS ===
+            # Altcoins (ETH, SOL, XRP) tend to follow BTC movements
+            # When BTC is dumping hard, altcoins usually dump harder
+            # When BTC is pumping, altcoins follow
+            if market.asset != "BTC" and self.binance_feed:
+                try:
+                    btc_velocity = self.binance_feed.get_velocity("BTC")
+                    BTC_VELOCITY_THRESHOLD = 0.0003  # 0.03% per second = significant move
+
+                    if btc_velocity is not None and abs(btc_velocity) > BTC_VELOCITY_THRESHOLD:
+                        # BTC is moving significantly
+                        if btc_velocity < -BTC_VELOCITY_THRESHOLD:
+                            # BTC dumping - bearish for altcoins
+                            btc_impact = min(0.05, abs(btc_velocity) * 100)  # Cap at 5%
+                            edge_down += btc_impact
+                            edge_up -= btc_impact * 0.5
+                            logger.info(
+                                f"₿ BTC CORRELATION [{market.asset}]: BTC dumping ({btc_velocity:.4%}/s) → "
+                                f"DOWN +{btc_impact:.1%}, UP -{btc_impact*0.5:.1%}"
+                            )
+                        elif btc_velocity > BTC_VELOCITY_THRESHOLD:
+                            # BTC pumping - bullish for altcoins
+                            btc_impact = min(0.05, abs(btc_velocity) * 100)  # Cap at 5%
+                            edge_up += btc_impact
+                            edge_down -= btc_impact * 0.5
+                            logger.info(
+                                f"₿ BTC CORRELATION [{market.asset}]: BTC pumping ({btc_velocity:.4%}/s) → "
+                                f"UP +{btc_impact:.1%}, DOWN -{btc_impact*0.5:.1%}"
+                            )
+                except Exception as e:
+                    logger.debug(f"BTC correlation check failed: {e}")
+
             # Log final decision
             logger.info(
                 f"📈 FINAL EDGES [{market.asset}]: UP={edge_up:.1%}, DOWN={edge_down:.1%} | "
