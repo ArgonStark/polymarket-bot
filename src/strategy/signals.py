@@ -47,6 +47,10 @@ try:
     from ..data.binance_chart import (
         analyze_chart,
         get_chart_bias,
+        should_pause_trading,
+        get_position_size_multiplier,
+        record_trade_for_cooldown,
+        get_multi_timeframe_decision,
         MarketType,
         TrendChange,
     )
@@ -57,6 +61,14 @@ except ImportError:
         return None
     def get_chart_bias(asset: str):
         return "neutral", 0.5
+    def should_pause_trading(asset: str, min_uncertainty: float = 0.5):
+        return False, ""
+    def get_position_size_multiplier(asset: str):
+        return 1.0, "no chart data"
+    def record_trade_for_cooldown(asset: str, uncertainty_was_high: bool = False):
+        pass
+    def get_multi_timeframe_decision(asset: str):
+        return "NONE", 0.5, True
 
 
 logger = logging.getLogger(__name__)
@@ -110,6 +122,10 @@ class SignalGenerator:
 
     # Reference to BinanceFeed for velocity calculations
     binance_feed: object = None  # Will be set externally
+
+    # Position size multiplier from chart analysis (graduated sizing)
+    _position_multiplier: float = 1.0
+    _position_multiplier_reason: str = ""
 
     def __post_init__(self):
         """Initialize data structures."""
@@ -562,6 +578,10 @@ class SignalGenerator:
                 chart_analysis = analyze_chart(market.asset)
                 if chart_analysis:
                     # Log comprehensive chart analysis at INFO level for visibility
+                    uncertainty_info = ""
+                    if chart_analysis.is_uncertain:
+                        uncertainty_info = f" | ⚠️ UNCERTAIN ({chart_analysis.uncertainty_score:.0%}): {chart_analysis.uncertainty_reason}"
+
                     logger.info(
                         f"📊 CHART ANALYSIS [{market.asset}]: "
                         f"Type={chart_analysis.market_type.value} | "
@@ -572,7 +592,72 @@ class SignalGenerator:
                         f"4h={chart_analysis.trend_4h:+.2f} | "
                         f"Change={chart_analysis.trend_change.value}"
                         + (f" | Pattern={chart_analysis.pattern_name}" if chart_analysis.pattern_name else "")
+                        + uncertainty_info
                     )
+
+                    # === GRADUATED POSITION SIZING ===
+                    # Instead of binary pause, we scale position size based on conditions
+                    position_multiplier = chart_analysis.position_size_multiplier
+                    position_reason = ""
+
+                    # Log position sizing factors
+                    sizing_factors = []
+                    if chart_analysis.is_uncertain:
+                        sizing_factors.append(f"uncertain={chart_analysis.uncertainty_score:.0%}")
+                    if not chart_analysis.timeframes_aligned:
+                        sizing_factors.append(f"alignment={chart_analysis.alignment_score:.0%}")
+                    if chart_analysis.trend_strength_dropping:
+                        sizing_factors.append("trend_breaking")
+                    if not chart_analysis.resume_ready and chart_analysis.is_uncertain:
+                        sizing_factors.append(f"resume_conf={chart_analysis.resume_confidence:.0%}")
+
+                    if sizing_factors:
+                        position_reason = ", ".join(sizing_factors)
+                        logger.info(
+                            f"📏 POSITION SIZING [{market.asset}]: {position_multiplier:.0%} of normal | "
+                            f"Factors: {position_reason}"
+                        )
+
+                    # === HARD PAUSE: Only pause if position multiplier is 0 AND not ready to resume ===
+                    if position_multiplier == 0.0 and not chart_analysis.resume_ready:
+                        logger.info(
+                            f"⏸️ MARKET PAUSE [{market.asset}]: Full pause - "
+                            f"waiting for resume conditions | "
+                            f"Uncertainty: {chart_analysis.uncertainty_score:.0%} | "
+                            f"Resume confidence: {chart_analysis.resume_confidence:.0%} | "
+                            f"Consecutive candles: {chart_analysis.consecutive_candles_same_dir} | "
+                            f"Reason: {chart_analysis.uncertainty_reason}"
+                        )
+                        return Signal(
+                            market=market,
+                            side=Side.NONE,
+                            edge=0.0,
+                            true_prob=0.5,
+                            market_prob=0.5,
+                            recommended_action=OrderAction.SKIP,
+                            recommended_price=0.0,
+                            size_usd=0.0,
+                            size_shares=0.0,
+                            chainlink_price=current_price,
+                            time_remaining=time_remaining,
+                            reasoning=f"[MARKET PAUSE] Waiting for resume: need 3+ candles same dir, RSI decisive. Current: {chart_analysis.consecutive_candles_same_dir} candles, RSI={chart_analysis.rsi_14:.0f}",
+                        )
+
+                    # === MULTI-TIMEFRAME ALIGNMENT CHECK ===
+                    if not chart_analysis.timeframes_aligned and chart_analysis.alignment_score < 0.5:
+                        logger.info(
+                            f"⚠️ TIMEFRAME CONFLICT [{market.asset}]: "
+                            f"15m={chart_analysis.trend_15m:+.2f}, "
+                            f"1h={chart_analysis.trend_1h:+.2f}, "
+                            f"4h={chart_analysis.trend_4h:+.2f} | "
+                            f"Alignment: {chart_analysis.alignment_score:.0%} | "
+                            f"Using reduced position"
+                        )
+
+                    # Store position multiplier for later use
+                    self._position_multiplier = position_multiplier
+                    self._position_multiplier_reason = position_reason
+
             except Exception as e:
                 logger.debug(f"Chart analysis failed for {market.asset}: {e}")
 
@@ -740,6 +825,30 @@ class SignalGenerator:
                 edge_down += 0.05
                 edge_up -= 0.05
                 logger.info(f"🔄 TREND REVERSAL [{market.asset}]: Bearish reversal detected → DOWN +5%, UP -5%")
+
+            # === MULTI-TIMEFRAME EDGE ADJUSTMENT ===
+            # When 1h and 15m trends align, boost edge
+            # When they disagree, penalize the signal going against 1h
+            if chart_analysis:
+                higher_tf_bias = chart_analysis.higher_timeframe_bias
+                alignment = chart_analysis.alignment_score
+
+                if alignment >= 0.8:
+                    # Strong alignment - boost the aligned direction
+                    if higher_tf_bias == "bullish":
+                        edge_up += 0.03
+                        logger.info(f"🎯 TIMEFRAME ALIGNMENT [{market.asset}]: Strong bullish alignment ({alignment:.0%}) → UP +3%")
+                    elif higher_tf_bias == "bearish":
+                        edge_down += 0.03
+                        logger.info(f"🎯 TIMEFRAME ALIGNMENT [{market.asset}]: Strong bearish alignment ({alignment:.0%}) → DOWN +3%")
+                elif alignment < 0.5:
+                    # Poor alignment - penalize trades against 1h trend
+                    if higher_tf_bias == "bullish" and chart_says_down:
+                        edge_down -= 0.05
+                        logger.info(f"⚠️ TIMEFRAME CONFLICT [{market.asset}]: DOWN signal against 1h bullish → DOWN -5%")
+                    elif higher_tf_bias == "bearish" and chart_says_up:
+                        edge_up -= 0.05
+                        logger.info(f"⚠️ TIMEFRAME CONFLICT [{market.asset}]: UP signal against 1h bearish → UP -5%")
 
             # Log final decision
             logger.info(
@@ -976,6 +1085,9 @@ class SignalGenerator:
         Position size scales from base_position_size up to 2x
         based on edge strength.
 
+        GRADUATED SIZING: Applies position multiplier from chart analysis
+        to reduce position during uncertain/transitional markets.
+
         Returns:
             Tuple of (size_usd, size_shares)
         """
@@ -993,6 +1105,18 @@ class SignalGenerator:
         kelly_multiplier = 1.0 + edge_factor
 
         size_usd = base_size * kelly_multiplier
+
+        # === GRADUATED POSITION SIZING ===
+        # Apply position multiplier from chart analysis
+        # This reduces position size during uncertain/transitional markets
+        position_multiplier = getattr(self, '_position_multiplier', 1.0)
+        if position_multiplier < 1.0:
+            original_size = size_usd
+            size_usd *= position_multiplier
+            logger.info(
+                f"📏 GRADUATED SIZING: ${original_size:.2f} × {position_multiplier:.0%} = ${size_usd:.2f} | "
+                f"Reason: {getattr(self, '_position_multiplier_reason', 'unknown')}"
+            )
 
         # Convert to shares
         price = max(0.01, min(0.99, price))
@@ -1132,6 +1256,19 @@ class SignalGenerator:
         # Clear any active leg for this market
         self.arb_detector.clear_leg(market_id)
         self.arb_detector.clear_market_history(market_id)
+
+    def record_trade_execution(self, asset: str, uncertainty_was_high: bool = False):
+        """
+        Record a trade execution for cooldown tracking.
+
+        Call this after each successful trade to track cooldown progress.
+
+        Args:
+            asset: Asset symbol (BTC, ETH, etc.)
+            uncertainty_was_high: True if market uncertainty was >= 60%
+        """
+        if CHART_ANALYSIS_AVAILABLE:
+            record_trade_for_cooldown(asset, uncertainty_was_high)
 
     def _evaluate_trend_protection(
         self,

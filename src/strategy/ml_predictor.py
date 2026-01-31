@@ -110,8 +110,17 @@ class TradeFeatures:
     chart_bullish_pattern: float = 0.0  # 1 if bullish pattern detected
     chart_bearish_pattern: float = 0.0  # 1 if bearish pattern detected
 
+    # Advanced chart analysis features (graduated sizing, multi-TF, trend break)
+    chart_uncertainty_score: float = 0.0  # Market uncertainty (0-1)
+    chart_position_multiplier: float = 1.0  # Graduated position size (0-1)
+    chart_timeframe_aligned: float = 1.0  # 1 if 15m/1h/4h aligned, 0 otherwise
+    chart_alignment_score: float = 1.0  # Multi-TF alignment (0-1)
+    chart_trend_breaking: float = 0.0  # 1 if trend is breaking down
+    chart_resume_ready: float = 1.0  # 1 if safe to trade, 0 if in pause
+    chart_resume_confidence: float = 1.0  # Confidence in resuming (0-1)
+
     def to_vector(self) -> list[float]:
-        """Convert to feature vector for model (46 features total)."""
+        """Convert to feature vector for model (53 features total)."""
         # Normalize features to roughly 0-1 range
         # NOTE: hour_of_day and day_of_week are set to neutral (0.5) because
         # they don't predict crypto price direction - they're just noise.
@@ -174,6 +183,14 @@ class TradeFeatures:
             min(max(self.chart_confidence, 0.0), 1.0),  # Confidence 0-1
             self.chart_bullish_pattern,  # Binary
             self.chart_bearish_pattern,  # Binary
+            # Advanced chart features (7) - graduated sizing, multi-TF, trend break
+            min(max(self.chart_uncertainty_score, 0.0), 1.0),  # Uncertainty 0-1
+            min(max(self.chart_position_multiplier, 0.0), 1.0),  # Position multiplier 0-1
+            self.chart_timeframe_aligned,  # Binary (1 if aligned)
+            min(max(self.chart_alignment_score, 0.0), 1.0),  # Alignment 0-1
+            self.chart_trend_breaking,  # Binary (1 if breaking)
+            self.chart_resume_ready,  # Binary (1 if ready to trade)
+            min(max(self.chart_resume_confidence, 0.0), 1.0),  # Resume confidence 0-1
         ]
         return vector
 
@@ -217,6 +234,14 @@ class TradeFeatures:
             "chart_confidence": self.chart_confidence,
             "chart_bullish_pattern": self.chart_bullish_pattern,
             "chart_bearish_pattern": self.chart_bearish_pattern,
+            # Advanced chart features
+            "chart_uncertainty_score": self.chart_uncertainty_score,
+            "chart_position_multiplier": self.chart_position_multiplier,
+            "chart_timeframe_aligned": self.chart_timeframe_aligned,
+            "chart_alignment_score": self.chart_alignment_score,
+            "chart_trend_breaking": self.chart_trend_breaking,
+            "chart_resume_ready": self.chart_resume_ready,
+            "chart_resume_confidence": self.chart_resume_confidence,
         }
 
     @classmethod
@@ -260,6 +285,14 @@ class TradeFeatures:
             chart_confidence=data.get("chart_confidence", 0.5),
             chart_bullish_pattern=data.get("chart_bullish_pattern", 0.0),
             chart_bearish_pattern=data.get("chart_bearish_pattern", 0.0),
+            # Advanced chart features
+            chart_uncertainty_score=data.get("chart_uncertainty_score", 0.0),
+            chart_position_multiplier=data.get("chart_position_multiplier", 1.0),
+            chart_timeframe_aligned=data.get("chart_timeframe_aligned", 1.0),
+            chart_alignment_score=data.get("chart_alignment_score", 1.0),
+            chart_trend_breaking=data.get("chart_trend_breaking", 0.0),
+            chart_resume_ready=data.get("chart_resume_ready", 1.0),
+            chart_resume_confidence=data.get("chart_resume_confidence", 1.0),
         )
 
 
@@ -269,12 +302,12 @@ class SimpleLogisticRegression:
     A simple logistic regression model that doesn't require sklearn.
     Uses online learning to update weights incrementally.
 
-    UPDATED: Now supports 46 features including chart analysis from Binance.
+    UPDATED: Now supports 53 features including advanced chart analysis.
     """
     weights: list[float] = field(default_factory=list)
     bias: float = 0.0
     learning_rate: float = 0.1
-    n_features: int = 46  # Number of features in TradeFeatures.to_vector()
+    n_features: int = 53  # Number of features in TradeFeatures.to_vector()
 
     def __post_init__(self):
         if not self.weights:
@@ -345,13 +378,13 @@ class SimpleNeuralNetwork:
     Simple 2-layer neural network for online learning.
     More powerful than logistic regression, adapts to new patterns.
 
-    Architecture: Input(46) -> Hidden(48) -> Output(1)
+    Architecture: Input(53) -> Hidden(56) -> Output(1)
     Uses ReLU activation and online gradient descent.
 
-    UPDATED: Now uses all 46 features including chart analysis from Binance.
+    UPDATED: Now uses all 53 features including advanced chart analysis.
     """
-    input_size: int = 46  # Full feature vector (matching TradeFeatures.to_vector())
-    hidden_size: int = 48  # Larger hidden layer for more features
+    input_size: int = 53  # Full feature vector (matching TradeFeatures.to_vector())
+    hidden_size: int = 56  # Larger hidden layer for more features
     learning_rate: float = 0.03  # Slightly lower for stability
 
     # Weights
@@ -467,11 +500,11 @@ class SimpleNeuralNetwork:
     @classmethod
     def from_dict(cls, data: dict) -> "SimpleNeuralNetwork":
         """Deserialize model."""
-        # Use current architecture defaults (46 features, 48 hidden)
+        # Use current architecture defaults (53 features, 56 hidden)
         # Old models with wrong dimensions will be re-initialized
         return cls(
-            input_size=data.get("input_size", 46),  # Must match TradeFeatures.to_vector()
-            hidden_size=data.get("hidden_size", 48),  # Current architecture
+            input_size=data.get("input_size", 53),  # Must match TradeFeatures.to_vector()
+            hidden_size=data.get("hidden_size", 56),  # Current architecture
             learning_rate=data.get("learning_rate", 0.03),  # Current default
             weights_ih=data.get("weights_ih", []),
             weights_ho=data.get("weights_ho", []),
@@ -783,6 +816,14 @@ class MLSignalPredictor:
         chart_confidence: float = 0.5,
         chart_bullish_pattern: float = 0.0,
         chart_bearish_pattern: float = 0.0,
+        # Advanced chart features
+        chart_uncertainty_score: float = 0.0,
+        chart_position_multiplier: float = 1.0,
+        chart_timeframe_aligned: float = 1.0,
+        chart_alignment_score: float = 1.0,
+        chart_trend_breaking: float = 0.0,
+        chart_resume_ready: float = 1.0,
+        chart_resume_confidence: float = 1.0,
     ) -> TradeFeatures:
         """
         Extract features from a trading signal.
@@ -820,6 +861,13 @@ class MLSignalPredictor:
             chart_confidence: Chart analysis confidence (0-1)
             chart_bullish_pattern: 1 if bullish pattern detected
             chart_bearish_pattern: 1 if bearish pattern detected
+            chart_uncertainty_score: Market uncertainty (0-1)
+            chart_position_multiplier: Graduated position size (0-1)
+            chart_timeframe_aligned: 1 if 15m/1h/4h aligned
+            chart_alignment_score: Multi-TF alignment (0-1)
+            chart_trend_breaking: 1 if trend is breaking down
+            chart_resume_ready: 1 if safe to trade
+            chart_resume_confidence: Confidence in resuming (0-1)
         """
         now = datetime.now(timezone.utc)
 
@@ -886,6 +934,14 @@ class MLSignalPredictor:
             chart_confidence=chart_confidence,
             chart_bullish_pattern=chart_bullish_pattern,
             chart_bearish_pattern=chart_bearish_pattern,
+            # Advanced chart features
+            chart_uncertainty_score=chart_uncertainty_score,
+            chart_position_multiplier=chart_position_multiplier,
+            chart_timeframe_aligned=chart_timeframe_aligned,
+            chart_alignment_score=chart_alignment_score,
+            chart_trend_breaking=chart_trend_breaking,
+            chart_resume_ready=chart_resume_ready,
+            chart_resume_confidence=chart_resume_confidence,
         )
 
     def _get_gradual_threshold(self) -> float:
@@ -943,6 +999,14 @@ class MLSignalPredictor:
         chart_confidence: float = 0.5,
         chart_bullish_pattern: float = 0.0,
         chart_bearish_pattern: float = 0.0,
+        # Advanced chart features
+        chart_uncertainty_score: float = 0.0,
+        chart_position_multiplier: float = 1.0,
+        chart_timeframe_aligned: float = 1.0,
+        chart_alignment_score: float = 1.0,
+        chart_trend_breaking: float = 0.0,
+        chart_resume_ready: float = 1.0,
+        chart_resume_confidence: float = 1.0,
     ) -> tuple[bool, float, str]:
         """
         Decide if we should take this trade based on ML prediction.
@@ -1055,6 +1119,14 @@ class MLSignalPredictor:
             chart_confidence=chart_confidence,
             chart_bullish_pattern=chart_bullish_pattern,
             chart_bearish_pattern=chart_bearish_pattern,
+            # Advanced chart features
+            chart_uncertainty_score=chart_uncertainty_score,
+            chart_position_multiplier=chart_position_multiplier,
+            chart_timeframe_aligned=chart_timeframe_aligned,
+            chart_alignment_score=chart_alignment_score,
+            chart_trend_breaking=chart_trend_breaking,
+            chart_resume_ready=chart_resume_ready,
+            chart_resume_confidence=chart_resume_confidence,
         )
         feature_vector = features.to_vector()
 
@@ -1137,6 +1209,14 @@ class MLSignalPredictor:
         chart_confidence: float = 0.5,
         chart_bullish_pattern: float = 0.0,
         chart_bearish_pattern: float = 0.0,
+        # Advanced chart features
+        chart_uncertainty_score: float = 0.0,
+        chart_position_multiplier: float = 1.0,
+        chart_timeframe_aligned: float = 1.0,
+        chart_alignment_score: float = 1.0,
+        chart_trend_breaking: float = 0.0,
+        chart_resume_ready: float = 1.0,
+        chart_resume_confidence: float = 1.0,
     ):
         """
         Record a trade outcome and update the model.
@@ -1162,6 +1242,13 @@ class MLSignalPredictor:
             price_high: Recent high price
             price_low: Recent low price
             price_velocity: Rate of price change
+            chart_uncertainty_score: Market uncertainty (0-1)
+            chart_position_multiplier: Graduated position size (0-1)
+            chart_timeframe_aligned: 1 if 15m/1h/4h aligned
+            chart_alignment_score: Multi-TF alignment (0-1)
+            chart_trend_breaking: 1 if trend is breaking down
+            chart_resume_ready: 1 if safe to trade
+            chart_resume_confidence: Confidence in resuming (0-1)
         """
         features = self.extract_features(
             signal, volatility, price_momentum, arb_type,
@@ -1183,6 +1270,14 @@ class MLSignalPredictor:
             chart_confidence=chart_confidence,
             chart_bullish_pattern=chart_bullish_pattern,
             chart_bearish_pattern=chart_bearish_pattern,
+            # Advanced chart features
+            chart_uncertainty_score=chart_uncertainty_score,
+            chart_position_multiplier=chart_position_multiplier,
+            chart_timeframe_aligned=chart_timeframe_aligned,
+            chart_alignment_score=chart_alignment_score,
+            chart_trend_breaking=chart_trend_breaking,
+            chart_resume_ready=chart_resume_ready,
+            chart_resume_confidence=chart_resume_confidence,
         )
         feature_vector = features.to_vector()
 
@@ -1375,17 +1470,31 @@ class MLSignalPredictor:
                     )
                 elif len(old_weights) == 33:
                     logger.info(
-                        f"🤖 Migrating ML model from 33 to 46 features (adding chart analysis)..."
+                        f"🤖 Migrating ML model from 33 to 53 features (adding chart analysis + advanced)..."
                     )
-                    # Extend weights for chart analysis features (13 new)
-                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(13)]
+                    # Extend weights for chart analysis features (13 + 7 new = 20 total)
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(20)]
                     model_data["weights"] = new_weights
                     # Keep most training data since this is a significant addition
                     self.training_samples = max(0, int(data.get("training_samples", 0) * 0.85))
                     self.predictions_made = int(data.get("predictions_made", 0) * 0.85)
                     self.correct_predictions = int(data.get("correct_predictions", 0) * 0.85)
                     logger.info(
-                        f"🤖 Migration complete - model will retrain with chart analysis features"
+                        f"🤖 Migration complete - model will retrain with all chart features"
+                    )
+                elif len(old_weights) == 46:
+                    logger.info(
+                        f"🤖 Migrating ML model from 46 to 53 features (adding advanced chart features)..."
+                    )
+                    # Extend weights for advanced chart features (7 new)
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(7)]
+                    model_data["weights"] = new_weights
+                    # Keep most training data since this is a smaller addition
+                    self.training_samples = max(0, int(data.get("training_samples", 0) * 0.9))
+                    self.predictions_made = int(data.get("predictions_made", 0) * 0.9)
+                    self.correct_predictions = int(data.get("correct_predictions", 0) * 0.9)
+                    logger.info(
+                        f"🤖 Migration complete - model will retrain with advanced chart features"
                     )
                 else:
                     self.training_samples = data.get("training_samples", 0)
@@ -1598,6 +1707,24 @@ def extract_ml_features_from_market(
         if chart_analysis.is_bearish_pattern:
             chart_bearish_pattern = 1.0
 
+    # Advanced chart features (graduated sizing, multi-TF, trend break)
+    chart_uncertainty_score = 0.0
+    chart_position_multiplier = 1.0
+    chart_timeframe_aligned = 1.0
+    chart_alignment_score = 1.0
+    chart_trend_breaking = 0.0
+    chart_resume_ready = 1.0
+    chart_resume_confidence = 1.0
+
+    if chart_analysis is not None:
+        chart_uncertainty_score = chart_analysis.uncertainty_score
+        chart_position_multiplier = chart_analysis.position_size_multiplier
+        chart_timeframe_aligned = 1.0 if chart_analysis.timeframes_aligned else 0.0
+        chart_alignment_score = chart_analysis.alignment_score
+        chart_trend_breaking = 1.0 if chart_analysis.trend_strength_dropping else 0.0
+        chart_resume_ready = 1.0 if chart_analysis.resume_ready else 0.0
+        chart_resume_confidence = chart_analysis.resume_confidence
+
     return {
         "volatility": volatility,
         "price_momentum": price_momentum,
@@ -1629,4 +1756,12 @@ def extract_ml_features_from_market(
         "chart_confidence": chart_confidence,
         "chart_bullish_pattern": chart_bullish_pattern,
         "chart_bearish_pattern": chart_bearish_pattern,
+        # Advanced chart features
+        "chart_uncertainty_score": chart_uncertainty_score,
+        "chart_position_multiplier": chart_position_multiplier,
+        "chart_timeframe_aligned": chart_timeframe_aligned,
+        "chart_alignment_score": chart_alignment_score,
+        "chart_trend_breaking": chart_trend_breaking,
+        "chart_resume_ready": chart_resume_ready,
+        "chart_resume_confidence": chart_resume_confidence,
     }
