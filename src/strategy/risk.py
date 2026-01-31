@@ -113,7 +113,19 @@ class RiskManager:
         if self.peak_bankroll > 0:
             drawdown = (self.peak_bankroll - current_equity) / self.peak_bankroll
             if drawdown >= trading.max_drawdown_pct:
-                return (False, f"Drawdown {drawdown:.1%} exceeds {trading.max_drawdown_pct:.0%} limit")
+                # AUTO-RESET: If no positions, losses are realized - reset peak to continue trading
+                # This prevents the bot from being stuck forever after a losing streak
+                if len(self.positions) == 0:
+                    old_peak = self.peak_bankroll
+                    self.peak_bankroll = current_equity
+                    self.consecutive_losses = 0
+                    logger.warning(
+                        f"🔄 AUTO-RESET DRAWDOWN: No positions, acknowledging realized losses. "
+                        f"Peak ${old_peak:.2f} → ${current_equity:.2f}"
+                    )
+                    # Don't return False - allow trading to continue
+                else:
+                    return (False, f"Drawdown {drawdown:.1%} exceeds {trading.max_drawdown_pct:.0%} limit")
 
         # Check win rate (only after minimum trades)
         if len(self.trade_history) >= trading.min_trades_for_winrate:
