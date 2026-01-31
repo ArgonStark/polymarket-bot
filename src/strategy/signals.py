@@ -42,6 +42,22 @@ except ImportError:
     def get_multi_timeframe_trends(asset: str) -> dict:
         return {"trend_1h": 0.0, "trend_4h": 0.0, "trend_1d": 0.0}
 
+# Import Binance chart analyzer for comprehensive technical analysis
+try:
+    from ..data.binance_chart import (
+        analyze_chart,
+        get_chart_bias,
+        MarketType,
+        TrendChange,
+    )
+    CHART_ANALYSIS_AVAILABLE = True
+except ImportError:
+    CHART_ANALYSIS_AVAILABLE = False
+    def analyze_chart(asset: str):
+        return None
+    def get_chart_bias(asset: str):
+        return "neutral", 0.5
+
 
 logger = logging.getLogger(__name__)
 
@@ -535,40 +551,123 @@ class SignalGenerator:
                 f"Watching for Chainlink to follow..."
             )
 
+        # === COMPREHENSIVE CHART ANALYSIS ===
+        # Use Binance candlestick data for advanced trend analysis
+        chart_analysis = None
+        if CHART_ANALYSIS_AVAILABLE:
+            try:
+                chart_analysis = analyze_chart(market.asset)
+                if chart_analysis:
+                    # Log comprehensive chart analysis at INFO level for visibility
+                    logger.info(
+                        f"📊 CHART ANALYSIS [{market.asset}]: "
+                        f"Type={chart_analysis.market_type.value} | "
+                        f"Bias={chart_analysis.bias} ({chart_analysis.confidence:.0%}) | "
+                        f"RSI={chart_analysis.rsi_14:.0f} | "
+                        f"Trends: 15m={chart_analysis.trend_15m:+.2f}, "
+                        f"1h={chart_analysis.trend_1h:+.2f}, "
+                        f"4h={chart_analysis.trend_4h:+.2f} | "
+                        f"Change={chart_analysis.trend_change.value}"
+                        + (f" | Pattern={chart_analysis.pattern_name}" if chart_analysis.pattern_name else "")
+                    )
+            except Exception as e:
+                logger.debug(f"Chart analysis failed for {market.asset}: {e}")
+
         # === TREND-FOLLOWING EDGE BOOST ===
         # Trade WITH the trend: boost edge when trend aligns with price position
         try:
-            trends = get_multi_timeframe_trends(market.asset)
-            trend_1h = trends.get("trend_1h", 0.0)
-            trend_4h = trends.get("trend_4h", 0.0)
-            trend_1d = trends.get("trend_1d", 0.0)
+            # Use chart analysis if available, otherwise fall back to simple trends
+            if chart_analysis:
+                trend_1h = chart_analysis.trend_1h
+                trend_4h = chart_analysis.trend_4h
+                trend_15m = chart_analysis.trend_15m
+                avg_trend = (trend_15m + trend_1h + trend_4h) / 3
+                chart_bias = chart_analysis.bias
+                chart_confidence = chart_analysis.confidence
+                market_type = chart_analysis.market_type.value
+                rsi = chart_analysis.rsi_14
+                trend_change = chart_analysis.trend_change.value
+                is_bullish_pattern = chart_analysis.is_bullish_pattern
+                is_bearish_pattern = chart_analysis.is_bearish_pattern
 
-            # Calculate average trend strength (-1 to +1)
-            avg_trend = (trend_1h + trend_4h + trend_1d) / 3
+                # Log comprehensive analysis
+                logger.debug(
+                    f"📊 CHART [{market.asset}]: {market_type} | Bias: {chart_bias} ({chart_confidence:.0%}) | "
+                    f"RSI: {rsi:.0f} | Trends: 15m={trend_15m:.2f}, 1h={trend_1h:.2f}, 4h={trend_4h:.2f}"
+                )
+            else:
+                # Fallback to simple trends
+                trends = get_multi_timeframe_trends(market.asset)
+                trend_1h = trends.get("trend_1h", 0.0)
+                trend_4h = trends.get("trend_4h", 0.0)
+                trend_15m = 0.0
+                avg_trend = (trend_1h + trend_4h) / 2
+                chart_bias = "neutral"
+                chart_confidence = 0.5
+                rsi = 50.0
+                is_bullish_pattern = False
+                is_bearish_pattern = False
+                trend_change = "no_change"
 
             # Determine price position relative to target
             price_below_target = current_price < market.target_price
             price_above_target = current_price > market.target_price
 
-            # Strong UP trend (avg > 0.3) + price below target = boost UP
-            # Logic: price is trending up and below target, likely to rise above
+            # === EDGE BOOST LOGIC ===
+            # 1. Trend alignment boost
             if avg_trend > 0.3 and price_below_target:
-                trend_boost = min(0.05, avg_trend * 0.1)  # Up to 5% boost
+                trend_boost = min(0.05, avg_trend * 0.1)
                 edge_up += trend_boost
                 logger.info(
-                    f"📈 TREND-FOLLOWING [{market.asset}]: UP trend ({avg_trend:.2f}) + "
-                    f"price below target → UP edge +{trend_boost:.1%}"
+                    f"📈 TREND [{market.asset}]: UP trend ({avg_trend:.2f}) + below target → UP +{trend_boost:.1%}"
                 )
-
-            # Strong DOWN trend (avg < -0.3) + price above target = boost DOWN
-            # Logic: price is trending down and above target, likely to fall below
             elif avg_trend < -0.3 and price_above_target:
-                trend_boost = min(0.05, abs(avg_trend) * 0.1)  # Up to 5% boost
+                trend_boost = min(0.05, abs(avg_trend) * 0.1)
                 edge_down += trend_boost
                 logger.info(
-                    f"📉 TREND-FOLLOWING [{market.asset}]: DOWN trend ({avg_trend:.2f}) + "
-                    f"price above target → DOWN edge +{trend_boost:.1%}"
+                    f"📉 TREND [{market.asset}]: DOWN trend ({avg_trend:.2f}) + above target → DOWN +{trend_boost:.1%}"
                 )
+
+            # 2. Chart bias boost (from comprehensive analysis)
+            if chart_analysis and chart_confidence > 0.6:
+                bias_boost = (chart_confidence - 0.5) * 0.1  # Up to 5% boost
+                if chart_bias == "bullish" and price_below_target:
+                    edge_up += bias_boost
+                    logger.info(f"📊 BIAS [{market.asset}]: Bullish ({chart_confidence:.0%}) → UP +{bias_boost:.1%}")
+                elif chart_bias == "bearish" and price_above_target:
+                    edge_down += bias_boost
+                    logger.info(f"📊 BIAS [{market.asset}]: Bearish ({chart_confidence:.0%}) → DOWN +{bias_boost:.1%}")
+
+            # 3. RSI extremes boost (oversold/overbought)
+            if chart_analysis:
+                if rsi < 25 and price_below_target:
+                    rsi_boost = 0.03  # Oversold bounce expected
+                    edge_up += rsi_boost
+                    logger.info(f"📉 RSI [{market.asset}]: Oversold ({rsi:.0f}) → UP +{rsi_boost:.1%}")
+                elif rsi > 75 and price_above_target:
+                    rsi_boost = 0.03  # Overbought pullback expected
+                    edge_down += rsi_boost
+                    logger.info(f"📈 RSI [{market.asset}]: Overbought ({rsi:.0f}) → DOWN +{rsi_boost:.1%}")
+
+            # 4. Pattern recognition boost
+            if is_bullish_pattern and price_below_target:
+                pattern_boost = 0.02
+                edge_up += pattern_boost
+                logger.info(f"🕯️ PATTERN [{market.asset}]: Bullish pattern → UP +{pattern_boost:.1%}")
+            elif is_bearish_pattern and price_above_target:
+                pattern_boost = 0.02
+                edge_down += pattern_boost
+                logger.info(f"🕯️ PATTERN [{market.asset}]: Bearish pattern → DOWN +{pattern_boost:.1%}")
+
+            # 5. Trend reversal signal (major boost)
+            if trend_change == "bullish_reversal" and price_below_target:
+                reversal_boost = 0.04
+                edge_up += reversal_boost
+                logger.info(f"🔄 REVERSAL [{market.asset}]: Bullish reversal → UP +{reversal_boost:.1%}")
+            elif trend_change == "bearish_reversal" and price_above_target:
+                reversal_boost = 0.04
+                edge_down += reversal_boost
+                logger.info(f"🔄 REVERSAL [{market.asset}]: Bearish reversal → DOWN +{reversal_boost:.1%}")
 
         except Exception as e:
             logger.debug(f"Trend-following analysis failed for {market.asset}: {e}")
