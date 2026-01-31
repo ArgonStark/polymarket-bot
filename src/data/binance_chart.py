@@ -179,6 +179,23 @@ class ChartAnalysis:
     uncertainty_score: float = 0.0  # 0 to 1
     uncertainty_reason: str = ""  # Why market is uncertain
 
+    # Graduated position sizing (replaces binary pause)
+    position_size_multiplier: float = 1.0  # 0.0 to 1.0 based on uncertainty
+
+    # Multi-timeframe confirmation
+    timeframes_aligned: bool = True  # True if 15m, 1h trends agree
+    alignment_score: float = 1.0  # 0.0 (disagreement) to 1.0 (full alignment)
+    higher_timeframe_bias: str = "neutral"  # 1h trend direction
+
+    # Trend break detection
+    trend_strength_dropping: bool = False  # True if strength dropped >30% recently
+    ema_distance_pct: float = 0.0  # Distance between EMA9 and EMA21 as %
+
+    # Resume confirmation tracking
+    consecutive_candles_same_dir: int = 0  # Count of candles in same direction
+    resume_ready: bool = True  # False during pause, True when safe to resume
+    resume_confidence: float = 1.0  # Confidence in resuming (0-1)
+
     # Recommendation
     bias: str = "neutral"  # "bullish", "bearish", "neutral"
     confidence: float = 0.5  # 0 to 1
@@ -201,6 +218,19 @@ class ChartAnalysis:
             "is_uncertain": self.is_uncertain,
             "uncertainty_score": self.uncertainty_score,
             "uncertainty_reason": self.uncertainty_reason,
+            # Graduated position sizing
+            "position_size_multiplier": self.position_size_multiplier,
+            # Multi-timeframe
+            "timeframes_aligned": self.timeframes_aligned,
+            "alignment_score": self.alignment_score,
+            "higher_timeframe_bias": self.higher_timeframe_bias,
+            # Trend break
+            "trend_strength_dropping": self.trend_strength_dropping,
+            "ema_distance_pct": self.ema_distance_pct,
+            # Resume
+            "consecutive_candles_same_dir": self.consecutive_candles_same_dir,
+            "resume_ready": self.resume_ready,
+            "resume_confidence": self.resume_confidence,
         }
 
 
@@ -604,6 +634,232 @@ class BinanceChartAnalyzer:
 
         return is_uncertain, uncertainty_score, reason
 
+    def calculate_graduated_position_size(
+        self,
+        uncertainty_score: float,
+        alignment_score: float,
+        trend_strength_dropping: bool,
+    ) -> float:
+        """
+        Calculate graduated position size multiplier based on market conditions.
+
+        Instead of binary pause (trade or don't trade), we scale position size:
+        - Full confidence (1.0): 100% position
+        - Moderate uncertainty: 50-75% position
+        - High uncertainty: 25-50% position
+        - Extreme uncertainty: 0% (full pause)
+
+        Args:
+            uncertainty_score: Market uncertainty (0-1)
+            alignment_score: Timeframe alignment (0-1)
+            trend_strength_dropping: True if trend is weakening
+
+        Returns:
+            Position size multiplier (0.0 to 1.0)
+        """
+        # Start with full position
+        multiplier = 1.0
+
+        # Reduce based on uncertainty (graduated, not binary)
+        if uncertainty_score < 0.3:
+            # Low uncertainty: full position
+            uncertainty_penalty = 0.0
+        elif uncertainty_score < 0.5:
+            # Moderate: 75% position
+            uncertainty_penalty = 0.25
+        elif uncertainty_score < 0.7:
+            # High: 50% position
+            uncertainty_penalty = 0.50
+        elif uncertainty_score < 0.85:
+            # Very high: 25% position
+            uncertainty_penalty = 0.75
+        else:
+            # Extreme: full pause
+            uncertainty_penalty = 1.0
+
+        multiplier -= uncertainty_penalty
+
+        # Reduce based on timeframe misalignment
+        if alignment_score < 0.5:
+            # Major disagreement: reduce by 25%
+            multiplier *= 0.75
+        elif alignment_score < 0.75:
+            # Moderate disagreement: reduce by 10%
+            multiplier *= 0.90
+
+        # Reduce if trend is breaking
+        if trend_strength_dropping:
+            multiplier *= 0.75  # Extra 25% reduction
+
+        return max(0.0, min(1.0, multiplier))
+
+    def calculate_timeframe_alignment(
+        self,
+        trend_15m: float,
+        trend_1h: float,
+        trend_4h: float,
+    ) -> tuple[bool, float, str]:
+        """
+        Calculate multi-timeframe alignment score.
+
+        Alignment is higher when all timeframes agree on direction.
+        Perfect alignment: all positive or all negative.
+        Misalignment: mixed signals.
+
+        Returns:
+            Tuple of (is_aligned, alignment_score 0-1, higher_timeframe_bias)
+        """
+        # Determine higher timeframe bias (1h is most important)
+        if trend_1h > 0.2:
+            higher_tf_bias = "bullish"
+        elif trend_1h < -0.2:
+            higher_tf_bias = "bearish"
+        else:
+            higher_tf_bias = "neutral"
+
+        # Check if all trends agree on direction
+        all_positive = trend_15m > 0 and trend_1h > 0 and trend_4h > 0
+        all_negative = trend_15m < 0 and trend_1h < 0 and trend_4h < 0
+
+        # Calculate alignment score
+        if all_positive or all_negative:
+            # Full alignment
+            alignment_score = 1.0
+            is_aligned = True
+        else:
+            # Calculate how aligned they are
+            # Count how many are in each direction
+            positive_count = sum(1 for t in [trend_15m, trend_1h, trend_4h] if t > 0.1)
+            negative_count = sum(1 for t in [trend_15m, trend_1h, trend_4h] if t < -0.1)
+            neutral_count = 3 - positive_count - negative_count
+
+            # Alignment is higher when more agree
+            max_agreement = max(positive_count, negative_count)
+            alignment_score = max_agreement / 3.0
+
+            # 15m disagreeing with 1h is particularly bad
+            if (trend_15m > 0.2 and trend_1h < -0.2) or (trend_15m < -0.2 and trend_1h > 0.2):
+                alignment_score *= 0.5  # Heavy penalty
+
+            is_aligned = alignment_score >= 0.66  # At least 2/3 agree
+
+        return is_aligned, alignment_score, higher_tf_bias
+
+    def detect_trend_break(
+        self,
+        candles: List[Candle],
+        current_trend_strength: float,
+    ) -> tuple[bool, float, float]:
+        """
+        Detect if trend is breaking down.
+
+        Signs of trend break:
+        1. EMA distance collapsing (EMAs converging)
+        2. Rapid drop in trend strength
+        3. Price whipsawing through EMAs
+
+        Returns:
+            Tuple of (is_breaking, ema_distance_pct, strength_change)
+        """
+        if len(candles) < 30:
+            return False, 0.0, 0.0
+
+        closes = [c.close for c in candles]
+
+        # Calculate current EMAs
+        ema_9 = self.calculate_ema(closes, 9)
+        ema_21 = self.calculate_ema(closes, 21)
+
+        # EMA distance as percentage
+        ema_distance_pct = abs(ema_9 - ema_21) / ema_21 * 100
+
+        # Calculate trend strength 5 candles ago for comparison
+        if len(closes) > 5:
+            closes_5_ago = closes[:-5]
+            old_trend = self.detect_trend(candles[:-5])
+            strength_change = abs(current_trend_strength) - abs(old_trend)
+        else:
+            strength_change = 0.0
+
+        # Detect trend break conditions
+        is_breaking = False
+
+        # EMAs very close (about to cross or just crossed)
+        if ema_distance_pct < 0.15:  # Within 0.15%
+            is_breaking = True
+
+        # Rapid strength drop (>30% drop in 5 candles)
+        if strength_change < -0.3:
+            is_breaking = True
+
+        return is_breaking, ema_distance_pct, strength_change
+
+    def calculate_resume_confidence(
+        self,
+        candles: List[Candle],
+        rsi: float,
+        uncertainty_score: float,
+    ) -> tuple[bool, int, float]:
+        """
+        Calculate confidence in resuming trading after a pause.
+
+        Requirements to resume with full confidence:
+        1. 3+ consecutive candles in same direction
+        2. RSI decisive (not in 40-60 neutral zone)
+        3. Uncertainty has dropped below 50%
+
+        Returns:
+            Tuple of (resume_ready, consecutive_candles, confidence)
+        """
+        if len(candles) < 5:
+            return True, 0, 1.0
+
+        # Count consecutive candles in same direction
+        consecutive = 0
+        last_direction = None
+
+        for candle in reversed(candles[-10:]):
+            if candle.is_bullish:
+                direction = "up"
+            elif candle.is_bearish:
+                direction = "down"
+            else:
+                direction = "neutral"
+
+            if last_direction is None:
+                last_direction = direction
+                consecutive = 1
+            elif direction == last_direction and direction != "neutral":
+                consecutive += 1
+            else:
+                break
+
+        # Check RSI decisiveness
+        rsi_decisive = rsi < 40 or rsi > 60
+
+        # Calculate resume confidence
+        confidence = 0.0
+
+        # Consecutive candles (max 0.4)
+        confidence += min(consecutive / 5.0, 0.4)  # 5 candles = max 0.4
+
+        # RSI decisiveness (max 0.3)
+        if rsi_decisive:
+            confidence += 0.3
+        elif rsi < 45 or rsi > 55:
+            confidence += 0.15
+
+        # Low uncertainty (max 0.3)
+        if uncertainty_score < 0.3:
+            confidence += 0.3
+        elif uncertainty_score < 0.5:
+            confidence += 0.15
+
+        # Ready to resume if confidence >= 0.6 and not highly uncertain
+        resume_ready = confidence >= 0.6 and uncertainty_score < 0.6
+
+        return resume_ready, consecutive, confidence
+
     def detect_patterns(self, candles: List[Candle]) -> tuple[bool, bool, str]:
         """
         Detect bullish/bearish candlestick patterns.
@@ -833,6 +1089,35 @@ class BinanceChartAnalyzer:
                 else:
                     uncertainty_reason = trend_change.value
 
+            # === MULTI-TIMEFRAME ALIGNMENT ===
+            timeframes_aligned, alignment_score, higher_tf_bias = self.calculate_timeframe_alignment(
+                trend_15m, trend_1h, trend_4h
+            )
+
+            # === TREND BREAK DETECTION ===
+            trend_strength_dropping, ema_distance_pct, strength_change = self.detect_trend_break(
+                candles_15m, trend_strength
+            )
+
+            # === GRADUATED POSITION SIZING ===
+            position_size_multiplier = self.calculate_graduated_position_size(
+                uncertainty_score, alignment_score, trend_strength_dropping
+            )
+
+            # === RESUME CONFIDENCE ===
+            resume_ready, consecutive_candles, resume_confidence = self.calculate_resume_confidence(
+                candles_15m, rsi_14, uncertainty_score
+            )
+
+            # If currently paused (high uncertainty), check if we can resume
+            if is_uncertain and uncertainty_score >= 0.6:
+                if not resume_ready:
+                    # Still in pause mode
+                    position_size_multiplier = 0.0
+                else:
+                    # Resuming - use reduced position initially
+                    position_size_multiplier = min(position_size_multiplier, 0.5)  # Cooldown: 50% max
+
             analysis = ChartAnalysis(
                 asset=asset,
                 timestamp=datetime.now(timezone.utc),
@@ -867,6 +1152,20 @@ class BinanceChartAnalyzer:
                 is_uncertain=is_uncertain,
                 uncertainty_score=uncertainty_score,
                 uncertainty_reason=uncertainty_reason,
+                # Graduated position sizing
+                position_size_multiplier=position_size_multiplier,
+                # Multi-timeframe confirmation
+                timeframes_aligned=timeframes_aligned,
+                alignment_score=alignment_score,
+                higher_timeframe_bias=higher_tf_bias,
+                # Trend break detection
+                trend_strength_dropping=trend_strength_dropping,
+                ema_distance_pct=ema_distance_pct,
+                # Resume confirmation
+                consecutive_candles_same_dir=consecutive_candles,
+                resume_ready=resume_ready,
+                resume_confidence=resume_confidence,
+                # Bias
                 bias=bias,
                 confidence=confidence,
             )
@@ -969,6 +1268,109 @@ def is_market_uncertain(asset: str) -> tuple[bool, float, str]:
     if analysis:
         return analysis.is_uncertain, analysis.uncertainty_score, analysis.uncertainty_reason
     return False, 0.0, ""
+
+
+# Cooldown tracking for post-uncertainty trading
+# Maps asset -> {"trades_since_resume": int, "last_uncertainty_time": datetime, "in_cooldown": bool}
+_cooldown_tracker: Dict[str, dict] = {}
+
+
+def get_position_size_multiplier(asset: str) -> tuple[float, str]:
+    """
+    Get the recommended position size multiplier for an asset.
+
+    This implements graduated position sizing instead of binary pause:
+    - 1.0: Full position (low uncertainty, aligned timeframes)
+    - 0.75: Reduced position (moderate uncertainty)
+    - 0.5: Half position (high uncertainty or cooldown)
+    - 0.25: Quarter position (very high uncertainty)
+    - 0.0: Full pause (extreme uncertainty, not ready to resume)
+
+    Returns:
+        Tuple of (multiplier 0-1, reason)
+    """
+    analysis = analyze_chart(asset)
+    if not analysis:
+        return 1.0, "no chart data"
+
+    multiplier = analysis.position_size_multiplier
+    reasons = []
+
+    if analysis.is_uncertain:
+        reasons.append(f"uncertain ({analysis.uncertainty_score:.0%})")
+
+    if not analysis.timeframes_aligned:
+        reasons.append(f"timeframes misaligned ({analysis.alignment_score:.0%})")
+
+    if analysis.trend_strength_dropping:
+        reasons.append("trend breaking")
+
+    if not analysis.resume_ready and analysis.is_uncertain:
+        reasons.append(f"waiting for resume ({analysis.resume_confidence:.0%})")
+
+    # Check cooldown
+    cooldown_info = _cooldown_tracker.get(asset.upper(), {})
+    if cooldown_info.get("in_cooldown", False):
+        trades_since = cooldown_info.get("trades_since_resume", 0)
+        if trades_since < 2:
+            multiplier = min(multiplier, 0.5)
+            reasons.append(f"cooldown ({trades_since}/2 trades)")
+
+    reason = ", ".join(reasons) if reasons else "full confidence"
+    return multiplier, reason
+
+
+def record_trade_for_cooldown(asset: str, uncertainty_was_high: bool = False):
+    """
+    Record a trade for cooldown tracking.
+
+    Call this after each trade to track cooldown progress.
+    """
+    asset_upper = asset.upper()
+
+    if asset_upper not in _cooldown_tracker:
+        _cooldown_tracker[asset_upper] = {
+            "trades_since_resume": 0,
+            "last_uncertainty_time": None,
+            "in_cooldown": False,
+        }
+
+    tracker = _cooldown_tracker[asset_upper]
+
+    if uncertainty_was_high:
+        # Just came out of high uncertainty - start cooldown
+        tracker["in_cooldown"] = True
+        tracker["trades_since_resume"] = 0
+        tracker["last_uncertainty_time"] = datetime.now(timezone.utc)
+    elif tracker["in_cooldown"]:
+        # In cooldown - count trades
+        tracker["trades_since_resume"] += 1
+        if tracker["trades_since_resume"] >= 2:
+            # Cooldown complete
+            tracker["in_cooldown"] = False
+
+
+def get_multi_timeframe_decision(asset: str) -> tuple[str, float, bool]:
+    """
+    Get trading decision based on multi-timeframe analysis.
+
+    Returns:
+        Tuple of (recommended_side "UP"/"DOWN"/"NONE", confidence, should_trade)
+    """
+    analysis = analyze_chart(asset)
+    if not analysis:
+        return "NONE", 0.5, True
+
+    # Use higher timeframe bias as primary direction
+    if analysis.higher_timeframe_bias == "bullish" and analysis.alignment_score >= 0.66:
+        return "UP", analysis.alignment_score, True
+    elif analysis.higher_timeframe_bias == "bearish" and analysis.alignment_score >= 0.66:
+        return "DOWN", analysis.alignment_score, True
+    elif analysis.alignment_score < 0.5:
+        # Significant disagreement - be cautious
+        return "NONE", analysis.alignment_score, False
+    else:
+        return "NONE", analysis.alignment_score, True
 
 
 def should_pause_trading(asset: str, min_uncertainty: float = 0.5) -> tuple[bool, str]:
