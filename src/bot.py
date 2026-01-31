@@ -3018,17 +3018,52 @@ class TradingBot:
                 logger.info(f"[{market.asset}] ⏸️ HISTORY (repeat): {history_reason}")
             return
 
+        # === CHART-BASED FILTER ===
+        # Block trades that go against strong chart signals
+        # This is the PRIMARY filter - chart analysis determines if we should trade
+        chart_analysis = None
+        if CHART_ANALYSIS_AVAILABLE:
+            try:
+                chart_analysis = analyze_chart(market.asset)
+                if chart_analysis:
+                    chart_bias = chart_analysis.bias
+                    chart_confidence = chart_analysis.confidence
+                    market_type = chart_analysis.market_type.value
+                    avg_trend = (chart_analysis.trend_15m + chart_analysis.trend_1h + chart_analysis.trend_4h) / 3
+
+                    # Determine chart direction
+                    chart_says_down = (chart_bias == "bearish" and chart_confidence >= 0.6) or avg_trend < -0.5
+                    chart_says_up = (chart_bias == "bullish" and chart_confidence >= 0.6) or avg_trend > 0.5
+
+                    # Calculate signal strength
+                    chart_signal_strength = chart_confidence if chart_bias != "neutral" else abs(avg_trend)
+                    if "strong_downtrend" in market_type or "strong_uptrend" in market_type:
+                        chart_signal_strength = min(1.0, chart_signal_strength + 0.2)
+
+                    # Block trades that go AGAINST strong chart signals
+                    if chart_signal_strength >= 0.7:  # Strong chart signal
+                        if chart_says_down and signal.side == Side.UP:
+                            logger.info(
+                                f"[{market.asset}] ❌ CHART BLOCK: Taking UP against strong BEARISH chart "
+                                f"({market_type}, {chart_bias} {chart_confidence:.0%}, trend={avg_trend:.2f})"
+                            )
+                            return
+                        elif chart_says_up and signal.side == Side.DOWN:
+                            logger.info(
+                                f"[{market.asset}] ❌ CHART BLOCK: Taking DOWN against strong BULLISH chart "
+                                f"({market_type}, {chart_bias} {chart_confidence:.0%}, trend={avg_trend:.2f})"
+                            )
+                            return
+
+                    logger.info(f"[{market.asset}] ✓ Chart filter passed")
+
+            except Exception as e:
+                logger.debug(f"Chart analysis failed: {e}")
+
         # ML filter - check predicted win probability (do this BEFORE sizing for Kelly)
         logger.info(f"[{market.asset}] ✓3 ML filter")
         ml_confidence = None
-        chart_analysis = None
         if self.ml_predictor:
-            # Get chart analysis for ML features
-            if CHART_ANALYSIS_AVAILABLE:
-                try:
-                    chart_analysis = analyze_chart(market.asset)
-                except Exception as e:
-                    logger.debug(f"Chart analysis failed for ML features: {e}")
 
             # Extract all ML features using the helper function
             ml_features = extract_ml_features_from_market(
