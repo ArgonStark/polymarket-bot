@@ -916,6 +916,48 @@ class SignalGenerator:
                             f"📍 NEAR SUPPLY [{market.asset}]: Price near resistance ${chart_analysis.nearest_supply:,.2f} → DOWN +2%"
                         )
 
+            # === BTC TREND FOLLOWING ===
+            # BTC leads the market - follow its trend for all assets
+            # For altcoins: stronger correlation (they follow BTC)
+            # For BTC itself: trend following based on momentum
+            if self.binance_feed:
+                try:
+                    btc_velocity = self.binance_feed.get_velocity("BTC")
+                    BTC_VELOCITY_THRESHOLD = 0.0002  # 0.02% per second = significant move
+
+                    if btc_velocity is not None and abs(btc_velocity) > BTC_VELOCITY_THRESHOLD:
+                        # Determine impact multiplier based on asset
+                        # Altcoins follow BTC more strongly than BTC itself
+                        if market.asset == "BTC":
+                            impact_multiplier = 1.0  # BTC trend following
+                        elif market.asset == "ETH":
+                            impact_multiplier = 1.2  # ETH closely correlated
+                        elif market.asset == "SOL":
+                            impact_multiplier = 1.5  # SOL more volatile, stronger correlation
+                        else:  # XRP
+                            impact_multiplier = 1.3  # XRP moderately correlated
+
+                        if btc_velocity < -BTC_VELOCITY_THRESHOLD:
+                            # BTC dumping - bearish bias
+                            btc_impact = min(0.08, abs(btc_velocity) * 150 * impact_multiplier)  # Cap at 8%
+                            edge_down += btc_impact
+                            edge_up -= btc_impact * 0.7  # Stronger penalty for going against BTC
+                            logger.info(
+                                f"₿ BTC TREND [{market.asset}]: BTC dumping ({btc_velocity:.4%}/s) → "
+                                f"DOWN +{btc_impact:.1%}, UP -{btc_impact*0.7:.1%}"
+                            )
+                        elif btc_velocity > BTC_VELOCITY_THRESHOLD:
+                            # BTC pumping - bullish bias
+                            btc_impact = min(0.08, abs(btc_velocity) * 150 * impact_multiplier)  # Cap at 8%
+                            edge_up += btc_impact
+                            edge_down -= btc_impact * 0.7  # Stronger penalty for going against BTC
+                            logger.info(
+                                f"₿ BTC TREND [{market.asset}]: BTC pumping ({btc_velocity:.4%}/s) → "
+                                f"UP +{btc_impact:.1%}, DOWN -{btc_impact*0.7:.1%}"
+                            )
+                except Exception as e:
+                    logger.debug(f"BTC trend check failed: {e}")
+
             # Log final decision
             logger.info(
                 f"📈 FINAL EDGES [{market.asset}]: UP={edge_up:.1%}, DOWN={edge_down:.1%} | "
