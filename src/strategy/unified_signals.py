@@ -18,6 +18,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Tuple
 
+# Use structured trading logger
+try:
+    from ..utils.trading_logger import get_trading_logger
+    USE_TRADING_LOGGER = True
+except ImportError:
+    USE_TRADING_LOGGER = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -893,13 +900,18 @@ def get_unified_signal_generator() -> UnifiedSignalGenerator:
     return _unified_generator
 
 
-def generate_unified_signal(chart_analysis, time_remaining: float = 900.0) -> UnifiedSignal:
+def generate_unified_signal(
+    chart_analysis,
+    time_remaining: float = 900.0,
+    asset: str = "",
+) -> UnifiedSignal:
     """
     Convenience function to generate a unified signal from chart analysis.
 
     Args:
         chart_analysis: ChartAnalysis object from binance_chart.py
         time_remaining: Seconds remaining in the market
+        asset: Asset symbol for logging
 
     Returns:
         UnifiedSignal with direction, strength, and adjustments
@@ -911,4 +923,25 @@ def generate_unified_signal(chart_analysis, time_remaining: float = 900.0) -> Un
     context.time_critical = time_remaining < 120
 
     generator = get_unified_signal_generator()
-    return generator.generate_signal(context, trend, reversion, confirmation)
+    signal = generator.generate_signal(context, trend, reversion, confirmation)
+
+    # Log using structured trading logger
+    if USE_TRADING_LOGGER and asset:
+        try:
+            tlog = get_trading_logger(asset)
+            tlog.signal_analysis(
+                direction=signal.direction.value.upper(),
+                strength=signal.strength.value.upper(),
+                confidence=signal.confidence,
+                context=signal.context.value,
+                strategy=signal.strategy_used,
+                edge_adjustment=signal.edge_adjustment,
+                primary_reason=signal.primary_reason,
+                supporting=signal.supporting_reasons,
+                contradicting=signal.contradicting_reasons,
+                time_remaining=time_remaining,
+            )
+        except Exception:
+            pass  # Don't let logging errors affect signal generation
+
+    return signal

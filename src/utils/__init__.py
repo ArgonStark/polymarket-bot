@@ -8,6 +8,13 @@ from .console import (
     print_config_box,
     Colors,
 )
+from .trading_logger import (
+    TradingLogger,
+    get_trading_logger,
+    configure_trading_logging,
+    SignalLog,
+    TradeLog,
+)
 
 __all__ = [
     "setup_logging",
@@ -18,4 +25,10 @@ __all__ = [
     "print_status_box",
     "print_config_box",
     "Colors",
+    # Trading logger
+    "TradingLogger",
+    "get_trading_logger",
+    "configure_trading_logging",
+    "SignalLog",
+    "TradeLog",
 ]
