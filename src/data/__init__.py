@@ -1,4 +1,4 @@
-"""Data layer for Chainlink, CLOB, Binance, and market discovery."""
+"""Data layer for Chainlink, CLOB, Binance, The Graph, and market discovery."""
 
 from .chainlink import ChainlinkFeed
 from .clob import CLOBFeed
@@ -10,6 +10,7 @@ from .historical import (
     fetch_all_historical_prices,
     prepopulate_price_histories,
 )
+from .thegraph import PolymarketGraph, get_graph_client, Redemption, Split, Merge, Condition
 
 __all__ = [
     "ChainlinkFeed",
@@ -22,4 +23,10 @@ __all__ = [
     "fetch_historical_prices",
     "fetch_all_historical_prices",
     "prepopulate_price_histories",
+    "PolymarketGraph",
+    "get_graph_client",
+    "Redemption",
+    "Split",
+    "Merge",
+    "Condition",
 ]

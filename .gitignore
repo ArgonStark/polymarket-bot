@@ -53,4 +53,4 @@ htmlcov/
 .DS_Store
 Thumbs.db
 ml_model.json
-data/
+/data/
