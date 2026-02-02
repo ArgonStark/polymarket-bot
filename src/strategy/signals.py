@@ -1263,22 +1263,12 @@ class SignalGenerator:
         unified_signal = None
         if UNIFIED_SIGNALS_AVAILABLE and chart_analysis:
             try:
-                unified_signal = generate_unified_signal(chart_analysis, time_remaining)
-
-                # Log unified signal analysis
-                logger.info(
-                    f"🎯 UNIFIED SIGNAL [{market.asset}]: "
-                    f"Direction={unified_signal.direction.value} | "
-                    f"Strength={unified_signal.strength.value} | "
-                    f"Context={unified_signal.context.value} | "
-                    f"Strategy={unified_signal.strategy_used} | "
-                    f"Confidence={unified_signal.confidence:.0%}"
+                # Generate signal (logging handled internally by generate_unified_signal)
+                unified_signal = generate_unified_signal(
+                    chart_analysis,
+                    time_remaining,
+                    asset=market.asset,
                 )
-
-                if unified_signal.supporting_reasons:
-                    logger.info(f"   ✓ Supporting: {', '.join(unified_signal.supporting_reasons[:3])}")
-                if unified_signal.contradicting_reasons:
-                    logger.info(f"   ✗ Contradicting: {', '.join(unified_signal.contradicting_reasons[:2])}")
 
                 # Apply unified signal edge adjustment (OVERRIDE chaotic adjustments)
                 # Reset edges to base probability values and apply unified adjustment
@@ -1286,15 +1276,12 @@ class SignalGenerator:
                 base_edge_down = calculate_edge(1 - true_prob_up, market_prob_down)
 
                 if unified_signal.direction == SignalDirection.UP:
-                    # Unified says UP - boost UP, penalize DOWN
                     edge_up = base_edge_up + unified_signal.edge_adjustment
                     edge_down = base_edge_down - (unified_signal.edge_adjustment * 0.5)
                 elif unified_signal.direction == SignalDirection.DOWN:
-                    # Unified says DOWN - boost DOWN, penalize UP
                     edge_down = base_edge_down + unified_signal.edge_adjustment
                     edge_up = base_edge_up - (unified_signal.edge_adjustment * 0.5)
                 else:
-                    # Neutral - reduce both edges slightly
                     edge_up = base_edge_up - 0.02
                     edge_down = base_edge_down - 0.02
 
@@ -1302,15 +1289,14 @@ class SignalGenerator:
                 self._position_multiplier = unified_signal.position_multiplier
                 self._position_multiplier_reason = unified_signal.primary_reason
 
-                logger.info(
-                    f"📊 UNIFIED EDGES [{market.asset}]: "
-                    f"UP={edge_up:.1%} (base {base_edge_up:.1%}), "
-                    f"DOWN={edge_down:.1%} (base {base_edge_down:.1%}) | "
-                    f"Position mult: {unified_signal.position_multiplier:.0%}"
+                # Single concise log for edge result
+                logger.debug(
+                    f"[{market.asset}] Edges: ↑{edge_up:.1%} ↓{edge_down:.1%} | "
+                    f"size={unified_signal.position_multiplier:.0%}"
                 )
 
             except Exception as e:
-                logger.debug(f"Unified signal generation failed for {market.asset}: {e}")
+                logger.debug(f"Unified signal failed for {market.asset}: {e}")
 
         # === CLAMP EDGES TO MINIMUM 0 ===
         # Negative edges mean the trade is expected to lose money
