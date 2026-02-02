@@ -1053,28 +1053,28 @@ class BinanceChartAnalyzer:
                 crosses_ema += 1
         whipsaw = crosses_ema >= 2  # 2+ crosses in last 10 candles
 
-        # Calculate uncertainty score
+        # Calculate uncertainty score (REDUCED penalties for more trading)
         uncertainty_score = 0.0
         reasons = []
 
         if emas_converging:
-            uncertainty_score += 0.35
+            uncertainty_score += 0.20  # Reduced from 0.35
             reasons.append("EMAs converging")
 
         if volatility_spike:
-            uncertainty_score += 0.25
+            uncertainty_score += 0.15  # Reduced from 0.25
             reasons.append("volatility spike")
 
         if signals_mixed:
-            uncertainty_score += 0.25
+            uncertainty_score += 0.15  # Reduced from 0.25
             reasons.append("mixed signals")
 
         if whipsaw:
-            uncertainty_score += 0.30
+            uncertainty_score += 0.20  # Reduced from 0.30
             reasons.append("whipsaw detected")
 
         uncertainty_score = min(1.0, uncertainty_score)
-        is_uncertain = uncertainty_score >= 0.5
+        is_uncertain = uncertainty_score >= 0.7  # Raised from 0.5 to allow more trading
 
         reason = ", ".join(reasons) if reasons else "stable"
 
@@ -1107,20 +1107,21 @@ class BinanceChartAnalyzer:
         multiplier = 1.0
 
         # Reduce based on uncertainty (graduated, not binary)
-        if uncertainty_score < 0.3:
-            # Low uncertainty: full position
+        # RELAXED thresholds - allow more trading even in uncertain conditions
+        if uncertainty_score < 0.4:
+            # Low-moderate uncertainty: full position
             uncertainty_penalty = 0.0
-        elif uncertainty_score < 0.5:
-            # Moderate: 75% position
-            uncertainty_penalty = 0.25
-        elif uncertainty_score < 0.7:
-            # High: 50% position
+        elif uncertainty_score < 0.6:
+            # Moderate: 85% position
+            uncertainty_penalty = 0.15
+        elif uncertainty_score < 0.8:
+            # High: 70% position
+            uncertainty_penalty = 0.30
+        elif uncertainty_score < 0.95:
+            # Very high: 50% position (still trade, just smaller)
             uncertainty_penalty = 0.50
-        elif uncertainty_score < 0.85:
-            # Very high: 25% position
-            uncertainty_penalty = 0.75
         else:
-            # Extreme: full pause
+            # Extreme (0.95+): full pause
             uncertainty_penalty = 1.0
 
         multiplier -= uncertainty_penalty

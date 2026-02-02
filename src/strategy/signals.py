@@ -648,14 +648,14 @@ class SignalGenerator:
 
                     if sizing_factors:
                         position_reason = ", ".join(sizing_factors)
-                        logger.info(
+                        logger.debug(
                             f"📏 POSITION SIZING [{market.asset}]: {position_multiplier:.0%} of normal | "
                             f"Factors: {position_reason}"
                         )
 
                     # === HARD PAUSE: Only pause if position multiplier is 0 AND not ready to resume ===
                     if position_multiplier == 0.0 and not chart_analysis.resume_ready:
-                        logger.info(
+                        logger.debug(
                             f"⏸️ MARKET PAUSE [{market.asset}]: Full pause - "
                             f"waiting for resume conditions | "
                             f"Uncertainty: {chart_analysis.uncertainty_score:.0%} | "
@@ -680,7 +680,7 @@ class SignalGenerator:
 
                     # === MULTI-TIMEFRAME ALIGNMENT CHECK ===
                     if not chart_analysis.timeframes_aligned and chart_analysis.alignment_score < 0.5:
-                        logger.info(
+                        logger.debug(
                             f"⚠️ TIMEFRAME CONFLICT [{market.asset}]: "
                             f"15m={chart_analysis.trend_15m:+.2f}, "
                             f"1h={chart_analysis.trend_1h:+.2f}, "
@@ -804,7 +804,8 @@ class SignalGenerator:
                 )
 
             # Strong bearish signals (traditional)
-            elif chart_bias == "bearish" and chart_confidence >= 0.6:
+            # RELAXED: lowered confidence threshold from 0.6 to 0.5
+            elif chart_bias == "bearish" and chart_confidence >= 0.5:
                 chart_says_down = True
                 chart_signal_strength = chart_confidence
 
@@ -815,7 +816,8 @@ class SignalGenerator:
                     chart_signal_strength = min(1.0, chart_signal_strength + 0.2)
 
             # Strong bullish signals (traditional)
-            elif chart_bias == "bullish" and chart_confidence >= 0.6:
+            # RELAXED: lowered confidence threshold from 0.6 to 0.5
+            elif chart_bias == "bullish" and chart_confidence >= 0.5:
                 chart_says_up = True
                 chart_signal_strength = chart_confidence
 
@@ -825,13 +827,21 @@ class SignalGenerator:
                     chart_signal_strength = min(1.0, chart_signal_strength + 0.2)
 
             # Trend-based signals (even if bias is neutral)
+            # RELAXED: lowered trend threshold from 0.5 to 0.3
             if not chart_says_up and not chart_says_down:
-                if avg_trend < -0.5:  # Strong downtrend
+                if avg_trend < -0.3:  # Moderate downtrend (was -0.5)
                     chart_says_down = True
-                    chart_signal_strength = min(1.0, abs(avg_trend))
-                elif avg_trend > 0.5:  # Strong uptrend
+                    chart_signal_strength = min(1.0, abs(avg_trend) * 1.5)
+                elif avg_trend > 0.3:  # Moderate uptrend (was 0.5)
                     chart_says_up = True
-                    chart_signal_strength = min(1.0, avg_trend)
+                    chart_signal_strength = min(1.0, avg_trend * 1.5)
+                # NEW: In ranging markets, use RSI to pick direction
+                elif rsi < 35:
+                    chart_says_up = True  # Oversold → expect bounce
+                    chart_signal_strength = 0.55
+                elif rsi > 65:
+                    chart_says_down = True  # Overbought → expect pullback
+                    chart_signal_strength = 0.55
 
             # === APPLY CHART DECISION TO EDGES ===
             # When chart gives a clear signal, it OVERRIDES probability-based edges
