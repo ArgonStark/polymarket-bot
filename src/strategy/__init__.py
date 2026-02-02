@@ -9,6 +9,15 @@ from .ml_predictor import (
     calculate_price_trend,
     extract_ml_features_from_market,
 )
+from .unified_signals import (
+    UnifiedSignalGenerator,
+    UnifiedSignal,
+    MarketContext,
+    SignalDirection,
+    SignalStrength,
+    generate_unified_signal,
+    get_unified_signal_generator,
+)
 
 __all__ = [
     "SignalGenerator",
@@ -18,4 +27,12 @@ __all__ = [
     "get_ml_predictor",
     "calculate_price_trend",
     "extract_ml_features_from_market",
+    # Unified signals
+    "UnifiedSignalGenerator",
+    "UnifiedSignal",
+    "MarketContext",
+    "SignalDirection",
+    "SignalStrength",
+    "generate_unified_signal",
+    "get_unified_signal_generator",
 ]
