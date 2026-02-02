@@ -271,6 +271,14 @@ class SequenceMemory:
         if normalized:
             self.states[asset].update(normalized[-1], outcome)
 
+        # Log sequence addition
+        outcome_str = "WIN" if outcome == 1 else ("LOSS" if outcome == 0 else "PENDING")
+        logger.debug(
+            f"📊 SEQ [{asset}]: Added sequence | "
+            f"len={len(normalized)} | outcome={outcome_str} | "
+            f"total_seqs={len(self.sequences[asset])}"
+        )
+
         # Save periodically
         total_seqs = sum(len(s) for s in self.sequences.values())
         if total_seqs % 10 == 0:
@@ -335,6 +343,10 @@ class SequenceMemory:
         matches = self.find_similar_patterns(asset, current_prices)
 
         if len(matches) < self.min_matches_for_prediction:
+            logger.debug(
+                f"📊 SEQ [{asset}]: Insufficient pattern matches | "
+                f"found={len(matches)} | required={self.min_matches_for_prediction}"
+            )
             return 0.5, 0.0, f"Insufficient matches ({len(matches)}/{self.min_matches_for_prediction})"
 
         # Calculate weighted outcome based on similarity
@@ -373,6 +385,14 @@ class SequenceMemory:
         confidence = (avg_similarity * 0.4 + consistency * 0.4 + match_factor * 0.2)
 
         reason = f"Pattern match: {n_matches} similar, avg_sim={avg_similarity:.2f}, consistency={consistency:.2f}"
+
+        # Log prediction result
+        direction = "UP" if prob_up > 0.5 else ("DOWN" if prob_up < 0.5 else "NEUTRAL")
+        logger.info(
+            f"📊 SEQ PREDICT [{asset}]: {direction} {prob_up:.1%} | "
+            f"confidence={confidence:.1%} | matches={n_matches} | "
+            f"avg_sim={avg_similarity:.2f}"
+        )
 
         return prob_up, confidence, reason
 

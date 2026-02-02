@@ -467,6 +467,24 @@ class TradingBot:
                             ml_trend_1h=order_data.get("ml_trend_1h"),
                             ml_trend_4h=order_data.get("ml_trend_4h"),
                             ml_trend_1d=order_data.get("ml_trend_1d"),
+                            # NEW INDICATOR FEATURES
+                            ml_macd_histogram=order_data.get("ml_macd_histogram"),
+                            ml_macd_crossover=order_data.get("ml_macd_crossover"),
+                            ml_bb_bandwidth=order_data.get("ml_bb_bandwidth"),
+                            ml_bb_position=order_data.get("ml_bb_position"),
+                            ml_stoch_k=order_data.get("ml_stoch_k"),
+                            ml_stoch_d=order_data.get("ml_stoch_d"),
+                            ml_stoch_signal=order_data.get("ml_stoch_signal"),
+                            ml_rsi_divergence=order_data.get("ml_rsi_divergence"),
+                            ml_rsi_divergence_strength=order_data.get("ml_rsi_divergence_strength"),
+                            ml_volume_ratio=order_data.get("ml_volume_ratio"),
+                            ml_is_high_volume=order_data.get("ml_is_high_volume"),
+                            ml_obv_trend=order_data.get("ml_obv_trend"),
+                            ml_ha_trend=order_data.get("ml_ha_trend"),
+                            ml_ha_consecutive=order_data.get("ml_ha_consecutive"),
+                            ml_ha_strength=order_data.get("ml_ha_strength"),
+                            ml_vwap_distance_pct=order_data.get("ml_vwap_distance_pct"),
+                            ml_vwap_position=order_data.get("ml_vwap_position"),
                         )
 
                         # Record in trade history
@@ -523,6 +541,24 @@ class TradingBot:
                                 ml_trend_1h=order_data.get("ml_trend_1h"),
                                 ml_trend_4h=order_data.get("ml_trend_4h"),
                                 ml_trend_1d=order_data.get("ml_trend_1d"),
+                                # NEW INDICATOR FEATURES
+                                ml_macd_histogram=order_data.get("ml_macd_histogram"),
+                                ml_macd_crossover=order_data.get("ml_macd_crossover"),
+                                ml_bb_bandwidth=order_data.get("ml_bb_bandwidth"),
+                                ml_bb_position=order_data.get("ml_bb_position"),
+                                ml_stoch_k=order_data.get("ml_stoch_k"),
+                                ml_stoch_d=order_data.get("ml_stoch_d"),
+                                ml_stoch_signal=order_data.get("ml_stoch_signal"),
+                                ml_rsi_divergence=order_data.get("ml_rsi_divergence"),
+                                ml_rsi_divergence_strength=order_data.get("ml_rsi_divergence_strength"),
+                                ml_volume_ratio=order_data.get("ml_volume_ratio"),
+                                ml_is_high_volume=order_data.get("ml_is_high_volume"),
+                                ml_obv_trend=order_data.get("ml_obv_trend"),
+                                ml_ha_trend=order_data.get("ml_ha_trend"),
+                                ml_ha_consecutive=order_data.get("ml_ha_consecutive"),
+                                ml_ha_strength=order_data.get("ml_ha_strength"),
+                                ml_vwap_distance_pct=order_data.get("ml_vwap_distance_pct"),
+                                ml_vwap_position=order_data.get("ml_vwap_position"),
                             )
 
                             # Record in trade history
@@ -2214,6 +2250,24 @@ class TradingBot:
                 chart_confidence = position.ml_chart_confidence or 0.5
                 chart_bullish_pattern = position.ml_chart_bullish_pattern or 0.0
                 chart_bearish_pattern = position.ml_chart_bearish_pattern or 0.0
+                # NEW INDICATOR FEATURES from stored position
+                macd_histogram = position.ml_macd_histogram or 0.0
+                macd_crossover = position.ml_macd_crossover or "none"
+                bb_bandwidth = position.ml_bb_bandwidth or 0.0
+                bb_position = position.ml_bb_position or "middle"
+                stoch_k = position.ml_stoch_k or 50.0
+                stoch_d = position.ml_stoch_d or 50.0
+                stoch_signal = position.ml_stoch_signal or "neutral"
+                rsi_divergence = position.ml_rsi_divergence or "none"
+                rsi_divergence_strength = position.ml_rsi_divergence_strength or 0.0
+                volume_ratio = position.ml_volume_ratio or 1.0
+                is_high_volume = position.ml_is_high_volume or False
+                obv_trend = position.ml_obv_trend or 0.0
+                ha_trend = position.ml_ha_trend or "neutral"
+                ha_consecutive = position.ml_ha_consecutive or 0
+                ha_strength = position.ml_ha_strength or 0.0
+                vwap_distance_pct = position.ml_vwap_distance_pct or 0.0
+                vwap_position = position.ml_vwap_position or "at"
             else:
                 # Extract features now (for positions without stored ML data)
                 volatility = self.signal_generator.get_volatility(market.asset)
@@ -2249,6 +2303,24 @@ class TradingBot:
                 chart_confidence = 0.5
                 chart_bullish_pattern = 0.0
                 chart_bearish_pattern = 0.0
+                # NEW INDICATOR FEATURES defaults
+                macd_histogram = 0.0
+                macd_crossover = "none"
+                bb_bandwidth = 0.0
+                bb_position = "middle"
+                stoch_k = 50.0
+                stoch_d = 50.0
+                stoch_signal = "neutral"
+                rsi_divergence = "none"
+                rsi_divergence_strength = 0.0
+                volume_ratio = 1.0
+                is_high_volume = False
+                obv_trend = 0.0
+                ha_trend = "neutral"
+                ha_consecutive = 0
+                ha_strength = 0.0
+                vwap_distance_pct = 0.0
+                vwap_position = "at"
                 # Try to fetch trends if available
                 try:
                     from .data.binance import get_multi_timeframe_trends
@@ -2329,6 +2401,24 @@ class TradingBot:
                 chart_confidence=chart_confidence,
                 chart_bullish_pattern=chart_bullish_pattern,
                 chart_bearish_pattern=chart_bearish_pattern,
+                # NEW INDICATOR FEATURES
+                macd_histogram=macd_histogram,
+                macd_crossover=macd_crossover,
+                bb_bandwidth=bb_bandwidth,
+                bb_position=bb_position,
+                stoch_k=stoch_k,
+                stoch_d=stoch_d,
+                stoch_signal=stoch_signal,
+                rsi_divergence=rsi_divergence,
+                rsi_divergence_strength=rsi_divergence_strength,
+                volume_ratio=volume_ratio,
+                is_high_volume=is_high_volume,
+                obv_trend=obv_trend,
+                ha_trend=ha_trend,
+                ha_consecutive=ha_consecutive,
+                ha_strength=ha_strength,
+                vwap_distance_pct=vwap_distance_pct,
+                vwap_position=vwap_position,
             )
 
     async def _sync_ml_from_polymarket(self, force: bool = False):
@@ -3290,6 +3380,24 @@ class TradingBot:
             signal._ml_chart_confidence = ml_features.get("chart_confidence", 0.5)
             signal._ml_chart_bullish_pattern = ml_features.get("chart_bullish_pattern", 0.0)
             signal._ml_chart_bearish_pattern = ml_features.get("chart_bearish_pattern", 0.0)
+            # NEW INDICATOR FEATURES (for outcome recording)
+            signal._ml_macd_histogram = ml_features.get("macd_histogram", 0.0)
+            signal._ml_macd_crossover = ml_features.get("macd_crossover", "none")
+            signal._ml_bb_bandwidth = ml_features.get("bb_bandwidth", 0.0)
+            signal._ml_bb_position = ml_features.get("bb_position", "middle")
+            signal._ml_stoch_k = ml_features.get("stoch_k", 50.0)
+            signal._ml_stoch_d = ml_features.get("stoch_d", 50.0)
+            signal._ml_stoch_signal = ml_features.get("stoch_signal", "neutral")
+            signal._ml_rsi_divergence = ml_features.get("rsi_divergence", "none")
+            signal._ml_rsi_divergence_strength = ml_features.get("rsi_divergence_strength", 0.0)
+            signal._ml_volume_ratio = ml_features.get("volume_ratio", 1.0)
+            signal._ml_is_high_volume = ml_features.get("is_high_volume", False)
+            signal._ml_obv_trend = ml_features.get("obv_trend", 0.0)
+            signal._ml_ha_trend = ml_features.get("ha_trend", "neutral")
+            signal._ml_ha_consecutive = ml_features.get("ha_consecutive", 0)
+            signal._ml_ha_strength = ml_features.get("ha_strength", 0.0)
+            signal._ml_vwap_distance_pct = ml_features.get("vwap_distance_pct", 0.0)
+            signal._ml_vwap_position = ml_features.get("vwap_position", "at")
 
         # Adjust size using Kelly criterion (with ML confidence for optimal sizing)
         logger.info(f"[{market.asset}] ✓4 Kelly sizing (conf: {ml_confidence})")
@@ -4053,6 +4161,24 @@ class TradingBot:
             ml_chart_confidence = getattr(signal, '_ml_chart_confidence', None)
             ml_chart_bullish_pattern = getattr(signal, '_ml_chart_bullish_pattern', None)
             ml_chart_bearish_pattern = getattr(signal, '_ml_chart_bearish_pattern', None)
+            # NEW INDICATOR FEATURES
+            ml_macd_histogram = getattr(signal, '_ml_macd_histogram', None)
+            ml_macd_crossover = getattr(signal, '_ml_macd_crossover', None)
+            ml_bb_bandwidth = getattr(signal, '_ml_bb_bandwidth', None)
+            ml_bb_position = getattr(signal, '_ml_bb_position', None)
+            ml_stoch_k = getattr(signal, '_ml_stoch_k', None)
+            ml_stoch_d = getattr(signal, '_ml_stoch_d', None)
+            ml_stoch_signal = getattr(signal, '_ml_stoch_signal', None)
+            ml_rsi_divergence = getattr(signal, '_ml_rsi_divergence', None)
+            ml_rsi_divergence_strength = getattr(signal, '_ml_rsi_divergence_strength', None)
+            ml_volume_ratio = getattr(signal, '_ml_volume_ratio', None)
+            ml_is_high_volume = getattr(signal, '_ml_is_high_volume', None)
+            ml_obv_trend = getattr(signal, '_ml_obv_trend', None)
+            ml_ha_trend = getattr(signal, '_ml_ha_trend', None)
+            ml_ha_consecutive = getattr(signal, '_ml_ha_consecutive', None)
+            ml_ha_strength = getattr(signal, '_ml_ha_strength', None)
+            ml_vwap_distance_pct = getattr(signal, '_ml_vwap_distance_pct', None)
+            ml_vwap_position = getattr(signal, '_ml_vwap_position', None)
 
             conf_str = f" (ML: {ml_confidence:.0%})" if ml_confidence else ""
             arb_str = f" [{ml_arb_type}]" if ml_arb_type and ml_arb_type != "none" else ""
@@ -4092,6 +4218,24 @@ class TradingBot:
                     ml_chart_confidence=ml_chart_confidence,
                     ml_chart_bullish_pattern=ml_chart_bullish_pattern,
                     ml_chart_bearish_pattern=ml_chart_bearish_pattern,
+                    # NEW INDICATOR FEATURES
+                    ml_macd_histogram=ml_macd_histogram,
+                    ml_macd_crossover=ml_macd_crossover,
+                    ml_bb_bandwidth=ml_bb_bandwidth,
+                    ml_bb_position=ml_bb_position,
+                    ml_stoch_k=ml_stoch_k,
+                    ml_stoch_d=ml_stoch_d,
+                    ml_stoch_signal=ml_stoch_signal,
+                    ml_rsi_divergence=ml_rsi_divergence,
+                    ml_rsi_divergence_strength=ml_rsi_divergence_strength,
+                    ml_volume_ratio=ml_volume_ratio,
+                    ml_is_high_volume=ml_is_high_volume,
+                    ml_obv_trend=ml_obv_trend,
+                    ml_ha_trend=ml_ha_trend,
+                    ml_ha_consecutive=ml_ha_consecutive,
+                    ml_ha_strength=ml_ha_strength,
+                    ml_vwap_distance_pct=ml_vwap_distance_pct,
+                    ml_vwap_position=ml_vwap_position,
                 )
 
                 # Record in trade history
@@ -4145,6 +4289,24 @@ class TradingBot:
                     "ml_trend_1h": ml_trend_1h,
                     "ml_trend_4h": ml_trend_4h,
                     "ml_trend_1d": ml_trend_1d,
+                    # NEW INDICATOR FEATURES
+                    "ml_macd_histogram": ml_macd_histogram,
+                    "ml_macd_crossover": ml_macd_crossover,
+                    "ml_bb_bandwidth": ml_bb_bandwidth,
+                    "ml_bb_position": ml_bb_position,
+                    "ml_stoch_k": ml_stoch_k,
+                    "ml_stoch_d": ml_stoch_d,
+                    "ml_stoch_signal": ml_stoch_signal,
+                    "ml_rsi_divergence": ml_rsi_divergence,
+                    "ml_rsi_divergence_strength": ml_rsi_divergence_strength,
+                    "ml_volume_ratio": ml_volume_ratio,
+                    "ml_is_high_volume": ml_is_high_volume,
+                    "ml_obv_trend": ml_obv_trend,
+                    "ml_ha_trend": ml_ha_trend,
+                    "ml_ha_consecutive": ml_ha_consecutive,
+                    "ml_ha_strength": ml_ha_strength,
+                    "ml_vwap_distance_pct": ml_vwap_distance_pct,
+                    "ml_vwap_position": ml_vwap_position,
                 }
 
                 logger.info(

@@ -2033,6 +2033,74 @@ def extract_ml_features_from_market(
         chart_resume_ready = 1.0 if chart_analysis.resume_ready else 0.0
         chart_resume_confidence = chart_analysis.resume_confidence
 
+    # =========================================================================
+    # NEW INDICATOR FEATURES (29 features)
+    # These were added to improve ML prediction accuracy
+    # =========================================================================
+
+    # MACD features
+    macd_histogram = 0.0
+    macd_crossover = "none"
+
+    # Bollinger Bands features
+    bb_bandwidth = 0.0
+    bb_position = "middle"
+
+    # Stochastic features
+    stoch_k = 50.0
+    stoch_d = 50.0
+    stoch_signal = "neutral"
+
+    # RSI Divergence features
+    rsi_divergence = "none"
+    rsi_divergence_strength = 0.0
+
+    # Volume features
+    volume_ratio = 1.0
+    is_high_volume = False
+    obv_trend = 0.0
+
+    # Heiken Ashi features
+    ha_trend = "neutral"
+    ha_consecutive = 0
+    ha_strength = 0.0
+
+    # VWAP features
+    vwap_distance_pct = 0.0
+    vwap_position = "at"
+
+    if chart_analysis is not None:
+        # MACD
+        macd_histogram = getattr(chart_analysis, 'macd_histogram', 0.0) or 0.0
+        macd_crossover = getattr(chart_analysis, 'macd_crossover', "none") or "none"
+
+        # Bollinger Bands
+        bb_bandwidth = getattr(chart_analysis, 'bb_bandwidth', 0.0) or 0.0
+        bb_position = getattr(chart_analysis, 'bb_position', "middle") or "middle"
+
+        # Stochastic
+        stoch_k = getattr(chart_analysis, 'stoch_k', 50.0) or 50.0
+        stoch_d = getattr(chart_analysis, 'stoch_d', 50.0) or 50.0
+        stoch_signal = getattr(chart_analysis, 'stoch_signal', "neutral") or "neutral"
+
+        # RSI Divergence
+        rsi_divergence = getattr(chart_analysis, 'rsi_divergence', "none") or "none"
+        rsi_divergence_strength = getattr(chart_analysis, 'rsi_divergence_strength', 0.0) or 0.0
+
+        # Volume
+        volume_ratio = getattr(chart_analysis, 'volume_ratio', 1.0) or 1.0
+        is_high_volume = getattr(chart_analysis, 'is_high_volume', False) or False
+        obv_trend = getattr(chart_analysis, 'obv_trend', 0.0) or 0.0
+
+        # Heiken Ashi
+        ha_trend = getattr(chart_analysis, 'ha_trend', "neutral") or "neutral"
+        ha_consecutive = getattr(chart_analysis, 'ha_consecutive', 0) or 0
+        ha_strength = getattr(chart_analysis, 'ha_strength', 0.0) or 0.0
+
+        # VWAP
+        vwap_distance_pct = getattr(chart_analysis, 'vwap_distance_pct', 0.0) or 0.0
+        vwap_position = getattr(chart_analysis, 'vwap_position', "at") or "at"
+
     return {
         "volatility": volatility,
         "price_momentum": price_momentum,
@@ -2072,4 +2140,22 @@ def extract_ml_features_from_market(
         "chart_trend_breaking": chart_trend_breaking,
         "chart_resume_ready": chart_resume_ready,
         "chart_resume_confidence": chart_resume_confidence,
+        # NEW INDICATOR FEATURES (17 parameters for 29 one-hot encoded features)
+        "macd_histogram": macd_histogram,
+        "macd_crossover": macd_crossover,
+        "bb_bandwidth": bb_bandwidth,
+        "bb_position": bb_position,
+        "stoch_k": stoch_k,
+        "stoch_d": stoch_d,
+        "stoch_signal": stoch_signal,
+        "rsi_divergence": rsi_divergence,
+        "rsi_divergence_strength": rsi_divergence_strength,
+        "volume_ratio": volume_ratio,
+        "is_high_volume": is_high_volume,
+        "obv_trend": obv_trend,
+        "ha_trend": ha_trend,
+        "ha_consecutive": ha_consecutive,
+        "ha_strength": ha_strength,
+        "vwap_distance_pct": vwap_distance_pct,
+        "vwap_position": vwap_position,
     }

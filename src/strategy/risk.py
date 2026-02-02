@@ -288,6 +288,24 @@ class RiskManager:
         ml_chart_confidence: Optional[float] = None,
         ml_chart_bullish_pattern: Optional[float] = None,
         ml_chart_bearish_pattern: Optional[float] = None,
+        # NEW INDICATOR FEATURES
+        ml_macd_histogram: Optional[float] = None,
+        ml_macd_crossover: Optional[str] = None,
+        ml_bb_bandwidth: Optional[float] = None,
+        ml_bb_position: Optional[str] = None,
+        ml_stoch_k: Optional[float] = None,
+        ml_stoch_d: Optional[float] = None,
+        ml_stoch_signal: Optional[str] = None,
+        ml_rsi_divergence: Optional[str] = None,
+        ml_rsi_divergence_strength: Optional[float] = None,
+        ml_volume_ratio: Optional[float] = None,
+        ml_is_high_volume: Optional[bool] = None,
+        ml_obv_trend: Optional[float] = None,
+        ml_ha_trend: Optional[str] = None,
+        ml_ha_consecutive: Optional[int] = None,
+        ml_ha_strength: Optional[float] = None,
+        ml_vwap_distance_pct: Optional[float] = None,
+        ml_vwap_position: Optional[str] = None,
     ):
         """
         Record a new position being opened.
@@ -311,6 +329,13 @@ class RiskManager:
             ml_trend_4h: ML feature - 4-hour trend
             ml_trend_1d: ML feature - 1-day trend
             ml_chart_*: Chart analysis features from Binance candlestick data
+            ml_macd_*: MACD indicator features
+            ml_bb_*: Bollinger Bands features
+            ml_stoch_*: Stochastic oscillator features
+            ml_rsi_divergence*: RSI divergence features
+            ml_volume_*: Volume analysis features
+            ml_ha_*: Heiken Ashi features
+            ml_vwap_*: VWAP features
         """
         market_key = signal.market.condition_id
 
@@ -353,6 +378,24 @@ class RiskManager:
             ml_chart_confidence=ml_chart_confidence,
             ml_chart_bullish_pattern=ml_chart_bullish_pattern,
             ml_chart_bearish_pattern=ml_chart_bearish_pattern,
+            # NEW INDICATOR FEATURES
+            ml_macd_histogram=ml_macd_histogram,
+            ml_macd_crossover=ml_macd_crossover,
+            ml_bb_bandwidth=ml_bb_bandwidth,
+            ml_bb_position=ml_bb_position,
+            ml_stoch_k=ml_stoch_k,
+            ml_stoch_d=ml_stoch_d,
+            ml_stoch_signal=ml_stoch_signal,
+            ml_rsi_divergence=ml_rsi_divergence,
+            ml_rsi_divergence_strength=ml_rsi_divergence_strength,
+            ml_volume_ratio=ml_volume_ratio,
+            ml_is_high_volume=ml_is_high_volume,
+            ml_obv_trend=ml_obv_trend,
+            ml_ha_trend=ml_ha_trend,
+            ml_ha_consecutive=ml_ha_consecutive,
+            ml_ha_strength=ml_ha_strength,
+            ml_vwap_distance_pct=ml_vwap_distance_pct,
+            ml_vwap_position=ml_vwap_position,
         )
 
         self.positions[market_key] = position
