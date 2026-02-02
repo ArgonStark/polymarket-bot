@@ -74,7 +74,7 @@ class TradingConfig:
 
     # Base position size in USD (smaller = more trades, less risk per trade)
     base_position_size: float = field(
-        default_factory=lambda: float(os.getenv("BASE_POSITION_SIZE", "10"))
+        default_factory=lambda: float(os.getenv("BASE_POSITION_SIZE", "25"))
     )
 
     # Maximum position as percentage of bankroll
