@@ -67,14 +67,30 @@ class DecisionStump:
 @dataclass
 class GradientBoostingClassifier:
     """
-    Simple Gradient Boosting implementation for binary classification.
+    Enhanced Gradient Boosting implementation for binary classification.
 
     Uses decision stumps as weak learners and gradient descent
     to minimize log-loss.
+
+    IMPROVED:
+    - L2 regularization to prevent overfitting
+    - Early stopping based on validation loss
+    - Feature subsampling (like XGBoost)
+    - Feature importance tracking
     """
-    n_estimators: int = 50
-    learning_rate: float = 0.1
-    max_features: int = 33  # Number of features to consider
+    n_estimators: int = 100  # Increased for better accuracy
+    learning_rate: float = 0.08  # Slightly lower for stability
+    max_features: int = 82  # Updated for 82 features
+
+    # Regularization
+    l2_lambda: float = 0.1  # L2 regularization strength
+    min_samples_split: int = 5  # Minimum samples to make a split
+    max_depth: int = 1  # Depth of weak learners (1 = stump)
+
+    # Early stopping
+    early_stopping: bool = True
+    early_stopping_rounds: int = 10  # Stop if no improvement for N rounds
+    validation_fraction: float = 0.2  # Fraction for validation
 
     # Trained stumps
     stumps: List[DecisionStump] = field(default_factory=list)
@@ -85,10 +101,21 @@ class GradientBoostingClassifier:
     # Training data buffer (for online learning)
     X_buffer: List[List[float]] = field(default_factory=list)
     y_buffer: List[int] = field(default_factory=list)
-    buffer_size: int = 200
+    buffer_size: int = 300  # Increased buffer
 
     # Performance tracking
     training_samples: int = 0
+
+    # Feature importance tracking
+    feature_importance: List[float] = field(default_factory=list)
+    feature_split_counts: List[int] = field(default_factory=list)
+
+    def __post_init__(self):
+        """Initialize feature importance arrays."""
+        if not self.feature_importance:
+            self.feature_importance = [0.0] * self.max_features
+        if not self.feature_split_counts:
+            self.feature_split_counts = [0] * self.max_features
 
     def _sigmoid(self, x: float) -> float:
         """Sigmoid function."""
@@ -101,9 +128,10 @@ class GradientBoostingClassifier:
         residuals: List[float],
         feature_indices: List[int],
     ) -> DecisionStump:
-        """Find the best split for a decision stump."""
+        """Find the best split for a decision stump with L2 regularization."""
         best_stump = DecisionStump()
         best_gain = float('-inf')
+        best_feature_idx = -1
 
         for feat_idx in feature_indices:
             # Get unique values for this feature
@@ -126,21 +154,35 @@ class GradientBoostingClassifier:
                     else:
                         right_residuals.append(residuals[j])
 
-                if not left_residuals or not right_residuals:
+                # Check minimum samples for split
+                if len(left_residuals) < self.min_samples_split or len(right_residuals) < self.min_samples_split:
                     continue
 
-                # Calculate gain (reduction in squared error)
-                left_mean = sum(left_residuals) / len(left_residuals)
-                right_mean = sum(right_residuals) / len(right_residuals)
+                # Calculate gain with L2 regularization (like XGBoost)
+                # Regularized leaf values: sum(residuals) / (count + lambda)
+                left_sum = sum(left_residuals)
+                right_sum = sum(right_residuals)
+                n_left = len(left_residuals)
+                n_right = len(right_residuals)
 
-                left_sse = sum((r - left_mean) ** 2 for r in left_residuals)
-                right_sse = sum((r - right_mean) ** 2 for r in right_residuals)
-                total_sse = sum(r ** 2 for r in residuals)
+                # L2 regularized leaf values
+                left_mean = left_sum / (n_left + self.l2_lambda)
+                right_mean = right_sum / (n_right + self.l2_lambda)
 
-                gain = total_sse - left_sse - right_sse
+                # Gain calculation with regularization
+                # Gain = 0.5 * [G_L^2/(H_L+lambda) + G_R^2/(H_R+lambda) - G^2/(H+lambda)] - gamma
+                # For regression on residuals: H = n (count), G = sum(residuals)
+                gain_left = (left_sum ** 2) / (n_left + self.l2_lambda)
+                gain_right = (right_sum ** 2) / (n_right + self.l2_lambda)
+                total_sum = left_sum + right_sum
+                total_n = n_left + n_right
+                gain_total = (total_sum ** 2) / (total_n + self.l2_lambda)
+
+                gain = 0.5 * (gain_left + gain_right - gain_total)
 
                 if gain > best_gain:
                     best_gain = gain
+                    best_feature_idx = feat_idx
                     best_stump = DecisionStump(
                         feature_idx=feat_idx,
                         threshold=threshold,
@@ -148,55 +190,125 @@ class GradientBoostingClassifier:
                         right_value=right_mean,
                     )
 
+        # Track feature importance
+        if best_feature_idx >= 0 and best_feature_idx < len(self.feature_importance):
+            self.feature_importance[best_feature_idx] += max(0, best_gain)
+            self.feature_split_counts[best_feature_idx] += 1
+
         return best_stump
 
+    def _calculate_log_loss(self, predictions: List[float], y: List[int]) -> float:
+        """Calculate log loss for early stopping."""
+        eps = 1e-15
+        total_loss = 0.0
+        for i, yi in enumerate(y):
+            prob = self._sigmoid(predictions[i])
+            prob = max(eps, min(1 - eps, prob))
+            total_loss -= yi * math.log(prob) + (1 - yi) * math.log(1 - prob)
+        return total_loss / len(y) if y else 0.0
+
     def fit(self, X: List[List[float]], y: List[int]):
-        """Fit the model on training data."""
+        """Fit the model on training data with early stopping."""
         if not X or not y:
             return
 
         n_samples = len(X)
 
+        # Split into train/validation if early stopping enabled
+        if self.early_stopping and n_samples >= 20:
+            val_size = int(n_samples * self.validation_fraction)
+            indices = list(range(n_samples))
+            random.shuffle(indices)
+            train_indices = indices[val_size:]
+            val_indices = indices[:val_size]
+            X_train = [X[i] for i in train_indices]
+            y_train = [y[i] for i in train_indices]
+            X_val = [X[i] for i in val_indices]
+            y_val = [y[i] for i in val_indices]
+        else:
+            X_train, y_train = X, y
+            X_val, y_val = [], []
+
+        n_train = len(X_train)
+
         # Initialize prediction with log-odds
-        pos_count = sum(y)
-        neg_count = n_samples - pos_count
+        pos_count = sum(y_train)
+        neg_count = n_train - pos_count
         if pos_count > 0 and neg_count > 0:
             self.init_prediction = math.log(pos_count / neg_count)
         else:
             self.init_prediction = 0.0
 
         # Current predictions
-        predictions = [self.init_prediction] * n_samples
+        train_predictions = [self.init_prediction] * n_train
+        val_predictions = [self.init_prediction] * len(X_val) if X_val else []
 
-        # Clear existing stumps
+        # Clear existing stumps and reset feature importance
         self.stumps = []
+        self.feature_importance = [0.0] * self.max_features
+        self.feature_split_counts = [0] * self.max_features
 
         # Feature indices to sample from
-        all_features = list(range(self.max_features))
+        all_features = list(range(min(self.max_features, len(X_train[0]) if X_train else self.max_features)))
+
+        # Early stopping tracking
+        best_val_loss = float('inf')
+        rounds_without_improvement = 0
+        best_n_stumps = 0
 
         # Build stumps iteratively
-        for _ in range(self.n_estimators):
+        for estimator_idx in range(self.n_estimators):
             # Calculate residuals (gradient of log-loss)
             residuals = []
-            for i in range(n_samples):
-                prob = self._sigmoid(predictions[i])
-                residuals.append(y[i] - prob)
+            for i in range(n_train):
+                prob = self._sigmoid(train_predictions[i])
+                residuals.append(y_train[i] - prob)
 
-            # Sample features (like random forest)
-            n_features_sample = max(1, int(math.sqrt(self.max_features)))
+            # Sample features (like XGBoost/random forest)
+            # Use sqrt(n_features) as default, but can sample more for better coverage
+            n_features_sample = max(1, int(math.sqrt(len(all_features)) * 1.5))
             feature_subset = random.sample(all_features, min(n_features_sample, len(all_features)))
 
             # Find best stump
-            stump = self._find_best_split(X, residuals, feature_subset)
+            stump = self._find_best_split(X_train, residuals, feature_subset)
 
-            # Update predictions
-            for i in range(n_samples):
-                pred = stump.predict(X[i])
-                predictions[i] += self.learning_rate * pred
+            # Update training predictions
+            for i in range(n_train):
+                pred = stump.predict(X_train[i])
+                train_predictions[i] += self.learning_rate * pred
 
             self.stumps.append(stump)
 
+            # Early stopping check
+            if self.early_stopping and X_val:
+                # Update validation predictions
+                for i in range(len(X_val)):
+                    pred = stump.predict(X_val[i])
+                    val_predictions[i] += self.learning_rate * pred
+
+                val_loss = self._calculate_log_loss(val_predictions, y_val)
+
+                if val_loss < best_val_loss - 0.0001:  # Improvement threshold
+                    best_val_loss = val_loss
+                    rounds_without_improvement = 0
+                    best_n_stumps = len(self.stumps)
+                else:
+                    rounds_without_improvement += 1
+
+                if rounds_without_improvement >= self.early_stopping_rounds:
+                    # Rollback to best model
+                    self.stumps = self.stumps[:best_n_stumps]
+                    logger.debug(f"Early stopping at {estimator_idx + 1} estimators, best was {best_n_stumps}")
+                    break
+
         self.training_samples = n_samples
+
+    def get_feature_importance(self) -> Dict[int, float]:
+        """Get feature importance scores normalized to sum to 1."""
+        total = sum(self.feature_importance)
+        if total <= 0:
+            return {}
+        return {i: imp / total for i, imp in enumerate(self.feature_importance) if imp > 0}
 
     def partial_fit(self, features: List[float], outcome: int):
         """Online learning - add sample and periodically retrain."""
@@ -231,25 +343,39 @@ class GradientBoostingClassifier:
             "n_estimators": self.n_estimators,
             "learning_rate": self.learning_rate,
             "max_features": self.max_features,
+            "l2_lambda": self.l2_lambda,
+            "min_samples_split": self.min_samples_split,
+            "early_stopping": self.early_stopping,
+            "early_stopping_rounds": self.early_stopping_rounds,
+            "validation_fraction": self.validation_fraction,
             "init_prediction": self.init_prediction,
             "stumps": [s.to_dict() for s in self.stumps],
             "training_samples": self.training_samples,
-            "X_buffer": self.X_buffer[-50:],  # Save last 50 samples
-            "y_buffer": self.y_buffer[-50:],
+            "X_buffer": self.X_buffer[-100:],  # Save last 100 samples
+            "y_buffer": self.y_buffer[-100:],
+            "feature_importance": self.feature_importance,
+            "feature_split_counts": self.feature_split_counts,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "GradientBoostingClassifier":
         model = cls(
-            n_estimators=data.get("n_estimators", 50),
-            learning_rate=data.get("learning_rate", 0.1),
-            max_features=data.get("max_features", 33),
+            n_estimators=data.get("n_estimators", 100),
+            learning_rate=data.get("learning_rate", 0.08),
+            max_features=data.get("max_features", 82),
+            l2_lambda=data.get("l2_lambda", 0.1),
+            min_samples_split=data.get("min_samples_split", 5),
+            early_stopping=data.get("early_stopping", True),
+            early_stopping_rounds=data.get("early_stopping_rounds", 10),
+            validation_fraction=data.get("validation_fraction", 0.2),
         )
         model.init_prediction = data.get("init_prediction", 0.0)
         model.stumps = [DecisionStump.from_dict(s) for s in data.get("stumps", [])]
         model.training_samples = data.get("training_samples", 0)
         model.X_buffer = data.get("X_buffer", [])
         model.y_buffer = data.get("y_buffer", [])
+        model.feature_importance = data.get("feature_importance", [0.0] * model.max_features)
+        model.feature_split_counts = data.get("feature_split_counts", [0] * model.max_features)
         return model
 
 
@@ -265,9 +391,11 @@ class FeatureImportanceTracker:
     Uses a simple correlation-based approach:
     - For each feature, track correlation with outcomes
     - Higher correlation = more important feature
+
+    UPDATED: Now supports 82 features including new indicators.
     """
 
-    n_features: int = 33
+    n_features: int = 82
     feature_names: List[str] = field(default_factory=list)
 
     # Running statistics for each feature
@@ -282,15 +410,47 @@ class FeatureImportanceTracker:
     def __post_init__(self):
         if not self.feature_names:
             self.feature_names = [
+                # Core features (6)
                 "edge", "time_remaining", "volatility", "price_momentum",
                 "hour_of_day", "day_of_week",
-                "is_btc", "is_eth", "is_sol", "is_xrp", "is_up",
+                # Asset one-hot (4)
+                "is_btc", "is_eth", "is_sol", "is_xrp",
+                # Side (1)
+                "is_up",
+                # Arb type one-hot (5)
                 "arb_none", "arb_binary", "arb_asymmetric", "arb_dump", "arb_hedge",
+                # Market features (4)
                 "spread", "bid_depth", "ask_depth", "price_trend",
-                "distance_from_target", "binance_lead",
-                "conf_none", "conf_weak", "conf_medium", "conf_strong",
+                # Distance (1)
+                "distance_from_target",
+                # Binance features (5)
+                "binance_lead", "conf_none", "conf_weak", "conf_medium", "conf_strong",
+                # Multi-timeframe trends (3)
                 "trend_1h", "trend_4h", "trend_1d",
+                # Price features (4)
                 "price_normalized", "price_above_target", "price_range_position", "price_velocity",
+                # Chart analysis (13)
+                "chart_rsi", "chart_trend_strength", "chart_is_uptrend", "chart_is_downtrend",
+                "chart_is_ranging", "chart_bullish_reversal", "chart_bearish_reversal",
+                "chart_momentum", "chart_bias_bullish", "chart_bias_bearish",
+                "chart_confidence", "chart_bullish_pattern", "chart_bearish_pattern",
+                # Advanced chart (7)
+                "chart_uncertainty", "chart_position_mult", "chart_tf_aligned",
+                "chart_alignment", "chart_trend_breaking", "chart_resume_ready", "chart_resume_conf",
+                # NEW: MACD features (4)
+                "macd_histogram", "macd_cross_bullish", "macd_cross_bearish", "macd_cross_none",
+                # NEW: Bollinger Bands (4)
+                "bb_bandwidth", "bb_above", "bb_below", "bb_middle",
+                # NEW: Stochastic (5)
+                "stoch_k", "stoch_d", "stoch_overbought", "stoch_oversold", "stoch_neutral",
+                # NEW: RSI Divergence (4)
+                "rsi_div_bullish", "rsi_div_bearish", "rsi_div_none", "rsi_div_strength",
+                # NEW: Volume (3)
+                "volume_ratio", "is_high_volume", "obv_trend",
+                # NEW: Heiken Ashi (5)
+                "ha_bullish", "ha_bearish", "ha_neutral", "ha_consecutive", "ha_strength",
+                # NEW: VWAP (4)
+                "vwap_distance", "vwap_above", "vwap_below", "vwap_at",
             ]
 
         if not self.feature_sums:
@@ -371,12 +531,19 @@ class FeatureImportanceTracker:
     @classmethod
     def from_dict(cls, data: dict) -> "FeatureImportanceTracker":
         tracker = cls(
-            n_features=data.get("n_features", 33),
+            n_features=data.get("n_features", 82),
             feature_names=data.get("feature_names", []),
         )
-        tracker.feature_sums = data.get("feature_sums", [0.0] * tracker.n_features)
-        tracker.feature_sq_sums = data.get("feature_sq_sums", [0.0] * tracker.n_features)
-        tracker.outcome_sums = data.get("outcome_sums", [0.0] * tracker.n_features)
+        # Handle migration from smaller feature sets
+        old_sums = data.get("feature_sums", [])
+        old_sq_sums = data.get("feature_sq_sums", [])
+        old_outcome_sums = data.get("outcome_sums", [])
+
+        # Extend arrays if needed
+        tracker.feature_sums = old_sums + [0.0] * (tracker.n_features - len(old_sums)) if len(old_sums) < tracker.n_features else old_sums[:tracker.n_features]
+        tracker.feature_sq_sums = old_sq_sums + [0.0] * (tracker.n_features - len(old_sq_sums)) if len(old_sq_sums) < tracker.n_features else old_sq_sums[:tracker.n_features]
+        tracker.outcome_sums = old_outcome_sums + [0.0] * (tracker.n_features - len(old_outcome_sums)) if len(old_outcome_sums) < tracker.n_features else old_outcome_sums[:tracker.n_features]
+
         tracker.total_samples = data.get("total_samples", 0)
         tracker.total_outcomes = data.get("total_outcomes", 0.0)
         tracker.total_outcomes_sq = data.get("total_outcomes_sq", 0.0)

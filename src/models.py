@@ -231,6 +231,25 @@ class Position:
     ml_chart_bullish_pattern: Optional[float] = None
     ml_chart_bearish_pattern: Optional[float] = None
 
+    # NEW INDICATOR FEATURES (MACD, BB, Stochastic, RSI Div, Volume, HA, VWAP)
+    ml_macd_histogram: Optional[float] = None
+    ml_macd_crossover: Optional[str] = None
+    ml_bb_bandwidth: Optional[float] = None
+    ml_bb_position: Optional[str] = None
+    ml_stoch_k: Optional[float] = None
+    ml_stoch_d: Optional[float] = None
+    ml_stoch_signal: Optional[str] = None
+    ml_rsi_divergence: Optional[str] = None
+    ml_rsi_divergence_strength: Optional[float] = None
+    ml_volume_ratio: Optional[float] = None
+    ml_is_high_volume: Optional[bool] = None
+    ml_obv_trend: Optional[float] = None
+    ml_ha_trend: Optional[str] = None
+    ml_ha_consecutive: Optional[int] = None
+    ml_ha_strength: Optional[float] = None
+    ml_vwap_distance_pct: Optional[float] = None
+    ml_vwap_position: Optional[str] = None
+
     # Averaging down tracking
     times_averaged: int = 0  # How many times we've added to this position
     original_entry_price: Optional[float] = None  # First entry price before averaging
