@@ -2492,10 +2492,25 @@ class TradingBot:
 
         The ML learns from trades where we can determine the outcome (win/loss).
 
+        NOTE: This is SKIPPED if you have a pre-trained model with 1000+ samples
+        to avoid overwriting good training data with random market data.
+
         Args:
             force: If True, bypass rate limiting (used on startup)
         """
         if not self.client or not self.ml_predictor:
+            return
+
+        # Skip sync if we have a pre-trained model with significant samples
+        # This prevents overwriting a good model (e.g., trained from successful trader)
+        # with random market data that has lower accuracy
+        if self.ml_predictor.training_samples >= 1000:
+            if not hasattr(self, '_sync_skip_logged'):
+                logger.info(
+                    f"⏭️ Skipping CLOB sync - using pre-trained model "
+                    f"({self.ml_predictor.training_samples} samples)"
+                )
+                self._sync_skip_logged = True
             return
 
         # Rate limit: only sync every 5 minutes (unless forced)
