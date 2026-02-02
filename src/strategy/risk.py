@@ -251,6 +251,10 @@ class RiskManager:
             if signal.size_usd > 0:
                 ratio = position_size / signal.size_usd
                 signal.size_shares = signal.size_shares * ratio
+            else:
+                # Calculate shares from scratch if original size was 0
+                price = max(0.01, min(0.99, signal.recommended_price))
+                signal.size_shares = position_size / price
             signal.size_usd = position_size
 
         return signal
