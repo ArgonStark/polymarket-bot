@@ -349,21 +349,22 @@ class TrendProtectionConfig:
     )
 
     # Max velocity per asset (% per second) - skip if exceeded
+    # Higher = more lenient = more trades allowed
     velocity_btc: float = field(
-        default_factory=lambda: float(os.getenv("VELOCITY_MAX_BTC", "0.00017"))
-    )  # ~1% per minute
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_BTC", "0.00035"))
+    )  # ~2.1% per minute (raised to trade more)
 
     velocity_eth: float = field(
-        default_factory=lambda: float(os.getenv("VELOCITY_MAX_ETH", "0.00025"))
-    )  # ~1.5% per minute
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_ETH", "0.00038"))
+    )  # ~2.3% per minute (raised to trade more)
 
     velocity_sol: float = field(
-        default_factory=lambda: float(os.getenv("VELOCITY_MAX_SOL", "0.00033"))
-    )  # ~2% per minute
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_SOL", "0.00030"))
+    )  # ~1.8% per minute
 
     velocity_xrp: float = field(
-        default_factory=lambda: float(os.getenv("VELOCITY_MAX_XRP", "0.00030"))
-    )  # ~1.8% per minute
+        default_factory=lambda: float(os.getenv("VELOCITY_MAX_XRP", "0.00025"))
+    )  # ~1.5% per minute (lowered to trade less)
 
     # === Multi-Timeframe Agreement ===
     timeframe_agreement_enabled: bool = field(

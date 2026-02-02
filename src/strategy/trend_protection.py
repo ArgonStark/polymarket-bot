@@ -78,11 +78,12 @@ class TrendProtectionConfig:
     velocity_guard_enabled: bool = True
 
     # Max velocity per asset (% per second) - skip if exceeded
+    # Higher = more lenient = more trades allowed
     max_velocity: dict = field(default_factory=lambda: {
-        "BTC": 0.00017,  # ~1% per minute
-        "ETH": 0.00025,  # ~1.5% per minute
-        "SOL": 0.00033,  # ~2% per minute
-        "XRP": 0.00030,  # ~1.8% per minute
+        "BTC": 0.00035,  # ~2.1% per minute (raised to trade more)
+        "ETH": 0.00038,  # ~2.3% per minute (raised to trade more)
+        "SOL": 0.00030,  # ~1.8% per minute
+        "XRP": 0.00025,  # ~1.5% per minute (lowered to trade less)
     })
 
     # === Multi-Timeframe Agreement ===
