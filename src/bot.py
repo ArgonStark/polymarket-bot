@@ -21,6 +21,7 @@ from .data import (
     fetch_all_historical_prices,
     prepopulate_price_histories,
     get_data_api,
+    get_settlement_verifier,
 )
 from .data.binance import BinancePrice
 from .execution import create_trading_client, OrderExecutor
@@ -125,6 +126,11 @@ class TradingBot:
             )
         else:
             logger.info("🤖 ML disabled (set ML_ENABLED=true to enable)")
+
+        # Settlement verifier (on-chain verification via The Graph)
+        self.settlement_verifier = get_settlement_verifier()
+        if self.settlement_verifier.is_enabled():
+            logger.info("📊 On-chain settlement verification enabled (The Graph)")
 
         # Market state - three-stage lifecycle
         self.markets: dict[str, MarketState] = {}  # Active trading markets
@@ -1970,6 +1976,18 @@ class TradingBot:
                 f"Winner: {winning_outcome} | "
                 f"Settlement Price: ${resolution_price:,.2f if resolution_price else 0}"
             )
+
+            # Cross-verify with on-chain data (The Graph)
+            if self.settlement_verifier.is_enabled() and winning_outcome:
+                verified, verify_msg = self.settlement_verifier.cross_verify_settlement(
+                    condition_id=market.condition_id,
+                    api_outcome=winning_outcome,
+                    api_price=resolution_price
+                )
+                if verified:
+                    logger.debug(f"  └─ On-chain: {verify_msg}")
+                else:
+                    logger.warning(f"  └─ On-chain verification: {verify_msg}")
         else:
             # API doesn't have resolution yet - try local determination
             # For 15-minute crypto markets: price >= target = UP wins
