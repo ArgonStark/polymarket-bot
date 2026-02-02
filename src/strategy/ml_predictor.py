@@ -119,8 +119,53 @@ class TradeFeatures:
     chart_resume_ready: float = 1.0  # 1 if safe to trade, 0 if in pause
     chart_resume_confidence: float = 1.0  # Confidence in resuming (0-1)
 
+    # === NEW INDICATOR FEATURES (adds 29 features, total 82) ===
+
+    # MACD features (4)
+    macd_histogram: float = 0.0  # Normalized histogram (-1 to +1)
+    macd_crossover_bullish: float = 0.0  # 1 if bullish crossover
+    macd_crossover_bearish: float = 0.0  # 1 if bearish crossover
+    macd_crossover_none: float = 1.0  # 1 if no crossover
+
+    # Bollinger Bands features (4)
+    bb_bandwidth: float = 0.0  # Normalized bandwidth (0-1)
+    bb_position_above: float = 0.0  # 1 if price above upper band
+    bb_position_below: float = 0.0  # 1 if price below lower band
+    bb_position_middle: float = 1.0  # 1 if price in middle
+
+    # Stochastic features (5)
+    stoch_k: float = 0.5  # Stochastic %K (0-1)
+    stoch_d: float = 0.5  # Stochastic %D (0-1)
+    stoch_overbought: float = 0.0  # 1 if overbought
+    stoch_oversold: float = 0.0  # 1 if oversold
+    stoch_neutral: float = 1.0  # 1 if neutral
+
+    # RSI Divergence features (4)
+    rsi_div_bullish: float = 0.0  # 1 if bullish divergence
+    rsi_div_bearish: float = 0.0  # 1 if bearish divergence
+    rsi_div_none: float = 1.0  # 1 if no divergence
+    rsi_div_strength: float = 0.0  # Divergence strength (0-1)
+
+    # Volume features (3)
+    volume_ratio: float = 1.0  # Current / Average volume
+    is_high_volume: float = 0.0  # 1 if high volume
+    obv_trend: float = 0.0  # On-balance volume trend (-1 to +1)
+
+    # Heiken Ashi features (5)
+    ha_trend_bullish: float = 0.0  # 1 if HA bullish
+    ha_trend_bearish: float = 0.0  # 1 if HA bearish
+    ha_trend_neutral: float = 1.0  # 1 if HA neutral
+    ha_consecutive: float = 0.0  # Consecutive same-color candles (normalized 0-1)
+    ha_strength: float = 0.0  # HA trend strength (0-1)
+
+    # VWAP features (4)
+    vwap_distance_pct: float = 0.0  # Distance from VWAP (normalized)
+    vwap_position_above: float = 0.0  # 1 if above VWAP
+    vwap_position_below: float = 0.0  # 1 if below VWAP
+    vwap_position_at: float = 1.0  # 1 if at VWAP
+
     def to_vector(self) -> list[float]:
-        """Convert to feature vector for model (53 features total)."""
+        """Convert to feature vector for model (82 features total)."""
         # Normalize features to roughly 0-1 range
         # NOTE: hour_of_day and day_of_week are set to neutral (0.5) because
         # they don't predict crypto price direction - they're just noise.
@@ -191,6 +236,51 @@ class TradeFeatures:
             self.chart_trend_breaking,  # Binary (1 if breaking)
             self.chart_resume_ready,  # Binary (1 if ready to trade)
             min(max(self.chart_resume_confidence, 0.0), 1.0),  # Resume confidence 0-1
+
+            # === NEW INDICATOR FEATURES (29 features) ===
+
+            # MACD features (4)
+            (self.macd_histogram + 1) / 2,  # Normalize -1,1 -> 0,1
+            self.macd_crossover_bullish,  # Binary
+            self.macd_crossover_bearish,  # Binary
+            self.macd_crossover_none,  # Binary
+
+            # Bollinger Bands features (4)
+            min(max(self.bb_bandwidth / 10, 0.0), 1.0),  # Normalize bandwidth (10% = 1.0)
+            self.bb_position_above,  # Binary
+            self.bb_position_below,  # Binary
+            self.bb_position_middle,  # Binary
+
+            # Stochastic features (5)
+            self.stoch_k / 100.0,  # Normalize 0-100 -> 0-1
+            self.stoch_d / 100.0,  # Normalize 0-100 -> 0-1
+            self.stoch_overbought,  # Binary
+            self.stoch_oversold,  # Binary
+            self.stoch_neutral,  # Binary
+
+            # RSI Divergence features (4)
+            self.rsi_div_bullish,  # Binary
+            self.rsi_div_bearish,  # Binary
+            self.rsi_div_none,  # Binary
+            min(max(self.rsi_div_strength, 0.0), 1.0),  # 0-1
+
+            # Volume features (3)
+            min(self.volume_ratio / 3.0, 1.0),  # Normalize (3x volume = 1.0)
+            self.is_high_volume,  # Binary
+            (self.obv_trend + 1) / 2,  # Normalize -1,1 -> 0,1
+
+            # Heiken Ashi features (5)
+            self.ha_trend_bullish,  # Binary
+            self.ha_trend_bearish,  # Binary
+            self.ha_trend_neutral,  # Binary
+            min(self.ha_consecutive / 10.0, 1.0),  # Normalize (10 candles = 1.0)
+            min(max(self.ha_strength, 0.0), 1.0),  # 0-1
+
+            # VWAP features (4)
+            (min(max(self.vwap_distance_pct * 100, -1.0), 1.0) + 1) / 2,  # -1% to +1% -> 0,1
+            self.vwap_position_above,  # Binary
+            self.vwap_position_below,  # Binary
+            self.vwap_position_at,  # Binary
         ]
         return vector
 
@@ -242,6 +332,36 @@ class TradeFeatures:
             "chart_trend_breaking": self.chart_trend_breaking,
             "chart_resume_ready": self.chart_resume_ready,
             "chart_resume_confidence": self.chart_resume_confidence,
+            # New indicator features
+            "macd_histogram": self.macd_histogram,
+            "macd_crossover_bullish": self.macd_crossover_bullish,
+            "macd_crossover_bearish": self.macd_crossover_bearish,
+            "macd_crossover_none": self.macd_crossover_none,
+            "bb_bandwidth": self.bb_bandwidth,
+            "bb_position_above": self.bb_position_above,
+            "bb_position_below": self.bb_position_below,
+            "bb_position_middle": self.bb_position_middle,
+            "stoch_k": self.stoch_k,
+            "stoch_d": self.stoch_d,
+            "stoch_overbought": self.stoch_overbought,
+            "stoch_oversold": self.stoch_oversold,
+            "stoch_neutral": self.stoch_neutral,
+            "rsi_div_bullish": self.rsi_div_bullish,
+            "rsi_div_bearish": self.rsi_div_bearish,
+            "rsi_div_none": self.rsi_div_none,
+            "rsi_div_strength": self.rsi_div_strength,
+            "volume_ratio": self.volume_ratio,
+            "is_high_volume": self.is_high_volume,
+            "obv_trend": self.obv_trend,
+            "ha_trend_bullish": self.ha_trend_bullish,
+            "ha_trend_bearish": self.ha_trend_bearish,
+            "ha_trend_neutral": self.ha_trend_neutral,
+            "ha_consecutive": self.ha_consecutive,
+            "ha_strength": self.ha_strength,
+            "vwap_distance_pct": self.vwap_distance_pct,
+            "vwap_position_above": self.vwap_position_above,
+            "vwap_position_below": self.vwap_position_below,
+            "vwap_position_at": self.vwap_position_at,
         }
 
     @classmethod
@@ -293,6 +413,36 @@ class TradeFeatures:
             chart_trend_breaking=data.get("chart_trend_breaking", 0.0),
             chart_resume_ready=data.get("chart_resume_ready", 1.0),
             chart_resume_confidence=data.get("chart_resume_confidence", 1.0),
+            # New indicator features
+            macd_histogram=data.get("macd_histogram", 0.0),
+            macd_crossover_bullish=data.get("macd_crossover_bullish", 0.0),
+            macd_crossover_bearish=data.get("macd_crossover_bearish", 0.0),
+            macd_crossover_none=data.get("macd_crossover_none", 1.0),
+            bb_bandwidth=data.get("bb_bandwidth", 0.0),
+            bb_position_above=data.get("bb_position_above", 0.0),
+            bb_position_below=data.get("bb_position_below", 0.0),
+            bb_position_middle=data.get("bb_position_middle", 1.0),
+            stoch_k=data.get("stoch_k", 50.0),
+            stoch_d=data.get("stoch_d", 50.0),
+            stoch_overbought=data.get("stoch_overbought", 0.0),
+            stoch_oversold=data.get("stoch_oversold", 0.0),
+            stoch_neutral=data.get("stoch_neutral", 1.0),
+            rsi_div_bullish=data.get("rsi_div_bullish", 0.0),
+            rsi_div_bearish=data.get("rsi_div_bearish", 0.0),
+            rsi_div_none=data.get("rsi_div_none", 1.0),
+            rsi_div_strength=data.get("rsi_div_strength", 0.0),
+            volume_ratio=data.get("volume_ratio", 1.0),
+            is_high_volume=data.get("is_high_volume", 0.0),
+            obv_trend=data.get("obv_trend", 0.0),
+            ha_trend_bullish=data.get("ha_trend_bullish", 0.0),
+            ha_trend_bearish=data.get("ha_trend_bearish", 0.0),
+            ha_trend_neutral=data.get("ha_trend_neutral", 1.0),
+            ha_consecutive=data.get("ha_consecutive", 0.0),
+            ha_strength=data.get("ha_strength", 0.0),
+            vwap_distance_pct=data.get("vwap_distance_pct", 0.0),
+            vwap_position_above=data.get("vwap_position_above", 0.0),
+            vwap_position_below=data.get("vwap_position_below", 0.0),
+            vwap_position_at=data.get("vwap_position_at", 1.0),
         )
 
 
@@ -302,12 +452,12 @@ class SimpleLogisticRegression:
     A simple logistic regression model that doesn't require sklearn.
     Uses online learning to update weights incrementally.
 
-    UPDATED: Now supports 53 features including advanced chart analysis.
+    UPDATED: Now supports 82 features including advanced chart analysis + new indicators.
     """
     weights: list[float] = field(default_factory=list)
     bias: float = 0.0
     learning_rate: float = 0.1
-    n_features: int = 53  # Number of features in TradeFeatures.to_vector()
+    n_features: int = 82  # Number of features in TradeFeatures.to_vector()
 
     def __post_init__(self):
         if not self.weights:
@@ -378,13 +528,13 @@ class SimpleNeuralNetwork:
     Simple 2-layer neural network for online learning.
     More powerful than logistic regression, adapts to new patterns.
 
-    Architecture: Input(53) -> Hidden(56) -> Output(1)
+    Architecture: Input(82) -> Hidden(85) -> Output(1)
     Uses ReLU activation and online gradient descent.
 
-    UPDATED: Now uses all 53 features including advanced chart analysis.
+    UPDATED: Now uses all 82 features including advanced chart analysis + new indicators.
     """
-    input_size: int = 53  # Full feature vector (matching TradeFeatures.to_vector())
-    hidden_size: int = 56  # Larger hidden layer for more features
+    input_size: int = 82  # Full feature vector (matching TradeFeatures.to_vector())
+    hidden_size: int = 85  # Larger hidden layer for more features
     learning_rate: float = 0.03  # Slightly lower for stability
 
     # Weights
@@ -500,11 +650,11 @@ class SimpleNeuralNetwork:
     @classmethod
     def from_dict(cls, data: dict) -> "SimpleNeuralNetwork":
         """Deserialize model."""
-        # Use current architecture defaults (53 features, 56 hidden)
+        # Use current architecture defaults (82 features, 85 hidden)
         # Old models with wrong dimensions will be re-initialized
         return cls(
-            input_size=data.get("input_size", 53),  # Must match TradeFeatures.to_vector()
-            hidden_size=data.get("hidden_size", 56),  # Current architecture
+            input_size=data.get("input_size", 82),  # Must match TradeFeatures.to_vector()
+            hidden_size=data.get("hidden_size", 85),  # Current architecture
             learning_rate=data.get("learning_rate", 0.03),  # Current default
             weights_ih=data.get("weights_ih", []),
             weights_ho=data.get("weights_ho", []),
@@ -824,6 +974,24 @@ class MLSignalPredictor:
         chart_trend_breaking: float = 0.0,
         chart_resume_ready: float = 1.0,
         chart_resume_confidence: float = 1.0,
+        # New indicator features (29 additional features)
+        macd_histogram: float = 0.0,
+        macd_crossover: str = "none",  # "bullish", "bearish", "none"
+        bb_bandwidth: float = 0.0,
+        bb_position: str = "middle",  # "above_upper", "below_lower", "middle"
+        stoch_k: float = 50.0,
+        stoch_d: float = 50.0,
+        stoch_signal: str = "neutral",  # "overbought", "oversold", "neutral"
+        rsi_divergence: str = "none",  # "bullish", "bearish", "none"
+        rsi_divergence_strength: float = 0.0,
+        volume_ratio: float = 1.0,
+        is_high_volume: bool = False,
+        obv_trend: float = 0.0,
+        ha_trend: str = "neutral",  # "bullish", "bearish", "neutral"
+        ha_consecutive: int = 0,
+        ha_strength: float = 0.0,
+        vwap_distance_pct: float = 0.0,
+        vwap_position: str = "at",  # "above", "below", "at"
     ) -> TradeFeatures:
         """
         Extract features from a trading signal.
@@ -868,6 +1036,23 @@ class MLSignalPredictor:
             chart_trend_breaking: 1 if trend is breaking down
             chart_resume_ready: 1 if safe to trade
             chart_resume_confidence: Confidence in resuming (0-1)
+            macd_histogram: MACD histogram value (normalized)
+            macd_crossover: MACD crossover type ("bullish", "bearish", "none")
+            bb_bandwidth: Bollinger Band bandwidth
+            bb_position: Price position relative to BB ("above_upper", "below_lower", "middle")
+            stoch_k: Stochastic %K (0-100)
+            stoch_d: Stochastic %D (0-100)
+            stoch_signal: Stochastic signal ("overbought", "oversold", "neutral")
+            rsi_divergence: RSI divergence type ("bullish", "bearish", "none")
+            rsi_divergence_strength: RSI divergence strength (0-1)
+            volume_ratio: Current volume / average volume
+            is_high_volume: True if volume > 1.5x average
+            obv_trend: On-balance volume trend (-1 to +1)
+            ha_trend: Heiken Ashi trend ("bullish", "bearish", "neutral")
+            ha_consecutive: Consecutive same-color HA candles
+            ha_strength: Heiken Ashi trend strength (0-1)
+            vwap_distance_pct: Distance from VWAP as percentage
+            vwap_position: Position relative to VWAP ("above", "below", "at")
         """
         now = datetime.now(timezone.utc)
 
@@ -942,6 +1127,42 @@ class MLSignalPredictor:
             chart_trend_breaking=chart_trend_breaking,
             chart_resume_ready=chart_resume_ready,
             chart_resume_confidence=chart_resume_confidence,
+            # New indicator features - MACD
+            macd_histogram=macd_histogram,
+            macd_crossover_bullish=1.0 if macd_crossover == "bullish" else 0.0,
+            macd_crossover_bearish=1.0 if macd_crossover == "bearish" else 0.0,
+            macd_crossover_none=1.0 if macd_crossover not in ["bullish", "bearish"] else 0.0,
+            # Bollinger Bands
+            bb_bandwidth=bb_bandwidth,
+            bb_position_above=1.0 if bb_position == "above_upper" else 0.0,
+            bb_position_below=1.0 if bb_position == "below_lower" else 0.0,
+            bb_position_middle=1.0 if bb_position not in ["above_upper", "below_lower"] else 0.0,
+            # Stochastic
+            stoch_k=stoch_k,
+            stoch_d=stoch_d,
+            stoch_overbought=1.0 if stoch_signal == "overbought" else 0.0,
+            stoch_oversold=1.0 if stoch_signal == "oversold" else 0.0,
+            stoch_neutral=1.0 if stoch_signal not in ["overbought", "oversold"] else 0.0,
+            # RSI Divergence
+            rsi_div_bullish=1.0 if rsi_divergence == "bullish" else 0.0,
+            rsi_div_bearish=1.0 if rsi_divergence == "bearish" else 0.0,
+            rsi_div_none=1.0 if rsi_divergence not in ["bullish", "bearish"] else 0.0,
+            rsi_div_strength=rsi_divergence_strength,
+            # Volume
+            volume_ratio=volume_ratio,
+            is_high_volume=1.0 if is_high_volume else 0.0,
+            obv_trend=obv_trend,
+            # Heiken Ashi
+            ha_trend_bullish=1.0 if ha_trend == "bullish" else 0.0,
+            ha_trend_bearish=1.0 if ha_trend == "bearish" else 0.0,
+            ha_trend_neutral=1.0 if ha_trend not in ["bullish", "bearish"] else 0.0,
+            ha_consecutive=float(ha_consecutive),
+            ha_strength=ha_strength,
+            # VWAP
+            vwap_distance_pct=vwap_distance_pct,
+            vwap_position_above=1.0 if vwap_position == "above" else 0.0,
+            vwap_position_below=1.0 if vwap_position == "below" else 0.0,
+            vwap_position_at=1.0 if vwap_position not in ["above", "below"] else 0.0,
         )
 
     def _get_gradual_threshold(self) -> float:
@@ -1007,6 +1228,24 @@ class MLSignalPredictor:
         chart_trend_breaking: float = 0.0,
         chart_resume_ready: float = 1.0,
         chart_resume_confidence: float = 1.0,
+        # New indicator features
+        macd_histogram: float = 0.0,
+        macd_crossover: str = "none",
+        bb_bandwidth: float = 0.0,
+        bb_position: str = "middle",
+        stoch_k: float = 50.0,
+        stoch_d: float = 50.0,
+        stoch_signal: str = "neutral",
+        rsi_divergence: str = "none",
+        rsi_divergence_strength: float = 0.0,
+        volume_ratio: float = 1.0,
+        is_high_volume: bool = False,
+        obv_trend: float = 0.0,
+        ha_trend: str = "neutral",
+        ha_consecutive: int = 0,
+        ha_strength: float = 0.0,
+        vwap_distance_pct: float = 0.0,
+        vwap_position: str = "at",
     ) -> tuple[bool, float, str]:
         """
         Decide if we should take this trade based on ML prediction.
@@ -1127,6 +1366,24 @@ class MLSignalPredictor:
             chart_trend_breaking=chart_trend_breaking,
             chart_resume_ready=chart_resume_ready,
             chart_resume_confidence=chart_resume_confidence,
+            # New indicator features
+            macd_histogram=macd_histogram,
+            macd_crossover=macd_crossover,
+            bb_bandwidth=bb_bandwidth,
+            bb_position=bb_position,
+            stoch_k=stoch_k,
+            stoch_d=stoch_d,
+            stoch_signal=stoch_signal,
+            rsi_divergence=rsi_divergence,
+            rsi_divergence_strength=rsi_divergence_strength,
+            volume_ratio=volume_ratio,
+            is_high_volume=is_high_volume,
+            obv_trend=obv_trend,
+            ha_trend=ha_trend,
+            ha_consecutive=ha_consecutive,
+            ha_strength=ha_strength,
+            vwap_distance_pct=vwap_distance_pct,
+            vwap_position=vwap_position,
         )
         feature_vector = features.to_vector()
 
@@ -1217,6 +1474,24 @@ class MLSignalPredictor:
         chart_trend_breaking: float = 0.0,
         chart_resume_ready: float = 1.0,
         chart_resume_confidence: float = 1.0,
+        # New indicator features
+        macd_histogram: float = 0.0,
+        macd_crossover: str = "none",
+        bb_bandwidth: float = 0.0,
+        bb_position: str = "middle",
+        stoch_k: float = 50.0,
+        stoch_d: float = 50.0,
+        stoch_signal: str = "neutral",
+        rsi_divergence: str = "none",
+        rsi_divergence_strength: float = 0.0,
+        volume_ratio: float = 1.0,
+        is_high_volume: bool = False,
+        obv_trend: float = 0.0,
+        ha_trend: str = "neutral",
+        ha_consecutive: int = 0,
+        ha_strength: float = 0.0,
+        vwap_distance_pct: float = 0.0,
+        vwap_position: str = "at",
     ):
         """
         Record a trade outcome and update the model.
@@ -1249,6 +1524,7 @@ class MLSignalPredictor:
             chart_trend_breaking: 1 if trend is breaking down
             chart_resume_ready: 1 if safe to trade
             chart_resume_confidence: Confidence in resuming (0-1)
+            + New indicator features: MACD, Bollinger, Stochastic, etc.
         """
         features = self.extract_features(
             signal, volatility, price_momentum, arb_type,
@@ -1278,6 +1554,24 @@ class MLSignalPredictor:
             chart_trend_breaking=chart_trend_breaking,
             chart_resume_ready=chart_resume_ready,
             chart_resume_confidence=chart_resume_confidence,
+            # New indicator features
+            macd_histogram=macd_histogram,
+            macd_crossover=macd_crossover,
+            bb_bandwidth=bb_bandwidth,
+            bb_position=bb_position,
+            stoch_k=stoch_k,
+            stoch_d=stoch_d,
+            stoch_signal=stoch_signal,
+            rsi_divergence=rsi_divergence,
+            rsi_divergence_strength=rsi_divergence_strength,
+            volume_ratio=volume_ratio,
+            is_high_volume=is_high_volume,
+            obv_trend=obv_trend,
+            ha_trend=ha_trend,
+            ha_consecutive=ha_consecutive,
+            ha_strength=ha_strength,
+            vwap_distance_pct=vwap_distance_pct,
+            vwap_position=vwap_position,
         )
         feature_vector = features.to_vector()
 
@@ -1495,6 +1789,20 @@ class MLSignalPredictor:
                     self.correct_predictions = int(data.get("correct_predictions", 0) * 0.9)
                     logger.info(
                         f"🤖 Migration complete - model will retrain with advanced chart features"
+                    )
+                elif len(old_weights) == 53:
+                    logger.info(
+                        f"🤖 Migrating ML model from 53 to 82 features (adding new indicators: MACD, BB, Stoch, RSI Div, Volume, HA, VWAP)..."
+                    )
+                    # Extend weights for new indicator features (29 new)
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(29)]
+                    model_data["weights"] = new_weights
+                    # Keep most training data since features are related to existing patterns
+                    self.training_samples = max(0, int(data.get("training_samples", 0) * 0.85))
+                    self.predictions_made = int(data.get("predictions_made", 0) * 0.85)
+                    self.correct_predictions = int(data.get("correct_predictions", 0) * 0.85)
+                    logger.info(
+                        f"🤖 Migration complete - model will retrain with new indicator features"
                     )
                 else:
                     self.training_samples = data.get("training_samples", 0)
