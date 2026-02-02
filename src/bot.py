@@ -132,6 +132,11 @@ class TradingBot:
         if self.settlement_verifier.is_enabled():
             logger.info("📊 On-chain settlement verification enabled (The Graph)")
 
+        # Graph stats cache for position status display
+        self._graph_stats_cache: Optional[dict] = None
+        self._graph_stats_last_fetch: Optional[datetime] = None
+        self._graph_stats_refresh_interval = 300.0  # Refresh every 5 minutes
+
         # Auto-retrainer (learns from your trades)
         self.auto_retrainer = None
         if self.ml_predictor:
@@ -3801,8 +3806,72 @@ class TradingBot:
             cooldown_str = ", ".join(active_cooldowns)
             logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  ⏱️  Cooldowns: {cooldown_str:<48}{Colors.BRIGHT_CYAN}│{Colors.RESET}")
 
+        # On-chain stats from The Graph
+        if self.settlement_verifier.is_enabled():
+            graph_stats = self._get_graph_stats()
+            if graph_stats:
+                logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * 64}┤{Colors.RESET}")
+                logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  📈 On-Chain Stats (The Graph):                                  {Colors.BRIGHT_CYAN}│{Colors.RESET}")
+                wins = graph_stats.get("winning_redemptions", 0)
+                losses = graph_stats.get("losing_redemptions", 0)
+                total_payouts = graph_stats.get("total_redemption_payout_usdc", 0)
+                win_rate = graph_stats.get("redemption_win_rate", 0) * 100
+                splits = graph_stats.get("total_splits", 0)
+
+                # Win rate color
+                if win_rate >= 60:
+                    wr_color = Colors.BRIGHT_GREEN
+                elif win_rate >= 50:
+                    wr_color = Colors.BRIGHT_YELLOW
+                else:
+                    wr_color = Colors.BRIGHT_RED
+
+                logger.info(
+                    f"{Colors.BRIGHT_CYAN}│{Colors.RESET}     Trades: {Colors.BRIGHT_WHITE}{splits}{Colors.RESET}  │  "
+                    f"Wins: {Colors.BRIGHT_GREEN}{wins}{Colors.RESET}  │  "
+                    f"Losses: {Colors.BRIGHT_RED}{losses}{Colors.RESET}  │  "
+                    f"Win Rate: {wr_color}{win_rate:.0f}%{Colors.RESET}          {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+                )
+                logger.info(
+                    f"{Colors.BRIGHT_CYAN}│{Colors.RESET}     Total Payouts: {Colors.BRIGHT_GREEN}${total_payouts:,.2f}{Colors.RESET}                                     {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+                )
+
         # Box footer
         logger.info(f"{Colors.BRIGHT_CYAN}└{'─' * 64}┘{Colors.RESET}")
+
+    def _get_graph_stats(self) -> Optional[dict]:
+        """
+        Get user stats from The Graph with caching.
+
+        Returns cached stats or fetches new ones if cache expired.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Check if we have cached stats that are still fresh
+        if (self._graph_stats_cache is not None and
+            self._graph_stats_last_fetch is not None):
+            elapsed = (now - self._graph_stats_last_fetch).total_seconds()
+            if elapsed < self._graph_stats_refresh_interval:
+                return self._graph_stats_cache
+
+        # Fetch new stats
+        try:
+            wallet_address = self.client.get_address()
+            if not wallet_address:
+                return None
+
+            graph = self.settlement_verifier.graph
+            if not graph:
+                return None
+
+            stats = graph.calculate_user_stats(wallet_address)
+            self._graph_stats_cache = stats
+            self._graph_stats_last_fetch = now
+            return stats
+
+        except Exception as e:
+            logger.debug(f"Failed to fetch Graph stats: {e}")
+            return self._graph_stats_cache  # Return stale cache on error
 
     def _has_active_position(self, asset: str) -> bool:
         """
