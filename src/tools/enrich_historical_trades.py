@@ -546,7 +546,21 @@ class TradeEnricher:
 
             # Get trade details
             entry_price = float(position.get("avgPrice", 0.5))
-            size_usd = float(position.get("totalBought", 0)) * entry_price
+            total_shares = float(position.get("totalBought", 0))
+
+            # Cost = shares * entry price
+            cost_usd = total_shares * entry_price
+
+            # Calculate actual P&L based on outcome
+            # If won: profit = shares * (1 - entry_price)
+            # If lost: loss = shares * entry_price (lost the cost)
+            if trade_outcome == "WIN":
+                calculated_pnl = total_shares * (1.0 - entry_price)
+            else:
+                calculated_pnl = -cost_usd
+
+            # Note: API realizedPnl seems inflated, use our calculation
+            # For reference: API says ${realized_pnl:.2f}, we calculate ${calculated_pnl:.2f}
 
             # Create enriched trade
             enriched = EnrichedTrade(
@@ -557,8 +571,8 @@ class TradeEnricher:
                 side=side,
                 outcome=trade_outcome,
                 entry_price=entry_price,
-                size_usd=size_usd,
-                realized_pnl=float(realized_pnl),
+                size_usd=cost_usd,
+                realized_pnl=calculated_pnl,  # Use our calculated P&L
             )
 
             # Fetch historical OHLCV data from Binance
