@@ -9,6 +9,12 @@ from .ml_predictor import (
     calculate_price_trend,
     extract_ml_features_from_market,
 )
+from .auto_retrain import (
+    AutoRetrainer,
+    RetrainingConfig,
+    get_auto_retrainer,
+    init_auto_retrainer,
+)
 from .unified_signals import (
     UnifiedSignalGenerator,
     UnifiedSignal,
@@ -27,6 +33,10 @@ __all__ = [
     "get_ml_predictor",
     "calculate_price_trend",
     "extract_ml_features_from_market",
+    "AutoRetrainer",
+    "RetrainingConfig",
+    "get_auto_retrainer",
+    "init_auto_retrainer",
     # Unified signals
     "UnifiedSignalGenerator",
     "UnifiedSignal",

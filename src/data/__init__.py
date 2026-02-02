@@ -11,6 +11,12 @@ from .historical import (
     prepopulate_price_histories,
 )
 from .thegraph import PolymarketGraph, get_graph_client, Redemption, Split, Merge, Condition
+from .settlement_verifier import (
+    SettlementVerifier,
+    get_settlement_verifier,
+    SettlementVerification,
+    PositionVerification,
+)
 
 __all__ = [
     "ChainlinkFeed",
@@ -29,4 +35,8 @@ __all__ = [
     "Split",
     "Merge",
     "Condition",
+    "SettlementVerifier",
+    "get_settlement_verifier",
+    "SettlementVerification",
+    "PositionVerification",
 ]

@@ -21,11 +21,12 @@ from .data import (
     fetch_all_historical_prices,
     prepopulate_price_histories,
     get_data_api,
+    get_settlement_verifier,
 )
 from .data.binance import BinancePrice
 from .execution import create_trading_client, OrderExecutor
 from .execution.client import get_account_balance, get_trades
-from .strategy import SignalGenerator, RiskManager
+from .strategy import SignalGenerator, RiskManager, init_auto_retrainer, get_auto_retrainer
 from .strategy.ml_predictor import (
     get_ml_predictor,
     MLSignalPredictor,
@@ -125,6 +126,17 @@ class TradingBot:
             )
         else:
             logger.info("🤖 ML disabled (set ML_ENABLED=true to enable)")
+
+        # Settlement verifier (on-chain verification via The Graph)
+        self.settlement_verifier = get_settlement_verifier()
+        if self.settlement_verifier.is_enabled():
+            logger.info("📊 On-chain settlement verification enabled (The Graph)")
+
+        # Auto-retrainer (learns from your trades)
+        self.auto_retrainer = None
+        if self.ml_predictor:
+            self.auto_retrainer = init_auto_retrainer(self.ml_predictor)
+            logger.info("🔄 Auto-retraining enabled (every 50 trades)")
 
         # Market state - three-stage lifecycle
         self.markets: dict[str, MarketState] = {}  # Active trading markets
@@ -1868,6 +1880,10 @@ class TradingBot:
                 price_velocity=price_velocity,
             )
 
+            # Track for auto-retraining
+            if self.auto_retrainer:
+                self.auto_retrainer.record_trade(won=won)
+
         # Clear asset cooldown so we can trade again
         asset = market.asset
         if asset in self._last_order_time:
@@ -1970,6 +1986,18 @@ class TradingBot:
                 f"Winner: {winning_outcome} | "
                 f"Settlement Price: ${resolution_price:,.2f if resolution_price else 0}"
             )
+
+            # Cross-verify with on-chain data (The Graph)
+            if self.settlement_verifier.is_enabled() and winning_outcome:
+                verified, verify_msg = self.settlement_verifier.cross_verify_settlement(
+                    condition_id=market.condition_id,
+                    api_outcome=winning_outcome,
+                    api_price=resolution_price
+                )
+                if verified:
+                    logger.debug(f"  └─ On-chain: {verify_msg}")
+                else:
+                    logger.warning(f"  └─ On-chain verification: {verify_msg}")
         else:
             # API doesn't have resolution yet - try local determination
             # For 15-minute crypto markets: price >= target = UP wins
@@ -2235,6 +2263,17 @@ class TradingBot:
             pnl=pnl,
             exit_price=1.0 if won else 0.0,
         )
+
+        # Track for auto-retraining
+        if self.auto_retrainer:
+            self.auto_retrainer.record_trade(won=won)
+            # Check if retraining should be triggered
+            result = self.auto_retrainer.check_and_retrain()
+            if result and result.get("success"):
+                logger.info(
+                    f"🔄 Auto-retrain completed: {result['old_accuracy']:.1%} → "
+                    f"{result['new_accuracy']:.1%} ({result['reason']})"
+                )
 
         # Record ML outcome for model learning
         # Always try to record if ML is enabled - extract features if not stored
