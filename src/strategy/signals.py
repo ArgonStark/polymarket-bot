@@ -1063,6 +1063,43 @@ class SignalGenerator:
                     edge_down += 0.02
                     logger.info(f"📉 OBV BEARISH [{market.asset}]: Volume flowing out of asset → DOWN +2%")
 
+                # --- HEIKEN ASHI TREND ---
+                # Smoothed trend indicator - consecutive same-color candles = strong trend
+                if chart_analysis.ha_consecutive >= 3:
+                    ha_boost = min(0.04, chart_analysis.ha_strength * 0.05)
+                    if chart_analysis.ha_trend == "bullish":
+                        edge_up += ha_boost
+                        logger.info(
+                            f"🕯️ HEIKEN ASHI [{market.asset}]: {chart_analysis.ha_consecutive} bullish candles "
+                            f"(strength={chart_analysis.ha_strength:.0%}) → UP +{ha_boost:.1%}"
+                        )
+                    elif chart_analysis.ha_trend == "bearish":
+                        edge_down += ha_boost
+                        logger.info(
+                            f"🕯️ HEIKEN ASHI [{market.asset}]: {chart_analysis.ha_consecutive} bearish candles "
+                            f"(strength={chart_analysis.ha_strength:.0%}) → DOWN +{ha_boost:.1%}"
+                        )
+
+                # --- VWAP (Volume Weighted Average Price) ---
+                # Institutional level - price tends to revert to VWAP
+                if chart_analysis.vwap > 0:
+                    if chart_analysis.vwap_position == "below" and abs(chart_analysis.vwap_distance_pct) > 0.003:
+                        # Price significantly below VWAP - expect mean reversion UP
+                        vwap_boost = min(0.03, abs(chart_analysis.vwap_distance_pct) * 5)
+                        edge_up += vwap_boost
+                        logger.info(
+                            f"📊 VWAP [{market.asset}]: Price {chart_analysis.vwap_distance_pct:.2%} below VWAP "
+                            f"(${chart_analysis.vwap:,.0f}) → Mean reversion UP +{vwap_boost:.1%}"
+                        )
+                    elif chart_analysis.vwap_position == "above" and abs(chart_analysis.vwap_distance_pct) > 0.003:
+                        # Price significantly above VWAP - expect mean reversion DOWN
+                        vwap_boost = min(0.03, abs(chart_analysis.vwap_distance_pct) * 5)
+                        edge_down += vwap_boost
+                        logger.info(
+                            f"📊 VWAP [{market.asset}]: Price {chart_analysis.vwap_distance_pct:.2%} above VWAP "
+                            f"(${chart_analysis.vwap:,.0f}) → Mean reversion DOWN +{vwap_boost:.1%}"
+                        )
+
                 # --- VOLATILITY-DISTANCE CHECK ---
                 # Can price realistically reach the target in 15 minutes?
                 distance_to_target = abs(current_price - market.target_price)
@@ -1130,10 +1167,79 @@ class SignalGenerator:
                 except Exception as e:
                     logger.debug(f"BTC trend check failed: {e}")
 
+            # === TIME-AWARE PROBABILITY ADJUSTMENT ===
+            # KEY INSIGHT: As time runs out, price is less likely to move far
+            # Early in 15-min window: TA signals matter more
+            # Late in 15-min window: Current price position matters more
+            #
+            # If 2 mins left and price is $500 below target → unlikely to reach → favor DOWN
+            # If 12 mins left and price is $500 below target → could still move → use TA signals
+
+            time_adjustment_applied = False
+            if time_remaining is not None and time_remaining > 0:
+                # Calculate time decay factor (0 = just started, 1 = about to expire)
+                total_window = 15 * 60  # 15 minutes in seconds
+                time_elapsed_ratio = max(0, 1 - (time_remaining / total_window))
+
+                # Only apply strong adjustments in the last 5 minutes
+                if time_remaining < 300:  # Less than 5 minutes left
+                    # Time decay: 0 at 5 mins, 1 at 0 mins
+                    time_decay = 1 - (time_remaining / 300)
+                    time_decay = time_decay ** 1.5  # Exponential decay (stronger near end)
+
+                    # Distance from target as percentage
+                    distance_pct = abs(current_price - market.target_price) / market.target_price
+
+                    # Expected move in remaining time (using ATR if available)
+                    if chart_analysis and chart_analysis.atr > 0:
+                        # ATR is per 15-min candle, scale to remaining time
+                        expected_move_pct = (chart_analysis.atr / current_price) * (time_remaining / 900)
+                    else:
+                        # Fallback: assume 0.3% typical 15-min move for BTC
+                        expected_move_pct = 0.003 * (time_remaining / 900)
+
+                    # If price needs to move more than expected → favor current position
+                    if distance_pct > expected_move_pct * 1.5:
+                        # Price unlikely to cross target
+                        time_boost = time_decay * 0.10  # Up to 10% boost
+
+                        if price_below_target:
+                            # Price below target, unlikely to reach → DOWN wins
+                            edge_down += time_boost
+                            edge_up -= time_boost * 0.5
+                            logger.info(
+                                f"⏱️ TIME-AWARE [{market.asset}]: {time_remaining:.0f}s left, "
+                                f"price ${current_price:,.0f} needs to rise {distance_pct:.2%} to reach ${market.target_price:,.0f} "
+                                f"(expected move: {expected_move_pct:.2%}) → DOWN +{time_boost:.1%}"
+                            )
+                        else:
+                            # Price above target, unlikely to drop → UP wins
+                            edge_up += time_boost
+                            edge_down -= time_boost * 0.5
+                            logger.info(
+                                f"⏱️ TIME-AWARE [{market.asset}]: {time_remaining:.0f}s left, "
+                                f"price ${current_price:,.0f} needs to drop {distance_pct:.2%} to reach ${market.target_price:,.0f} "
+                                f"(expected move: {expected_move_pct:.2%}) → UP +{time_boost:.1%}"
+                            )
+                        time_adjustment_applied = True
+
+                    # If price is very close to target with little time → uncertain
+                    elif distance_pct < expected_move_pct * 0.5 and time_remaining < 120:
+                        # Too close to call - reduce both edges (avoid risky trades)
+                        uncertainty_penalty = time_decay * 0.05
+                        edge_up -= uncertainty_penalty
+                        edge_down -= uncertainty_penalty
+                        logger.info(
+                            f"⏱️ TIME-AWARE [{market.asset}]: {time_remaining:.0f}s left, "
+                            f"price very close to target ({distance_pct:.2%}) → Too risky, edges reduced"
+                        )
+                        time_adjustment_applied = True
+
             # Log final decision
             logger.info(
                 f"📈 FINAL EDGES [{market.asset}]: UP={edge_up:.1%}, DOWN={edge_down:.1%} | "
                 f"Chart: {'DOWN' if chart_says_down else 'UP' if chart_says_up else 'NEUTRAL'} ({chart_signal_strength:.0%})"
+                + (f" | ⏱️ Time-adjusted" if time_adjustment_applied else "")
             )
 
         except Exception as e:
