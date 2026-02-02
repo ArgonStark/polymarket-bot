@@ -232,6 +232,16 @@ class ChartAnalysis:
     is_high_volume: bool = False
     obv_trend: float = 0.0  # -1 to +1
 
+    # Heiken Ashi
+    ha_trend: str = "neutral"  # "bullish", "bearish", "neutral"
+    ha_consecutive: int = 0  # Consecutive same-color candles
+    ha_strength: float = 0.0  # 0.0 to 1.0
+
+    # VWAP
+    vwap: float = 0.0
+    vwap_distance_pct: float = 0.0  # Distance from VWAP
+    vwap_position: str = "at"  # "above", "below", "at"
+
     # Momentum
     momentum: float = 0.0  # -1 to +1
     momentum_increasing: bool = False
@@ -703,6 +713,132 @@ class BinanceChartAnalyzer:
         d = sum(k_values[-d_period:]) / d_period
 
         return k, d
+
+    def calculate_heiken_ashi(self, candles: List[Candle]) -> List[dict]:
+        """
+        Calculate Heiken Ashi candles for smoother trend visualization.
+
+        Heiken Ashi smooths price action making trends clearer:
+        - HA_Close = (Open + High + Low + Close) / 4
+        - HA_Open = (prev_HA_Open + prev_HA_Close) / 2
+        - HA_High = max(High, HA_Open, HA_Close)
+        - HA_Low = min(Low, HA_Open, HA_Close)
+
+        Returns:
+            List of HA candles with trend direction
+        """
+        if len(candles) < 2:
+            return []
+
+        ha_candles = []
+
+        for i, candle in enumerate(candles):
+            ha_close = (candle.open + candle.high + candle.low + candle.close) / 4
+
+            if i == 0:
+                ha_open = (candle.open + candle.close) / 2
+            else:
+                prev_ha = ha_candles[i - 1]
+                ha_open = (prev_ha["open"] + prev_ha["close"]) / 2
+
+            ha_high = max(candle.high, ha_open, ha_close)
+            ha_low = min(candle.low, ha_open, ha_close)
+
+            ha_candles.append({
+                "open": ha_open,
+                "high": ha_high,
+                "low": ha_low,
+                "close": ha_close,
+                "is_bullish": ha_close > ha_open,
+                "is_bearish": ha_close < ha_open,
+                "body_size": abs(ha_close - ha_open),
+            })
+
+        return ha_candles
+
+    def analyze_heiken_ashi_trend(self, candles: List[Candle], lookback: int = 5) -> tuple[str, int, float]:
+        """
+        Analyze Heiken Ashi trend direction.
+
+        Counts consecutive same-color candles for trend strength.
+
+        Returns:
+            Tuple of (direction, consecutive_count, strength)
+            - direction: "bullish", "bearish", or "neutral"
+            - consecutive_count: Number of same-color candles
+            - strength: 0.0 to 1.0
+        """
+        ha_candles = self.calculate_heiken_ashi(candles)
+        if len(ha_candles) < lookback:
+            return "neutral", 0, 0.0
+
+        recent = ha_candles[-lookback:]
+
+        # Count consecutive same-color candles from the end
+        consecutive = 1
+        direction = "bullish" if recent[-1]["is_bullish"] else "bearish"
+
+        for i in range(len(recent) - 2, -1, -1):
+            if direction == "bullish" and recent[i]["is_bullish"]:
+                consecutive += 1
+            elif direction == "bearish" and recent[i]["is_bearish"]:
+                consecutive += 1
+            else:
+                break
+
+        # Strength based on consecutive count (5+ = max strength)
+        strength = min(1.0, consecutive / 5.0)
+
+        # Also check body sizes - larger bodies = stronger trend
+        avg_body = sum(c["body_size"] for c in recent) / len(recent)
+        last_body = recent[-1]["body_size"]
+        if last_body > avg_body * 1.2:
+            strength = min(1.0, strength + 0.2)
+
+        return direction, consecutive, strength
+
+    def calculate_vwap(self, candles: List[Candle]) -> tuple[float, float, str]:
+        """
+        Calculate VWAP (Volume Weighted Average Price).
+
+        VWAP is a key institutional level - price tends to revert to it.
+
+        Returns:
+            Tuple of (vwap, distance_pct, position)
+            - vwap: The VWAP price
+            - distance_pct: Current price distance from VWAP as percentage
+            - position: "above", "below", or "at"
+        """
+        if len(candles) < 5:
+            return 0.0, 0.0, "at"
+
+        # Calculate VWAP: sum(typical_price * volume) / sum(volume)
+        total_pv = 0.0
+        total_volume = 0.0
+
+        for candle in candles:
+            typical_price = (candle.high + candle.low + candle.close) / 3
+            total_pv += typical_price * candle.volume
+            total_volume += candle.volume
+
+        if total_volume == 0:
+            return 0.0, 0.0, "at"
+
+        vwap = total_pv / total_volume
+        current_price = candles[-1].close
+
+        # Distance from VWAP
+        distance_pct = (current_price - vwap) / vwap
+
+        # Position relative to VWAP
+        if distance_pct > 0.002:  # More than 0.2% above
+            position = "above"
+        elif distance_pct < -0.002:  # More than 0.2% below
+            position = "below"
+        else:
+            position = "at"
+
+        return vwap, distance_pct, position
 
     def detect_trend(self, candles: List[Candle]) -> float:
         """
@@ -1564,6 +1700,12 @@ class BinanceChartAnalyzer:
             # Volume Analysis
             volume_ratio, is_high_volume, obv_trend = self.calculate_volume_analysis(candles_15m)
 
+            # Heiken Ashi
+            ha_trend, ha_consecutive, ha_strength = self.analyze_heiken_ashi_trend(candles_15m)
+
+            # VWAP
+            vwap, vwap_distance_pct, vwap_position = self.calculate_vwap(candles_15m)
+
             # Detect market type
             avg_trend = (trend_15m + trend_1h + trend_4h) / 3
             market_type, trend_strength = self.detect_market_type(candles_15m, avg_trend)
@@ -1762,6 +1904,14 @@ class BinanceChartAnalyzer:
                 volume_ratio=volume_ratio,
                 is_high_volume=is_high_volume,
                 obv_trend=obv_trend,
+                # Heiken Ashi
+                ha_trend=ha_trend,
+                ha_consecutive=ha_consecutive,
+                ha_strength=ha_strength,
+                # VWAP
+                vwap=vwap,
+                vwap_distance_pct=vwap_distance_pct,
+                vwap_position=vwap_position,
                 # Momentum
                 momentum=momentum,
                 momentum_increasing=momentum_increasing,
