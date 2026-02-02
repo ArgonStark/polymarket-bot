@@ -588,15 +588,15 @@ class UnifiedSignalGenerator:
                 contradicting_reasons=["High uncertainty"],
             )
 
-        # General uncertainty - skip
+        # General uncertainty - allow small position instead of skip
         return UnifiedSignal(
             direction=SignalDirection.NEUTRAL,
             strength=SignalStrength.NONE,
             confidence=0.0,
             context=MarketContext.UNCERTAIN,
             strategy_used="none",
-            edge_adjustment=-0.10,  # Reduce edge
-            position_multiplier=0.0,
+            edge_adjustment=-0.05,  # Smaller edge reduction
+            position_multiplier=0.25,  # Was 0.0 - now allows small positions
             primary_reason=f"Market uncertain ({context.uncertainty_score:.0%})",
             supporting_reasons=[],
             contradicting_reasons=["High uncertainty score"],
@@ -642,28 +642,28 @@ class UnifiedSignalGenerator:
     ) -> float:
         """Calculate position size multiplier."""
 
-        # Base multiplier from strength
+        # Base multiplier from strength (more aggressive - allow trading even without strong signals)
         base_mult = {
             SignalStrength.STRONG: 1.0,
-            SignalStrength.MODERATE: 0.7,
-            SignalStrength.WEAK: 0.4,
-            SignalStrength.NONE: 0.0,
+            SignalStrength.MODERATE: 0.8,
+            SignalStrength.WEAK: 0.5,
+            SignalStrength.NONE: 0.3,  # Was 0.0 - now allows small positions
         }[strength]
 
-        # Context adjustment
+        # Context adjustment (less harsh penalties)
         context_mult = {
             MarketContext.STRONG_TREND: 1.0,
-            MarketContext.WEAK_TREND: 0.8,
-            MarketContext.RANGING: 0.7,
-            MarketContext.VOLATILE: 0.5,
-            MarketContext.UNCERTAIN: 0.3,
+            MarketContext.WEAK_TREND: 0.9,
+            MarketContext.RANGING: 0.8,  # Was 0.7
+            MarketContext.VOLATILE: 0.6,  # Was 0.5
+            MarketContext.UNCERTAIN: 0.5,  # Was 0.3
         }[context]
 
         # Confirmation adjustment
         conf_adj = min(1.2, max(0.6, conf_multiplier))
 
-        # Uncertainty penalty
-        uncertainty_mult = 1.0 - (ctx.uncertainty_score * 0.5)
+        # Uncertainty penalty (reduced from 0.5 to 0.3)
+        uncertainty_mult = 1.0 - (ctx.uncertainty_score * 0.3)
 
         return min(1.0, base_mult * context_mult * conf_adj * uncertainty_mult)
 
