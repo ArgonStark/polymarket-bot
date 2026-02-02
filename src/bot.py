@@ -32,6 +32,27 @@ from .strategy.ml_predictor import (
     extract_ml_features_from_market,
     calculate_price_trend,
 )
+
+# New clean ML interface (for future migration)
+# Usage: ml = MLPredictor() or ml = NoOpML()
+#        ml_input = create_ml_input_from_signal(signal, market, chart, signal_gen)
+#        decision = ml.evaluate_trade(ml_input)
+#        if decision.should_trade: execute()
+#        ml.record_outcome(trade_id, ml_input, won=True)
+from .ml import (
+    MLInterface,
+    MLInput,
+    MLDecision,
+    MLPredictor,
+    NoOpML,
+    create_ml_input_from_signal,
+    TradeSide,
+    MarketContext,
+    TrendContext,
+    ChartContext,
+    IndicatorContext,
+    PriceContext,
+)
 from .strategy.trade_history import get_trade_history
 from .utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
 
