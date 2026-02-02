@@ -287,3 +287,90 @@ def print_config_box(config_dict: dict):
         print(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {Colors.DIM}{key_str}{Colors.RESET} {Colors.BRIGHT_WHITE}{value_str:>25}{Colors.RESET} {Colors.BRIGHT_CYAN}│{Colors.RESET}")
 
     print(f"{Colors.BRIGHT_CYAN}└──────────────────────────────────────────────────────┘{Colors.RESET}\n")
+
+
+def sparkline(values: list, width: int = 10, color: str = None) -> str:
+    """
+    Generate a sparkline chart from a list of values.
+
+    Args:
+        values: List of numeric values (price history)
+        width: Number of characters in the sparkline
+        color: Optional ANSI color code to apply
+
+    Returns:
+        String sparkline representation
+    """
+    if not values:
+        return "─" * width
+
+    # Sparkline characters from lowest to highest
+    chars = "▁▂▃▄▅▆▇█"
+
+    # Get last N values
+    vals = values[-width:] if len(values) > width else values
+
+    # Extract just prices if tuples
+    if vals and isinstance(vals[0], tuple):
+        vals = [v[1] for v in vals]
+
+    if not vals or len(vals) < 2:
+        return "─" * width
+
+    # Normalize to 0-1 range
+    min_val = min(vals)
+    max_val = max(vals)
+    range_val = max_val - min_val
+
+    if range_val == 0:
+        # No change - flat line
+        result = "─" * len(vals)
+    else:
+        result = ""
+        for v in vals:
+            normalized = (v - min_val) / range_val
+            char_idx = min(len(chars) - 1, int(normalized * (len(chars) - 1)))
+            result += chars[char_idx]
+
+    # Pad to width
+    result = result.ljust(width, "─")
+
+    # Apply color if specified
+    if color:
+        return f"{color}{result}{Colors.RESET}"
+    return result
+
+
+def trend_arrow(values: list) -> tuple:
+    """
+    Get a trend arrow and color based on price movement.
+
+    Args:
+        values: List of (timestamp, price) tuples or prices
+
+    Returns:
+        Tuple of (arrow_char, color)
+    """
+    if not values or len(values) < 2:
+        return "→", Colors.DIM
+
+    # Extract prices
+    if isinstance(values[0], tuple):
+        first_price = values[0][1]
+        last_price = values[-1][1]
+    else:
+        first_price = values[0]
+        last_price = values[-1]
+
+    pct_change = (last_price - first_price) / first_price * 100 if first_price else 0
+
+    if pct_change > 0.5:
+        return "↗", Colors.BRIGHT_GREEN
+    elif pct_change > 0.1:
+        return "→", Colors.BRIGHT_GREEN
+    elif pct_change < -0.5:
+        return "↘", Colors.BRIGHT_RED
+    elif pct_change < -0.1:
+        return "→", Colors.BRIGHT_RED
+    else:
+        return "→", Colors.DIM

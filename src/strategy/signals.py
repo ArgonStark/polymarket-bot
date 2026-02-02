@@ -655,12 +655,10 @@ class SignalGenerator:
 
                     # === HARD PAUSE: Only pause if position multiplier is 0 AND not ready to resume ===
                     if position_multiplier == 0.0 and not chart_analysis.resume_ready:
-                        logger.debug(
-                            f"⏸️ MARKET PAUSE [{market.asset}]: Full pause - "
-                            f"waiting for resume conditions | "
+                        logger.info(
+                            f"⏸️ MARKET PAUSE [{market.asset}]: Waiting for clearer signal | "
                             f"Uncertainty: {chart_analysis.uncertainty_score:.0%} | "
-                            f"Resume confidence: {chart_analysis.resume_confidence:.0%} | "
-                            f"Consecutive candles: {chart_analysis.consecutive_candles_same_dir} | "
+                            f"Resume: {chart_analysis.resume_confidence:.0%} | "
                             f"Reason: {chart_analysis.uncertainty_reason}"
                         )
                         return Signal(

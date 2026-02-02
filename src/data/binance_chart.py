@@ -1819,14 +1819,30 @@ class BinanceChartAnalyzer:
             # Detect market uncertainty (trend changes, transitions)
             is_uncertain, uncertainty_score, uncertainty_reason = self.detect_market_uncertainty(candles_15m)
 
-            # Also flag as uncertain if we just had a reversal
+            # Handle reversals: they're trading opportunities, NOT uncertainty
+            # Only add mild uncertainty if reversal conflicts with overall bias
             if trend_change in [TrendChange.BULLISH_REVERSAL, TrendChange.BEARISH_REVERSAL]:
-                is_uncertain = True
-                uncertainty_score = max(uncertainty_score, 0.7)
-                if uncertainty_reason:
-                    uncertainty_reason += f", {trend_change.value}"
+                reversal_is_bullish = trend_change == TrendChange.BULLISH_REVERSAL
+                bias_is_bullish = bias == "bullish"
+
+                # If reversal aligns with bias, it's a CONFIRMATION - reduce uncertainty
+                if reversal_is_bullish == bias_is_bullish:
+                    # Reversal confirms the direction - this is good!
+                    uncertainty_score = max(0, uncertainty_score - 0.1)
+                    if uncertainty_reason:
+                        uncertainty_reason += f", {trend_change.value} (confirms bias)"
+                    else:
+                        uncertainty_reason = f"{trend_change.value} (confirms bias)"
                 else:
-                    uncertainty_reason = trend_change.value
+                    # Reversal conflicts with bias - add mild uncertainty but don't pause
+                    uncertainty_score = min(uncertainty_score + 0.15, 0.55)  # Cap at 0.55 to avoid pause
+                    if uncertainty_reason:
+                        uncertainty_reason += f", {trend_change.value} (conflicts)"
+                    else:
+                        uncertainty_reason = f"{trend_change.value} (conflicts with bias)"
+
+                # Update is_uncertain based on new score
+                is_uncertain = uncertainty_score >= 0.5
 
             # === MULTI-TIMEFRAME ALIGNMENT ===
             timeframes_aligned, alignment_score, higher_tf_bias = self.calculate_timeframe_alignment(

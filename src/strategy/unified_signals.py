@@ -92,6 +92,9 @@ class TrendFollowingSignals:
     btc_bearish: bool = False
     btc_velocity: float = 0.0
 
+    # Weighted trend bias (fallback when individual signals conflict)
+    trend_bias: float = 0.0  # -1 to +1, from weighted multi-timeframe analysis
+
     def get_direction(self) -> Tuple[SignalDirection, float]:
         """
         Calculate overall trend-following direction and strength.
@@ -132,10 +135,17 @@ class TrendFollowingSignals:
         elif self.btc_bearish:
             bearish_score += 0.10 * min(1.0, abs(self.btc_velocity) * 100)
 
-        # Determine direction
-        if bullish_score > bearish_score and bullish_score > 0.3:
+        # Trend bias fallback (weight: 15% - helps when other signals conflict)
+        # This uses weighted multi-timeframe trend directly
+        if self.trend_bias > 0.05:
+            bullish_score += 0.15 * min(1.0, self.trend_bias * 3)  # Scale: 0.33 trend = full weight
+        elif self.trend_bias < -0.05:
+            bearish_score += 0.15 * min(1.0, abs(self.trend_bias) * 3)
+
+        # Determine direction (RELAXED threshold: 0.15 for more trading)
+        if bullish_score > bearish_score and bullish_score > 0.15:
             return SignalDirection.UP, bullish_score
-        elif bearish_score > bullish_score and bearish_score > 0.3:
+        elif bearish_score > bullish_score and bearish_score > 0.15:
             return SignalDirection.DOWN, bearish_score
         else:
             return SignalDirection.NEUTRAL, max(bullish_score, bearish_score)
@@ -217,10 +227,10 @@ class MeanReversionSignals:
         elif self.rsi_bearish_div:
             bearish_score += 0.20 * self.div_strength
 
-        # Determine direction
-        if bullish_score > bearish_score and bullish_score > 0.25:
+        # Determine direction (RELAXED threshold: 0.18 instead of 0.25)
+        if bullish_score > bearish_score and bullish_score > 0.18:
             return SignalDirection.UP, bullish_score
-        elif bearish_score > bullish_score and bearish_score > 0.25:
+        elif bearish_score > bullish_score and bearish_score > 0.18:
             return SignalDirection.DOWN, bearish_score
         else:
             return SignalDirection.NEUTRAL, max(bullish_score, bearish_score)
@@ -821,7 +831,15 @@ def extract_signals_from_chart_analysis(chart_analysis) -> Tuple[
         uncertainty_score=ca.uncertainty_score,
     )
 
-    # Trend-following signals
+    # Calculate weighted trend score for more nuanced detection
+    # Weight: 15m=40%, 1h=35%, 4h=25% (short-term matters more for 15-min markets)
+    weighted_trend = (
+        ca.trend_15m * 0.40 +
+        ca.trend_1h * 0.35 +
+        ca.trend_4h * 0.25
+    )
+
+    # Trend-following signals (RELAXED thresholds for more trading)
     trend = TrendFollowingSignals(
         # MACD
         macd_bullish=ca.macd_crossover == "bullish" or ca.macd_histogram > 0,
@@ -833,14 +851,27 @@ def extract_signals_from_chart_analysis(chart_analysis) -> Tuple[
         ha_bearish=ca.ha_trend == "bearish",
         ha_strength=ca.ha_strength,
 
-        # MA alignment (use trend values as proxy)
-        ma_bullish=ca.trend_15m > 0.3 and ca.trend_1h > 0.2,
-        ma_bearish=ca.trend_15m < -0.3 and ca.trend_1h < -0.2,
+        # MA alignment - RELAXED: use weighted trend with lower threshold
+        ma_bullish=weighted_trend > 0.08,  # Was: 0.15
+        ma_bearish=weighted_trend < -0.08,  # Was: -0.15
 
-        # Multi-timeframe
-        mtf_bullish=ca.trend_15m > 0.2 and ca.trend_1h > 0.2 and ca.trend_4h > 0.1,
-        mtf_bearish=ca.trend_15m < -0.2 and ca.trend_1h < -0.2 and ca.trend_4h < -0.1,
+        # Multi-timeframe - RELAXED: majority rules OR any two timeframes agree
+        mtf_bullish=(
+            (ca.trend_15m > 0.05 and ca.trend_1h > 0.05) or  # Short+medium bullish
+            (ca.trend_1h > 0.05 and ca.trend_4h > 0.0) or   # Medium+long bullish
+            (ca.trend_15m > 0.1 and ca.trend_4h > 0.0) or   # Short+long bullish
+            (weighted_trend > 0.12)  # Moderate weighted trend
+        ),
+        mtf_bearish=(
+            (ca.trend_15m < -0.05 and ca.trend_1h < -0.05) or  # Short+medium bearish
+            (ca.trend_1h < -0.05 and ca.trend_4h < 0.0) or    # Medium+long bearish
+            (ca.trend_15m < -0.1 and ca.trend_4h < 0.0) or    # Short+long bearish
+            (weighted_trend < -0.12)  # Moderate weighted trend
+        ),
         mtf_alignment=ca.alignment_score,
+
+        # Direct trend bias from weighted multi-timeframe analysis
+        trend_bias=weighted_trend,
     )
 
     # Mean-reversion signals
