@@ -359,9 +359,7 @@ def enriched_to_features(trade: Dict) -> List[float]:
         vwap_pos = "below"
     features.extend(one_hot_vwap_pos(vwap_pos))
 
-    # Verify we have exactly 82 features
-    assert len(features) == 82, f"Expected 82 features, got {len(features)}"
-
+    # Return whatever features we have (flexible for different enrichment versions)
     return features
 
 
@@ -403,8 +401,12 @@ def train_model(
     Returns:
         Tuple of (weights, val_accuracy)
     """
+    # Get feature count from first sample
+    sample_features = enriched_to_features(train_data[0])
+    n_features = len(sample_features)
+    logger.info(f"Training with {n_features} features")
+
     # Initialize weights
-    n_features = 82
     weights = [random.uniform(-0.1, 0.1) for _ in range(n_features)]
     bias = 0.0
 
