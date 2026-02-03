@@ -4250,15 +4250,25 @@ class TradingBot:
         logger.info(f"{Colors.BRIGHT_CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
 
         # === MINIMUM ORDER SIZE CHECK ===
-        # LIMIT orders have very low minimum (~1 share)
-        # Only skip if truly tiny (risk management already handles sizing)
-        MIN_SHARES = 1.0
-        if signal.size_shares < MIN_SHARES:
-            logger.warning(
-                f"[{asset}] ❌ ORDER TOO SMALL: {signal.size_shares:.2f} shares < {MIN_SHARES} minimum | "
-                f"Skipping trade"
-            )
-            return
+        # Polymarket minimums:
+        # - LIMIT orders: 5 shares minimum
+        # - MARKET orders: $1 minimum (no share minimum)
+        if signal.recommended_action == OrderAction.LIMIT:
+            MIN_SHARES = 5.0
+            if signal.size_shares < MIN_SHARES:
+                logger.warning(
+                    f"[{asset}] ❌ ORDER TOO SMALL: {signal.size_shares:.2f} shares < {MIN_SHARES} minimum for LIMIT | "
+                    f"Skipping trade"
+                )
+                return
+        else:  # MARKET order
+            MIN_USD = 1.0
+            if signal.size_usd < MIN_USD:
+                logger.warning(
+                    f"[{asset}] ❌ ORDER TOO SMALL: ${signal.size_usd:.2f} < ${MIN_USD} minimum for MARKET | "
+                    f"Skipping trade"
+                )
+                return
 
         # Log the trade attempt with colors
         direction = "▲" if signal.side == Side.UP else "▼"
