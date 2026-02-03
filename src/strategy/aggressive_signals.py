@@ -12,6 +12,12 @@ The successful trader approach:
 Key insight: You don't need 85% win rate.
 At even odds (0.50), winning 55% of the time = profitable.
 At 0.45 odds, winning 52% = profitable.
+
+RISK MANAGEMENT (even in aggressive mode):
+- Never risk more than 5% of bankroll per trade
+- Maximum 4 concurrent positions (one per asset)
+- Total exposure capped at 20% of bankroll
+- Size based on conviction, not "all in"
 """
 
 import logging
@@ -37,8 +43,9 @@ class AggressiveSignal:
     edge: float  # Estimated edge (can be negative - we still trade)
     reason: str
 
-    # Position sizing
-    size_multiplier: float  # 0.5 to 1.0
+    # Position sizing (as percentage of max allowed, NOT bankroll)
+    # Even at 1.0 (100%), this is 100% of MAX_POSITION, which should be ~5% of bankroll
+    size_multiplier: float  # 0.3 to 1.0
 
     # For logging
     price_vs_target: float  # Current price distance from target (%)
@@ -215,27 +222,47 @@ def generate_aggressive_signal(
         market_prob = market_odds_down
         edge = true_prob - market_prob
 
+    # Cap edge at realistic maximum (no trade has 25% edge)
+    MAX_EDGE = 0.12  # 12% max
+    edge = max(-0.15, min(MAX_EDGE, edge))
+
     # ==========================================================================
-    # STEP 6: Position sizing
+    # STEP 6: Position sizing (CONSERVATIVE even in aggressive mode)
     # ==========================================================================
+    #
+    # Size multiplier is applied to MAX_POSITION_USD (from config)
+    # MAX_POSITION_USD should be ~5% of bankroll
+    # So even 100% multiplier = 5% of bankroll per trade
+    #
+    # Conviction-based sizing:
+    # - HIGH: 80% of max (4% of bankroll)
+    # - MEDIUM: 50% of max (2.5% of bankroll)
+    # - LOW: 30% of max (1.5% of bankroll)
 
     size_multiplier = {
-        Conviction.HIGH: 1.0,
-        Conviction.MEDIUM: 0.7,
-        Conviction.LOW: 0.5,
+        Conviction.HIGH: 0.8,    # Strong signal - still not 100%
+        Conviction.MEDIUM: 0.5,  # Decent signal
+        Conviction.LOW: 0.3,     # Weak signal - small position
     }[conviction]
 
-    # Boost size if edge is particularly good
-    if edge > 0.08:
-        size_multiplier = min(1.0, size_multiplier * 1.2)
+    # Boost size only if edge is VERY good (>10%)
+    if edge > 0.10:
+        size_multiplier = min(0.9, size_multiplier * 1.15)
 
-    # Reduce size if edge is negative (but still trade!)
+    # Reduce size if edge is negative (but still trade with tiny size)
     if edge < 0:
-        size_multiplier *= 0.7
+        size_multiplier *= 0.5  # Half size for negative edge
+    if edge < -0.05:
+        size_multiplier *= 0.5  # Quarter size for very negative edge
 
-    # Reduce size in final minute (less time to be right)
-    if time_remaining < 60:
-        size_multiplier *= 0.5
+    # Reduce size in final 2 minutes (less time to be right)
+    if time_remaining < 120:
+        size_multiplier *= 0.6
+    elif time_remaining < 60:
+        size_multiplier *= 0.4
+
+    # Minimum size floor (don't go below 20% of max)
+    size_multiplier = max(0.2, size_multiplier)
 
     # ==========================================================================
     # STEP 7: Return signal

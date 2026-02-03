@@ -522,11 +522,17 @@ class SignalGenerator:
 
         # === SPREAD CHECK ===
         # Wide spreads eat into edge - skip if spread is too wide
+        # Use PERCENTAGE spread relative to mid-price, not fixed dollar amount
         spread = market.best_ask - market.best_bid
-        MAX_SPREAD = 0.10  # 10 cents max spread
-        if spread > MAX_SPREAD:
+        mid_price = (market.best_ask + market.best_bid) / 2
+        spread_pct = spread / mid_price if mid_price > 0 else 1.0
+
+        MAX_SPREAD_PCT = 0.15  # 15% max spread (e.g., 0.075 spread on 0.50 token)
+        MAX_SPREAD_ABS = 0.12  # Also cap absolute spread at 12 cents
+
+        if spread_pct > MAX_SPREAD_PCT or spread > MAX_SPREAD_ABS:
             logger.info(
-                f"⚠️ WIDE SPREAD [{market.asset}]: {spread:.2f} > {MAX_SPREAD:.2f} - skipping"
+                f"⚠️ WIDE SPREAD [{market.asset}]: {spread:.2f} ({spread_pct:.0%}) - skipping"
             )
             return Signal(
                 market=market,
@@ -540,7 +546,7 @@ class SignalGenerator:
                 size_shares=0.0,
                 chainlink_price=current_price,
                 time_remaining=time_remaining,
-                reasoning=f"[WIDE SPREAD] Spread {spread:.2f} > max {MAX_SPREAD:.2f}",
+                reasoning=f"[WIDE SPREAD] Spread {spread:.2f} ({spread_pct:.0%}) too wide",
             )
 
         # STAGE 1: Check for arbitrage opportunities (pattern-based)
@@ -767,47 +773,27 @@ class SignalGenerator:
                     chart_analysis.trend_15m * 0.25
                 )
 
-            # Check for SHORT-TERM BOUNCE in a downtrend
-            # This is when 1h/4h are bearish but 1m/5m show a bounce
-            is_short_term_bounce = (
-                short_term_trend > 0.3 and  # Short-term bullish
-                trend_1h < -0.2  # But 1h is bearish (we're in a downtrend)
-            )
-
-            # Check for SHORT-TERM PULLBACK in an uptrend
-            # This is when 1h/4h are bullish but 1m/5m show a pullback
-            is_short_term_pullback = (
-                short_term_trend < -0.3 and  # Short-term bearish
-                trend_1h > 0.2  # But 1h is bullish (we're in an uptrend)
-            )
+            # =================================================================
+            # REMOVED: Counter-trend bounce/pullback logic
+            # =================================================================
+            # Counter-trend trades (bounce in downtrend, pullback in uptrend)
+            # tend to LOSE money on 15-minute Polymarket markets.
+            # The main trend usually wins. Don't fight it.
+            #
+            # OLD CODE REMOVED:
+            # - is_short_term_bounce (trading UP in a downtrend)
+            # - is_short_term_pullback (trading DOWN in an uptrend)
+            # =================================================================
 
             # === PATTERN-BASED SIGNALS ===
-            # Bullish/bearish patterns can also signal counter-trend opportunities
-            pattern_says_up = is_bullish_pattern
-            pattern_says_down = is_bearish_pattern
+            # Only use patterns that ALIGN with trend, not against it
+            pattern_says_up = is_bullish_pattern and trend_1h >= -0.1  # Only if not in strong downtrend
+            pattern_says_down = is_bearish_pattern and trend_1h <= 0.1  # Only if not in strong uptrend
 
             # === DETERMINE CHART SIGNAL ===
 
-            # SHORT-TERM BOUNCE: Trade UP even in downtrend
-            if is_short_term_bounce:
-                chart_says_up = True
-                chart_signal_strength = min(1.0, abs(short_term_trend) * 1.5)
-                logger.info(
-                    f"📈 SHORT-TERM BOUNCE [{market.asset}]: "
-                    f"1m/5m bullish ({short_term_trend:+.2f}) in 1h downtrend ({trend_1h:+.2f}) → UP signal"
-                )
-
-            # SHORT-TERM PULLBACK: Trade DOWN even in uptrend
-            elif is_short_term_pullback:
-                chart_says_down = True
-                chart_signal_strength = min(1.0, abs(short_term_trend) * 1.5)
-                logger.info(
-                    f"📉 SHORT-TERM PULLBACK [{market.asset}]: "
-                    f"1m/5m bearish ({short_term_trend:+.2f}) in 1h uptrend ({trend_1h:+.2f}) → DOWN signal"
-                )
-
-            # PATTERN-BASED SIGNAL (can override trend)
-            elif pattern_says_up and short_term_trend > 0:
+            # PATTERN-BASED SIGNAL (only if aligned with trend)
+            if pattern_says_up and short_term_trend > 0:
                 chart_says_up = True
                 chart_signal_strength = 0.7
                 logger.info(
@@ -1327,13 +1313,28 @@ class SignalGenerator:
 
         # === CLAMP EDGES TO MINIMUM 0 ===
         # Negative edges mean the trade is expected to lose money
-        # Never trade with negative edge - this prevents over-penalization
+        # =================================================================
+        # EDGE CLAMPING - Keep edges realistic
+        # =================================================================
+        # No trade has 40% edge. If calculations show that, something is wrong.
+        # Cap at 12% - this represents a strong but realistic edge.
+        MAX_REALISTIC_EDGE = 0.12  # 12% max edge
+
+        # Clamp minimum (no negative edges)
         if edge_up < 0:
             logger.debug(f"EDGE CLAMP [{market.asset}]: UP edge {edge_up:.1%} clamped to 0%")
             edge_up = 0.0
         if edge_down < 0:
             logger.debug(f"EDGE CLAMP [{market.asset}]: DOWN edge {edge_down:.1%} clamped to 0%")
             edge_down = 0.0
+
+        # Clamp maximum (no unrealistic edges)
+        if edge_up > MAX_REALISTIC_EDGE:
+            logger.debug(f"EDGE CLAMP [{market.asset}]: UP edge {edge_up:.1%} capped at {MAX_REALISTIC_EDGE:.1%}")
+            edge_up = MAX_REALISTIC_EDGE
+        if edge_down > MAX_REALISTIC_EDGE:
+            logger.debug(f"EDGE CLAMP [{market.asset}]: DOWN edge {edge_down:.1%} capped at {MAX_REALISTIC_EDGE:.1%}")
+            edge_down = MAX_REALISTIC_EDGE
 
         if edge_up > edge_down and edge_up >= min_edge:
             side = Side.UP
@@ -1716,19 +1717,39 @@ class SignalGenerator:
         # Convert to Signal object
         side = Side.UP if agg_signal.direction == "UP" else Side.DOWN
 
-        # Calculate position size
-        base_size = self.config.trading.max_position_usd
-        size_usd = base_size * agg_signal.size_multiplier
+        # =================================================================
+        # POSITION SIZING WITH RISK MANAGEMENT
+        # =================================================================
+        # Even in aggressive mode, respect these limits:
+        # 1. Max 5% of bankroll per trade (max_position_pct)
+        # 2. Size multiplier from conviction (0.3 to 0.8)
+        # 3. Never exceed max_position_usd
+        #
+        # Example with $1000 bankroll, 5% max:
+        # - HIGH conviction (0.8): 0.8 * $50 = $40 per trade
+        # - MEDIUM conviction (0.5): 0.5 * $50 = $25 per trade
+        # - LOW conviction (0.3): 0.3 * $50 = $15 per trade
+        # =================================================================
+
+        # Get max position from config (should be ~5% of bankroll)
+        max_position = self.config.trading.max_position_usd
+
+        # Apply conviction multiplier
+        size_usd = max_position * agg_signal.size_multiplier
+
+        # Extra safety: cap at absolute maximum
+        ABSOLUTE_MAX_PER_TRADE = 100.0  # Never more than $100 per trade
+        size_usd = min(size_usd, ABSOLUTE_MAX_PER_TRADE)
 
         # Recommended price
         if side == Side.UP:
             recommended_price = market.best_ask
             market_prob = market.best_ask
-            true_prob = market_prob + agg_signal.edge
+            true_prob = min(0.95, market_prob + agg_signal.edge)  # Cap true_prob
         else:
             recommended_price = 1 - market.best_bid
             market_prob = 1 - market.best_bid
-            true_prob = market_prob + agg_signal.edge
+            true_prob = min(0.95, market_prob + agg_signal.edge)  # Cap true_prob
 
         # Calculate shares
         if recommended_price > 0:
@@ -1736,10 +1757,8 @@ class SignalGenerator:
         else:
             size_shares = 0
 
-        # Determine action
-        action = OrderAction.OPEN_LIMIT
-        if agg_signal.conviction == Conviction.HIGH and agg_signal.edge > 0.05:
-            action = OrderAction.OPEN_MARKET  # High conviction = market order
+        # Determine action - always use LIMIT orders for safety
+        action = OrderAction.OPEN_LIMIT  # Safer than market orders
 
         return Signal(
             market=market,
