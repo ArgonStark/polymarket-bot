@@ -1769,7 +1769,7 @@ class SignalGenerator:
             edge=simple_sig.edge,
             true_prob=simple_sig.win_probability,
             market_prob=market_prob,
-            recommended_action=OrderAction.OPEN_LIMIT,
+            recommended_action=OrderAction.LIMIT,
             recommended_price=recommended_price,
             size_usd=size_usd,
             size_shares=size_shares,
