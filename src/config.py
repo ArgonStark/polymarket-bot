@@ -60,6 +60,13 @@ class TradingConfig:
         default_factory=lambda: os.getenv("TRADING_MODE", "normal")
     )
 
+    # SIMPLE MODE (RECOMMENDED): Use distance-from-target strategy
+    # This is the most profitable approach for 15-minute markets
+    # Set SIMPLE_MODE=false to use complex indicators (not recommended)
+    simple_mode: bool = field(
+        default_factory=lambda: os.getenv("SIMPLE_MODE", "true").lower() == "true"
+    )
+
     # AGGRESSIVE MODE: Trade every market, always pick a side
     # Set AGGRESSIVE_MODE=true to enable
     # This overrides normal signal generation with simple momentum-based decisions
