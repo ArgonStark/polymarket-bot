@@ -82,6 +82,19 @@ try:
 except ImportError:
     UNIFIED_SIGNALS_AVAILABLE = False
 
+# Import aggressive signal framework
+try:
+    from .aggressive_signals import (
+        generate_aggressive_signal,
+        AggressiveSignal,
+        Conviction,
+        should_skip_market,
+        log_aggressive_signal,
+    )
+    AGGRESSIVE_SIGNALS_AVAILABLE = True
+except ImportError:
+    AGGRESSIVE_SIGNALS_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -477,9 +490,9 @@ class SignalGenerator:
         """
         Generate a trading signal for a market.
 
-        ENHANCED: Now uses two-stage approach:
-        1. Check for arbitrage opportunities (pattern-based)
-        2. Fall back to probability-based edge calculation
+        MODES:
+        - AGGRESSIVE: Trade every market, always pick a side (set AGGRESSIVE_MODE=true)
+        - NORMAL: Use multi-stage analysis with arbitrage detection
 
         Args:
             market: Market state to analyze
@@ -492,6 +505,12 @@ class SignalGenerator:
         if current_price is None:
             logger.debug(f"No price data for {market.asset}")
             return None
+
+        # =====================================================================
+        # AGGRESSIVE MODE: Simple, always-trade strategy
+        # =====================================================================
+        if getattr(self.config.trading, 'aggressive_mode', False) and AGGRESSIVE_SIGNALS_AVAILABLE:
+            return self._generate_aggressive_signal(market, current_price)
 
         # Check time remaining
         time_remaining = market.time_remaining
@@ -1637,6 +1656,105 @@ class SignalGenerator:
                 base_reasoning += binance_info
 
         return base_reasoning
+
+    def _generate_aggressive_signal(
+        self,
+        market: MarketState,
+        current_price: float,
+    ) -> Optional[Signal]:
+        """
+        Generate signal using aggressive always-trade strategy.
+
+        Philosophy: Trade EVERY market. Pick a side based on:
+        1. Price position relative to target
+        2. Momentum (Binance trend)
+        3. Time remaining
+
+        Returns:
+            Signal object (ALWAYS returns a signal in aggressive mode)
+        """
+        time_remaining = market.time_remaining
+
+        # Check if we should skip (only skip in extreme cases)
+        spread = market.best_ask - market.best_bid
+        should_skip, skip_reason = should_skip_market(time_remaining, spread)
+        if should_skip:
+            logger.debug(f"AGGRESSIVE [{market.asset}]: Skipping - {skip_reason}")
+            return None
+
+        # Get momentum from Binance
+        binance_trend = 0.0
+        if self.binance_feed:
+            try:
+                # Get recent price movement
+                velocity = self.binance_feed.get_velocity(market.asset)
+                if velocity:
+                    # Convert velocity to trend score (-1 to +1)
+                    # Velocity of 0.0001 (0.01%/s) = moderate trend
+                    binance_trend = max(-1.0, min(1.0, velocity * 5000))
+            except Exception:
+                pass
+
+        # Get volatility
+        volatility = self.get_volatility(market.asset)
+
+        # Generate aggressive signal
+        agg_signal = generate_aggressive_signal(
+            asset=market.asset,
+            current_price=current_price,
+            target_price=market.target_price,
+            time_remaining=time_remaining,
+            binance_trend=binance_trend,
+            volatility=volatility,
+            market_odds_up=market.best_ask,
+            market_odds_down=1 - market.best_bid,
+        )
+
+        # Log the signal
+        log_aggressive_signal(market.asset, agg_signal)
+
+        # Convert to Signal object
+        side = Side.UP if agg_signal.direction == "UP" else Side.DOWN
+
+        # Calculate position size
+        base_size = self.config.trading.max_position_usd
+        size_usd = base_size * agg_signal.size_multiplier
+
+        # Recommended price
+        if side == Side.UP:
+            recommended_price = market.best_ask
+            market_prob = market.best_ask
+            true_prob = market_prob + agg_signal.edge
+        else:
+            recommended_price = 1 - market.best_bid
+            market_prob = 1 - market.best_bid
+            true_prob = market_prob + agg_signal.edge
+
+        # Calculate shares
+        if recommended_price > 0:
+            size_shares = size_usd / recommended_price
+        else:
+            size_shares = 0
+
+        # Determine action
+        action = OrderAction.OPEN_LIMIT
+        if agg_signal.conviction == Conviction.HIGH and agg_signal.edge > 0.05:
+            action = OrderAction.OPEN_MARKET  # High conviction = market order
+
+        return Signal(
+            market=market,
+            side=side,
+            edge=agg_signal.edge,
+            true_prob=true_prob,
+            market_prob=market_prob,
+            recommended_action=action,
+            recommended_price=recommended_price,
+            size_usd=size_usd,
+            size_shares=size_shares,
+            chainlink_price=current_price,
+            time_remaining=time_remaining,
+            reasoning=f"[AGGRESSIVE {agg_signal.conviction.value.upper()}] {agg_signal.reason}",
+        )
 
     def _check_arbitrage_opportunities(
         self,
