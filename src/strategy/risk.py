@@ -198,9 +198,9 @@ class RiskManager:
         """
         Adjust signal size to fit within risk limits.
 
-        Supports two modes:
-        1. Kelly Criterion (when ml_confidence provided and use_kelly=True)
-        2. Fixed percentage (fallback)
+        IMPORTANT: This only REDUCES size, never increases it.
+        The signal already calculated its desired size based on conviction.
+        We only cap it to prevent exceeding risk limits.
 
         Args:
             signal: Trading signal to adjust
@@ -213,31 +213,16 @@ class RiskManager:
         available = self.current_bankroll * 0.90
         max_position = self.current_bankroll * trading.max_position_pct
 
-        # Try Kelly criterion if ML confidence available
-        if use_kelly and ml_confidence is not None and ml_confidence > 0.52:
-            try:
-                from .kelly import calculate_kelly_position
-                kelly_size, kelly_details = calculate_kelly_position(
-                    bankroll=self.current_bankroll,
-                    win_probability=ml_confidence,
-                    market_price=signal.recommended_price,
-                    edge=signal.edge,
-                    max_position_usd=max_position,
-                )
-                position_size = min(kelly_size, available)
+        # The signal's original size is the MAXIMUM we want to trade
+        # We only reduce from here, never increase
+        original_size = signal.size_usd
 
-                # Log Kelly sizing
-                kelly_frac = kelly_details.get("adjusted_kelly_fraction", 0)
-                logger.debug(
-                    f"[{signal.market.asset}] Kelly size: ${position_size:.2f} "
-                    f"({kelly_frac:.1%} of bankroll) | ML conf: {ml_confidence:.1%}"
-                )
-            except Exception as e:
-                logger.debug(f"Kelly calculation failed, using fixed %: {e}")
-                position_size = min(max_position, available)
-        else:
-            # Fallback: fixed percentage of bankroll
-            position_size = min(max_position, available)
+        # Calculate the risk limit (caps based on bankroll)
+        risk_limit = min(max_position, available)
+
+        # Final position size = minimum of original and risk limit
+        # This ensures we NEVER scale UP, only DOWN
+        position_size = min(original_size, risk_limit)
 
         # Ensure minimum viable trade size ($3)
         if position_size < 3.0:
@@ -246,13 +231,16 @@ class RiskManager:
             signal.size_shares = 0
             return signal
 
-        # Scale signal to target size
-        if signal.size_usd != position_size:
+        # Only adjust if we need to scale DOWN
+        if position_size < original_size:
+            logger.info(
+                f"📏 RISK LIMIT [{signal.market.asset}]: ${original_size:.2f} → ${position_size:.2f} "
+                f"(bankroll ${self.current_bankroll:.2f} × {trading.max_position_pct:.0%} = ${max_position:.2f})"
+            )
             if signal.size_usd > 0:
                 ratio = position_size / signal.size_usd
                 signal.size_shares = signal.size_shares * ratio
             else:
-                # Calculate shares from scratch if original size was 0
                 price = max(0.01, min(0.99, signal.recommended_price))
                 signal.size_shares = position_size / price
             signal.size_usd = position_size
