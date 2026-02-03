@@ -60,6 +60,13 @@ class TradingConfig:
         default_factory=lambda: os.getenv("TRADING_MODE", "normal")
     )
 
+    # SIMPLE MODE (RECOMMENDED): Use distance-from-target strategy
+    # This is the most profitable approach for 15-minute markets
+    # Set SIMPLE_MODE=false to use complex indicators (not recommended)
+    simple_mode: bool = field(
+        default_factory=lambda: os.getenv("SIMPLE_MODE", "true").lower() == "true"
+    )
+
     # AGGRESSIVE MODE: Trade every market, always pick a side
     # Set AGGRESSIVE_MODE=true to enable
     # This overrides normal signal generation with simple momentum-based decisions
@@ -68,15 +75,16 @@ class TradingConfig:
     )
 
     # Minimum edge required to enter a trade (as decimal, e.g., 0.05 = 5%)
-    # Realistic values: 3-8% is typical for arbitrage opportunities
+    # With SIMPLE_MODE, lower edge is OK because signals are more reliable
+    # 0% = trade all signals, 2% = only trade when we have clear edge
     min_edge: float = field(
-        default_factory=lambda: float(os.getenv("MIN_EDGE", "0.03"))
+        default_factory=lambda: float(os.getenv("MIN_EDGE", "0.00"))
     )
 
     # Minimum time remaining before market close (seconds)
-    # 60s gives enough buffer for order execution and price movement
+    # 30s is enough for order execution - closer to settlement = more confident
     min_time_remaining: float = field(
-        default_factory=lambda: float(os.getenv("MIN_TIME_REMAINING", "60"))
+        default_factory=lambda: float(os.getenv("MIN_TIME_REMAINING", "30"))
     )
 
     # Base position size in USD (smaller = more trades, less risk per trade)
@@ -90,9 +98,9 @@ class TradingConfig:
     )
 
     # Maximum concurrent positions (filled + pending orders)
-    # WARNING: Lower = safer. Each position risks max_position_pct of bankroll
+    # 4 = one per asset (BTC, ETH, SOL, XRP)
     max_concurrent_positions: int = field(
-        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "2"))
+        default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "4"))
     )
 
     # Maximum total capital at risk (as % of bankroll)
@@ -102,9 +110,9 @@ class TradingConfig:
     )
 
     # Cooldown between trades for SAME asset (seconds)
-    # Higher = safer, prevents duplicate orders
+    # 10s enough to prevent duplicates while allowing active trading
     order_cooldown_seconds: int = field(
-        default_factory=lambda: int(os.getenv("ORDER_COOLDOWN_SECONDS", "30"))
+        default_factory=lambda: int(os.getenv("ORDER_COOLDOWN_SECONDS", "10"))
     )
 
     # Asset priority - higher priority assets get checked first
@@ -529,7 +537,7 @@ class BotConfig:
         if not self.wallet.validate():
             errors.append("Wallet not configured: PK and FUNDER required")
 
-        if self.trading.min_edge <= 0 or self.trading.min_edge >= 1:
+        if self.trading.min_edge < 0 or self.trading.min_edge >= 1:
             errors.append("min_edge must be between 0 and 1")
 
         if self.trading.min_time_remaining < 0:

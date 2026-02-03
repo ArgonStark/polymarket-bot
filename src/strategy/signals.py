@@ -95,6 +95,19 @@ try:
 except ImportError:
     AGGRESSIVE_SIGNALS_AVAILABLE = False
 
+# Import SIMPLE signal framework (RECOMMENDED)
+try:
+    from .simple_signals import (
+        generate_simple_signal,
+        SimpleSignal,
+        Conviction as SimpleConviction,
+        should_skip_market as simple_should_skip,
+        log_simple_signal,
+    )
+    SIMPLE_SIGNALS_AVAILABLE = True
+except ImportError:
+    SIMPLE_SIGNALS_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -490,9 +503,10 @@ class SignalGenerator:
         """
         Generate a trading signal for a market.
 
-        MODES:
-        - AGGRESSIVE: Trade every market, always pick a side (set AGGRESSIVE_MODE=true)
-        - NORMAL: Use multi-stage analysis with arbitrage detection
+        MODES (in order of priority):
+        1. SIMPLE (default): Distance from target + Trend + Momentum
+        2. AGGRESSIVE: Trade every market with momentum
+        3. NORMAL: Complex multi-stage analysis (deprecated)
 
         Args:
             market: Market state to analyze
@@ -505,6 +519,12 @@ class SignalGenerator:
         if current_price is None:
             logger.debug(f"No price data for {market.asset}")
             return None
+
+        # =====================================================================
+        # SIMPLE MODE (RECOMMENDED): Distance + Trend + Momentum
+        # =====================================================================
+        if getattr(self.config.trading, 'simple_mode', True) and SIMPLE_SIGNALS_AVAILABLE:
+            return self._generate_simple_signal(market, current_price)
 
         # =====================================================================
         # AGGRESSIVE MODE: Simple, always-trade strategy
@@ -1658,6 +1678,106 @@ class SignalGenerator:
 
         return base_reasoning
 
+    def _generate_simple_signal(
+        self,
+        market: MarketState,
+        current_price: float,
+    ) -> Optional[Signal]:
+        """
+        Generate signal using SIMPLE strategy (RECOMMENDED).
+
+        Decision hierarchy:
+        1. DISTANCE from target (PRIMARY)
+        2. TREND direction (SECONDARY)
+        3. MOMENTUM (CONFIRMATION)
+
+        Returns:
+            Signal object
+        """
+        time_remaining = market.time_remaining
+
+        # Check if we should skip
+        spread = market.best_ask - market.best_bid
+        skip, skip_reason = simple_should_skip(time_remaining, spread)
+        if skip:
+            logger.debug(f"SIMPLE [{market.asset}]: Skip - {skip_reason}")
+            return None
+
+        # Get momentum from Binance
+        momentum = 0.0
+        if self.binance_feed:
+            try:
+                velocity = self.binance_feed.get_velocity(market.asset)
+                if velocity:
+                    momentum = max(-1.0, min(1.0, velocity * 5000))
+            except Exception:
+                pass
+
+        # Get trends from Binance chart data
+        trend_15m = 0.0
+        trend_1h = 0.0
+        trend_4h = 0.0
+        try:
+            if CHART_ANALYSIS_AVAILABLE:
+                chart_analysis = analyze_chart(market.asset)
+                if chart_analysis:
+                    trend_15m = chart_analysis.trend_15m
+                    trend_1h = chart_analysis.trend_1h
+                    trend_4h = chart_analysis.trend_4h
+        except Exception:
+            pass
+
+        # Generate simple signal
+        simple_sig = generate_simple_signal(
+            asset=market.asset,
+            current_price=current_price,
+            target_price=market.target_price,
+            time_remaining=time_remaining,
+            momentum=momentum,
+            trend_15m=trend_15m,
+            trend_1h=trend_1h,
+            trend_4h=trend_4h,
+            market_odds_up=market.best_ask,
+            market_odds_down=1 - market.best_bid,
+        )
+
+        # Log the signal
+        log_simple_signal(market.asset, simple_sig, market.target_price, current_price)
+
+        # Convert to Signal object
+        side = Side.UP if simple_sig.direction == "UP" else Side.DOWN
+
+        # Position sizing (use base_position_size as max, apply multiplier)
+        base_size = self.config.trading.base_position_size
+        size_usd = base_size * simple_sig.size_multiplier
+        size_usd = min(size_usd, 100.0)  # Cap at $100
+
+        # Prices
+        if side == Side.UP:
+            recommended_price = market.best_ask
+            market_prob = market.best_ask
+        else:
+            recommended_price = 1 - market.best_bid
+            market_prob = 1 - market.best_bid
+
+        # Calculate shares
+        size_shares = size_usd / recommended_price if recommended_price > 0 else 0
+
+        return Signal(
+            market=market,
+            side=side,
+            edge=simple_sig.edge,
+            true_prob=simple_sig.win_probability,
+            market_prob=market_prob,
+            recommended_action=OrderAction.OPEN_LIMIT,
+            recommended_price=recommended_price,
+            size_usd=size_usd,
+            size_shares=size_shares,
+            chainlink_price=current_price,
+            time_remaining=time_remaining,
+            reasoning=f"[SIMPLE {simple_sig.conviction.value.upper()}] {simple_sig.reason}",
+        )
+
     def _generate_aggressive_signal(
         self,
         market: MarketState,
@@ -1721,21 +1841,21 @@ class SignalGenerator:
         # POSITION SIZING WITH RISK MANAGEMENT
         # =================================================================
         # Even in aggressive mode, respect these limits:
-        # 1. Max 5% of bankroll per trade (max_position_pct)
+        # 1. Base position size (default $25)
         # 2. Size multiplier from conviction (0.3 to 0.8)
-        # 3. Never exceed max_position_usd
+        # 3. Never exceed $100 per trade
         #
-        # Example with $1000 bankroll, 5% max:
-        # - HIGH conviction (0.8): 0.8 * $50 = $40 per trade
-        # - MEDIUM conviction (0.5): 0.5 * $50 = $25 per trade
-        # - LOW conviction (0.3): 0.3 * $50 = $15 per trade
+        # Example with $25 base:
+        # - HIGH conviction (0.8): 0.8 * $25 = $20 per trade
+        # - MEDIUM conviction (0.5): 0.5 * $25 = $12.50 per trade
+        # - LOW conviction (0.3): 0.3 * $25 = $7.50 per trade
         # =================================================================
 
-        # Get max position from config (should be ~5% of bankroll)
-        max_position = self.config.trading.max_position_usd
+        # Get base position from config
+        base_position = self.config.trading.base_position_size
 
         # Apply conviction multiplier
-        size_usd = max_position * agg_signal.size_multiplier
+        size_usd = base_position * agg_signal.size_multiplier
 
         # Extra safety: cap at absolute maximum
         ABSOLUTE_MAX_PER_TRADE = 100.0  # Never more than $100 per trade
