@@ -1747,9 +1747,9 @@ class SignalGenerator:
         # Convert to Signal object
         side = Side.UP if simple_sig.direction == "UP" else Side.DOWN
 
-        # Position sizing
-        max_position = self.config.trading.max_position_usd
-        size_usd = max_position * simple_sig.size_multiplier
+        # Position sizing (use base_position_size as max, apply multiplier)
+        base_size = self.config.trading.base_position_size
+        size_usd = base_size * simple_sig.size_multiplier
         size_usd = min(size_usd, 100.0)  # Cap at $100
 
         # Prices
@@ -1841,21 +1841,21 @@ class SignalGenerator:
         # POSITION SIZING WITH RISK MANAGEMENT
         # =================================================================
         # Even in aggressive mode, respect these limits:
-        # 1. Max 5% of bankroll per trade (max_position_pct)
+        # 1. Base position size (default $25)
         # 2. Size multiplier from conviction (0.3 to 0.8)
-        # 3. Never exceed max_position_usd
+        # 3. Never exceed $100 per trade
         #
-        # Example with $1000 bankroll, 5% max:
-        # - HIGH conviction (0.8): 0.8 * $50 = $40 per trade
-        # - MEDIUM conviction (0.5): 0.5 * $50 = $25 per trade
-        # - LOW conviction (0.3): 0.3 * $50 = $15 per trade
+        # Example with $25 base:
+        # - HIGH conviction (0.8): 0.8 * $25 = $20 per trade
+        # - MEDIUM conviction (0.5): 0.5 * $25 = $12.50 per trade
+        # - LOW conviction (0.3): 0.3 * $25 = $7.50 per trade
         # =================================================================
 
-        # Get max position from config (should be ~5% of bankroll)
-        max_position = self.config.trading.max_position_usd
+        # Get base position from config
+        base_position = self.config.trading.base_position_size
 
         # Apply conviction multiplier
-        size_usd = max_position * agg_signal.size_multiplier
+        size_usd = base_position * agg_signal.size_multiplier
 
         # Extra safety: cap at absolute maximum
         ABSOLUTE_MAX_PER_TRADE = 100.0  # Never more than $100 per trade

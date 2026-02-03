@@ -1,6 +1,6 @@
 # Polymarket 15-Minute Crypto Arbitrage Bot
 
-An autonomous trading bot for Polymarket's 15-minute cryptocurrency prediction markets. Exploits temporal arbitrage between real-time Chainlink oracle prices and lagging market odds, enhanced with an 82-feature ML system.
+An autonomous trading bot for Polymarket's 15-minute cryptocurrency prediction markets. Uses a simple distance-from-target + trend strategy to predict where markets will close.
 
 ## Quick Start
 
@@ -16,42 +16,35 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your wallet credentials
 
-# 3. Train ML model (optional but recommended)
-python -m src.tools.enrich_historical_trades  # Fetch historical data
-python -m src.tools.train_from_enriched       # Train model
-
-# 4. Run
+# 3. Run
 python -m src.main --dry-run  # Test first
 python -m src.main            # Live trading
 ```
 
 ## Strategy Overview
 
-### The Edge
+### Simple Signal Strategy (RECOMMENDED)
 
-15-minute crypto markets on Polymarket settle based on **Chainlink oracle prices** at expiry:
+The bot uses a **distance-from-target + trend** strategy for maximum profitability:
 
-1. **Chainlink prices move** in real-time with the spot market
-2. **Polymarket odds lag** because market participants are slow to update
-3. **Exploit the gap** between true probability and stale odds
+**Decision Hierarchy:**
+1. **DISTANCE** (Primary) - If price is far from target (>0.3%), it rarely crosses
+2. **TREND** (Secondary) - If price is near target, follow the trend direction
+3. **MOMENTUM** (Confirmation) - Short-term velocity confirms or warns
+
+| Scenario | Signal | Win Rate |
+|----------|--------|----------|
+| Price >0.3% above target | UP | 85%+ |
+| Price >0.3% below target | DOWN | 85%+ |
+| Near target + Strong downtrend | DOWN | 75-80% |
+| Near target + Strong uptrend | UP | 75-80% |
+| Near target + Moderate trend | Follow trend | 65-70% |
+| At target + Ranging | Use distance | 52-58% |
 
 ### Settlement Rules
 
 - **UP wins**: End price >= Start price (per Chainlink)
 - **DOWN wins**: End price < Start price (per Chainlink)
-
-### Arbitrage Strategies
-
-Research on top Polymarket traders revealed key patterns:
-- Bots earning **$5-10k daily** on 15-minute crypto markets
-- **98% win rate** achieved by exploiting price lag
-
-| Strategy | How It Works |
-|----------|--------------|
-| **Binary Mispricing** | Buy both YES+NO when total < $1.00 for guaranteed profit |
-| **Asymmetric Pricing** | Buy whichever side is temporarily too cheap |
-| **Dump Detection** | Enter when price drops 15%+ in 3 seconds |
-| **Hedge Execution** | Lock in profit when leg1 + opposite <= 0.95 |
 
 ## Architecture
 
@@ -178,13 +171,13 @@ The enrichment process adds:
 - Technical indicators (RSI, MACD, BB, etc.)
 - Market conditions and trends
 
-### ML Settings
+### ML Settings (Optional)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ML_ENABLED` | true | Enable ML signal filtering |
-| `ML_MIN_CONFIDENCE` | 0.55 | Min predicted win probability |
-| `ML_MIN_SAMPLES` | 10 | Training samples before ML activates |
+| `ML_ENABLED` | false | ML filtering (not needed with SIMPLE_MODE) |
+| `ML_MIN_CONFIDENCE` | 0.52 | Min predicted win probability |
+| `ML_MIN_SAMPLES` | 50 | Training samples before ML activates |
 
 ## Installation
 
@@ -224,28 +217,34 @@ cp .env.example .env
 - **EOA Wallet**: Standard Ethereum wallet. Leave `FUNDER` empty.
 - **Proxy Wallet**: Polymarket browser wallet. Set `FUNDER` to your deposit address.
 
-### Trading Modes
+### Signal Modes
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TRADING_MODE` | `normal` | Mode: `conservative`, `normal`, or `aggressive` |
+| `SIMPLE_MODE` | `true` | **RECOMMENDED** - Use distance+trend strategy |
+| `AGGRESSIVE_MODE` | `false` | Trade every market, always pick a side |
+| `TRADING_MODE` | `normal` | Risk profile: `conservative`, `normal`, `aggressive` |
 
-| Setting | Conservative | Normal | Aggressive |
-|---------|-------------|--------|------------|
-| `MIN_EDGE` | 0.08 | 0.03 | 0.02 |
-| `BASE_POSITION_SIZE` | 15 | 25 | 50 |
-| `MAX_POSITION_PCT` | 0.08 | 0.15 | 0.25 |
-| `MAX_CONCURRENT_POSITIONS` | 4 | 8 | 12 |
+### Simple Mode (Default)
+
+Best for consistent returns. Uses distance from target + trend to predict settlement.
+
+| Setting | Value | Description |
+|---------|-------|-------------|
+| `MIN_EDGE` | 0.00 | Trade all signals (reliable with simple mode) |
+| `MAX_CONCURRENT_POSITIONS` | 4 | One per asset (BTC, ETH, SOL, XRP) |
+| `ORDER_COOLDOWN_SECONDS` | 10 | Fast reaction to market changes |
 
 ### Core Trading Parameters
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MIN_EDGE` | 0.03 | Minimum edge to trade (3%) |
-| `MIN_TIME_REMAINING` | 60 | Min seconds before expiry |
-| `BASE_POSITION_SIZE` | 10 | Base position size in USD |
+| `MIN_EDGE` | 0.00 | Minimum edge to trade (0% with simple mode) |
+| `MIN_TIME_REMAINING` | 30 | Min seconds before expiry |
+| `BASE_POSITION_SIZE` | 25 | Base position size in USD |
 | `MAX_POSITION_PCT` | 0.10 | Max position as % of bankroll |
-| `MAX_CONCURRENT_POSITIONS` | 8 | Max open positions |
+| `MAX_CONCURRENT_POSITIONS` | 4 | Max open positions (one per asset) |
+| `ORDER_COOLDOWN_SECONDS` | 10 | Cooldown between trades for same asset |
 | `DAILY_LOSS_LIMIT` | 0.25 | Daily loss limit (25%) |
 
 ### Edge and Order Types
@@ -389,10 +388,11 @@ polymarket-bot/
     │   └── orders.py           # Order execution
     │
     ├── strategy/
-    │   ├── signals.py          # Signal generation
+    │   ├── simple_signals.py   # SIMPLE signal strategy (recommended)
+    │   ├── signals.py          # Signal generation coordinator
     │   ├── risk.py             # Risk management
     │   ├── arbitrage.py        # Arbitrage detection
-    │   ├── ml_predictor.py     # ML prediction engine
+    │   ├── ml_predictor.py     # ML prediction engine (optional)
     │   └── trade_history.py    # Performance tracking
     │
     ├── tools/
@@ -414,13 +414,12 @@ polymarket-bot/
 
 ## Key Principles
 
-1. **Chainlink is truth** - Settlement uses Chainlink, trade based on Chainlink
-2. **Don't predict** - Exploit mispricing, not direction
-3. **Speed wins** - Sub-second reaction to price movements
-4. **Maker first** - Earn rebates when possible
-5. **Kelly sizing** - Optimal position sizing from ML confidence
+1. **Distance is king** - Price far from target rarely crosses
+2. **Trend follows** - When price is near target, follow the trend
+3. **Chainlink is truth** - Settlement uses Chainlink oracle prices
+4. **Keep it simple** - Distance + trend beats complex indicators
+5. **Manage risk** - Position sizing based on conviction
 6. **Survive to trade** - Risk management prevents ruin
-7. **Learn from data** - ML improves with every outcome
 
 ## Technical Analysis Features
 
