@@ -1878,7 +1878,7 @@ class SignalGenerator:
             size_shares = 0
 
         # Determine action - always use LIMIT orders for safety
-        action = OrderAction.OPEN_LIMIT  # Safer than market orders
+        action = OrderAction.LIMIT  # Safer than market orders
 
         return Signal(
             market=market,
