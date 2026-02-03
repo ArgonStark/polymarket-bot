@@ -82,6 +82,19 @@ try:
 except ImportError:
     UNIFIED_SIGNALS_AVAILABLE = False
 
+# Import aggressive signal framework
+try:
+    from .aggressive_signals import (
+        generate_aggressive_signal,
+        AggressiveSignal,
+        Conviction,
+        should_skip_market,
+        log_aggressive_signal,
+    )
+    AGGRESSIVE_SIGNALS_AVAILABLE = True
+except ImportError:
+    AGGRESSIVE_SIGNALS_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -477,9 +490,9 @@ class SignalGenerator:
         """
         Generate a trading signal for a market.
 
-        ENHANCED: Now uses two-stage approach:
-        1. Check for arbitrage opportunities (pattern-based)
-        2. Fall back to probability-based edge calculation
+        MODES:
+        - AGGRESSIVE: Trade every market, always pick a side (set AGGRESSIVE_MODE=true)
+        - NORMAL: Use multi-stage analysis with arbitrage detection
 
         Args:
             market: Market state to analyze
@@ -493,6 +506,12 @@ class SignalGenerator:
             logger.debug(f"No price data for {market.asset}")
             return None
 
+        # =====================================================================
+        # AGGRESSIVE MODE: Simple, always-trade strategy
+        # =====================================================================
+        if getattr(self.config.trading, 'aggressive_mode', False) and AGGRESSIVE_SIGNALS_AVAILABLE:
+            return self._generate_aggressive_signal(market, current_price)
+
         # Check time remaining
         time_remaining = market.time_remaining
         if time_remaining < self.config.trading.min_time_remaining:
@@ -503,11 +522,17 @@ class SignalGenerator:
 
         # === SPREAD CHECK ===
         # Wide spreads eat into edge - skip if spread is too wide
+        # Use PERCENTAGE spread relative to mid-price, not fixed dollar amount
         spread = market.best_ask - market.best_bid
-        MAX_SPREAD = 0.10  # 10 cents max spread
-        if spread > MAX_SPREAD:
+        mid_price = (market.best_ask + market.best_bid) / 2
+        spread_pct = spread / mid_price if mid_price > 0 else 1.0
+
+        MAX_SPREAD_PCT = 0.15  # 15% max spread (e.g., 0.075 spread on 0.50 token)
+        MAX_SPREAD_ABS = 0.12  # Also cap absolute spread at 12 cents
+
+        if spread_pct > MAX_SPREAD_PCT or spread > MAX_SPREAD_ABS:
             logger.info(
-                f"⚠️ WIDE SPREAD [{market.asset}]: {spread:.2f} > {MAX_SPREAD:.2f} - skipping"
+                f"⚠️ WIDE SPREAD [{market.asset}]: {spread:.2f} ({spread_pct:.0%}) - skipping"
             )
             return Signal(
                 market=market,
@@ -521,7 +546,7 @@ class SignalGenerator:
                 size_shares=0.0,
                 chainlink_price=current_price,
                 time_remaining=time_remaining,
-                reasoning=f"[WIDE SPREAD] Spread {spread:.2f} > max {MAX_SPREAD:.2f}",
+                reasoning=f"[WIDE SPREAD] Spread {spread:.2f} ({spread_pct:.0%}) too wide",
             )
 
         # STAGE 1: Check for arbitrage opportunities (pattern-based)
@@ -748,47 +773,27 @@ class SignalGenerator:
                     chart_analysis.trend_15m * 0.25
                 )
 
-            # Check for SHORT-TERM BOUNCE in a downtrend
-            # This is when 1h/4h are bearish but 1m/5m show a bounce
-            is_short_term_bounce = (
-                short_term_trend > 0.3 and  # Short-term bullish
-                trend_1h < -0.2  # But 1h is bearish (we're in a downtrend)
-            )
-
-            # Check for SHORT-TERM PULLBACK in an uptrend
-            # This is when 1h/4h are bullish but 1m/5m show a pullback
-            is_short_term_pullback = (
-                short_term_trend < -0.3 and  # Short-term bearish
-                trend_1h > 0.2  # But 1h is bullish (we're in an uptrend)
-            )
+            # =================================================================
+            # REMOVED: Counter-trend bounce/pullback logic
+            # =================================================================
+            # Counter-trend trades (bounce in downtrend, pullback in uptrend)
+            # tend to LOSE money on 15-minute Polymarket markets.
+            # The main trend usually wins. Don't fight it.
+            #
+            # OLD CODE REMOVED:
+            # - is_short_term_bounce (trading UP in a downtrend)
+            # - is_short_term_pullback (trading DOWN in an uptrend)
+            # =================================================================
 
             # === PATTERN-BASED SIGNALS ===
-            # Bullish/bearish patterns can also signal counter-trend opportunities
-            pattern_says_up = is_bullish_pattern
-            pattern_says_down = is_bearish_pattern
+            # Only use patterns that ALIGN with trend, not against it
+            pattern_says_up = is_bullish_pattern and trend_1h >= -0.1  # Only if not in strong downtrend
+            pattern_says_down = is_bearish_pattern and trend_1h <= 0.1  # Only if not in strong uptrend
 
             # === DETERMINE CHART SIGNAL ===
 
-            # SHORT-TERM BOUNCE: Trade UP even in downtrend
-            if is_short_term_bounce:
-                chart_says_up = True
-                chart_signal_strength = min(1.0, abs(short_term_trend) * 1.5)
-                logger.info(
-                    f"📈 SHORT-TERM BOUNCE [{market.asset}]: "
-                    f"1m/5m bullish ({short_term_trend:+.2f}) in 1h downtrend ({trend_1h:+.2f}) → UP signal"
-                )
-
-            # SHORT-TERM PULLBACK: Trade DOWN even in uptrend
-            elif is_short_term_pullback:
-                chart_says_down = True
-                chart_signal_strength = min(1.0, abs(short_term_trend) * 1.5)
-                logger.info(
-                    f"📉 SHORT-TERM PULLBACK [{market.asset}]: "
-                    f"1m/5m bearish ({short_term_trend:+.2f}) in 1h uptrend ({trend_1h:+.2f}) → DOWN signal"
-                )
-
-            # PATTERN-BASED SIGNAL (can override trend)
-            elif pattern_says_up and short_term_trend > 0:
+            # PATTERN-BASED SIGNAL (only if aligned with trend)
+            if pattern_says_up and short_term_trend > 0:
                 chart_says_up = True
                 chart_signal_strength = 0.7
                 logger.info(
@@ -1308,13 +1313,28 @@ class SignalGenerator:
 
         # === CLAMP EDGES TO MINIMUM 0 ===
         # Negative edges mean the trade is expected to lose money
-        # Never trade with negative edge - this prevents over-penalization
+        # =================================================================
+        # EDGE CLAMPING - Keep edges realistic
+        # =================================================================
+        # No trade has 40% edge. If calculations show that, something is wrong.
+        # Cap at 12% - this represents a strong but realistic edge.
+        MAX_REALISTIC_EDGE = 0.12  # 12% max edge
+
+        # Clamp minimum (no negative edges)
         if edge_up < 0:
             logger.debug(f"EDGE CLAMP [{market.asset}]: UP edge {edge_up:.1%} clamped to 0%")
             edge_up = 0.0
         if edge_down < 0:
             logger.debug(f"EDGE CLAMP [{market.asset}]: DOWN edge {edge_down:.1%} clamped to 0%")
             edge_down = 0.0
+
+        # Clamp maximum (no unrealistic edges)
+        if edge_up > MAX_REALISTIC_EDGE:
+            logger.debug(f"EDGE CLAMP [{market.asset}]: UP edge {edge_up:.1%} capped at {MAX_REALISTIC_EDGE:.1%}")
+            edge_up = MAX_REALISTIC_EDGE
+        if edge_down > MAX_REALISTIC_EDGE:
+            logger.debug(f"EDGE CLAMP [{market.asset}]: DOWN edge {edge_down:.1%} capped at {MAX_REALISTIC_EDGE:.1%}")
+            edge_down = MAX_REALISTIC_EDGE
 
         if edge_up > edge_down and edge_up >= min_edge:
             side = Side.UP
@@ -1637,6 +1657,123 @@ class SignalGenerator:
                 base_reasoning += binance_info
 
         return base_reasoning
+
+    def _generate_aggressive_signal(
+        self,
+        market: MarketState,
+        current_price: float,
+    ) -> Optional[Signal]:
+        """
+        Generate signal using aggressive always-trade strategy.
+
+        Philosophy: Trade EVERY market. Pick a side based on:
+        1. Price position relative to target
+        2. Momentum (Binance trend)
+        3. Time remaining
+
+        Returns:
+            Signal object (ALWAYS returns a signal in aggressive mode)
+        """
+        time_remaining = market.time_remaining
+
+        # Check if we should skip (only skip in extreme cases)
+        spread = market.best_ask - market.best_bid
+        should_skip, skip_reason = should_skip_market(time_remaining, spread)
+        if should_skip:
+            logger.debug(f"AGGRESSIVE [{market.asset}]: Skipping - {skip_reason}")
+            return None
+
+        # Get momentum from Binance
+        binance_trend = 0.0
+        if self.binance_feed:
+            try:
+                # Get recent price movement
+                velocity = self.binance_feed.get_velocity(market.asset)
+                if velocity:
+                    # Convert velocity to trend score (-1 to +1)
+                    # Velocity of 0.0001 (0.01%/s) = moderate trend
+                    binance_trend = max(-1.0, min(1.0, velocity * 5000))
+            except Exception:
+                pass
+
+        # Get volatility
+        volatility = self.get_volatility(market.asset)
+
+        # Generate aggressive signal
+        agg_signal = generate_aggressive_signal(
+            asset=market.asset,
+            current_price=current_price,
+            target_price=market.target_price,
+            time_remaining=time_remaining,
+            binance_trend=binance_trend,
+            volatility=volatility,
+            market_odds_up=market.best_ask,
+            market_odds_down=1 - market.best_bid,
+        )
+
+        # Log the signal
+        log_aggressive_signal(market.asset, agg_signal)
+
+        # Convert to Signal object
+        side = Side.UP if agg_signal.direction == "UP" else Side.DOWN
+
+        # =================================================================
+        # POSITION SIZING WITH RISK MANAGEMENT
+        # =================================================================
+        # Even in aggressive mode, respect these limits:
+        # 1. Max 5% of bankroll per trade (max_position_pct)
+        # 2. Size multiplier from conviction (0.3 to 0.8)
+        # 3. Never exceed max_position_usd
+        #
+        # Example with $1000 bankroll, 5% max:
+        # - HIGH conviction (0.8): 0.8 * $50 = $40 per trade
+        # - MEDIUM conviction (0.5): 0.5 * $50 = $25 per trade
+        # - LOW conviction (0.3): 0.3 * $50 = $15 per trade
+        # =================================================================
+
+        # Get max position from config (should be ~5% of bankroll)
+        max_position = self.config.trading.max_position_usd
+
+        # Apply conviction multiplier
+        size_usd = max_position * agg_signal.size_multiplier
+
+        # Extra safety: cap at absolute maximum
+        ABSOLUTE_MAX_PER_TRADE = 100.0  # Never more than $100 per trade
+        size_usd = min(size_usd, ABSOLUTE_MAX_PER_TRADE)
+
+        # Recommended price
+        if side == Side.UP:
+            recommended_price = market.best_ask
+            market_prob = market.best_ask
+            true_prob = min(0.95, market_prob + agg_signal.edge)  # Cap true_prob
+        else:
+            recommended_price = 1 - market.best_bid
+            market_prob = 1 - market.best_bid
+            true_prob = min(0.95, market_prob + agg_signal.edge)  # Cap true_prob
+
+        # Calculate shares
+        if recommended_price > 0:
+            size_shares = size_usd / recommended_price
+        else:
+            size_shares = 0
+
+        # Determine action - always use LIMIT orders for safety
+        action = OrderAction.OPEN_LIMIT  # Safer than market orders
+
+        return Signal(
+            market=market,
+            side=side,
+            edge=agg_signal.edge,
+            true_prob=true_prob,
+            market_prob=market_prob,
+            recommended_action=action,
+            recommended_price=recommended_price,
+            size_usd=size_usd,
+            size_shares=size_shares,
+            chainlink_price=current_price,
+            time_remaining=time_remaining,
+            reasoning=f"[AGGRESSIVE {agg_signal.conviction.value.upper()}] {agg_signal.reason}",
+        )
 
     def _check_arbitrage_opportunities(
         self,

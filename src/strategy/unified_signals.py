@@ -652,21 +652,22 @@ class UnifiedSignalGenerator:
     ) -> float:
         """Calculate position size multiplier."""
 
-        # Base multiplier from strength (more aggressive - allow trading even without strong signals)
+        # Base multiplier from strength
+        # NONE = no signal = NO TRADE (0.0)
         base_mult = {
             SignalStrength.STRONG: 1.0,
-            SignalStrength.MODERATE: 0.8,
-            SignalStrength.WEAK: 0.5,
-            SignalStrength.NONE: 0.3,  # Was 0.0 - now allows small positions
+            SignalStrength.MODERATE: 0.7,
+            SignalStrength.WEAK: 0.4,
+            SignalStrength.NONE: 0.0,  # NO signal = NO trade
         }[strength]
 
-        # Context adjustment (less harsh penalties)
+        # Context adjustment
         context_mult = {
             MarketContext.STRONG_TREND: 1.0,
-            MarketContext.WEAK_TREND: 0.9,
-            MarketContext.RANGING: 0.8,  # Was 0.7
-            MarketContext.VOLATILE: 0.6,  # Was 0.5
-            MarketContext.UNCERTAIN: 0.5,  # Was 0.3
+            MarketContext.WEAK_TREND: 0.85,
+            MarketContext.RANGING: 0.7,
+            MarketContext.VOLATILE: 0.5,
+            MarketContext.UNCERTAIN: 0.3,
         }[context]
 
         # Confirmation adjustment

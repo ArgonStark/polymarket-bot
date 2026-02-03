@@ -60,6 +60,13 @@ class TradingConfig:
         default_factory=lambda: os.getenv("TRADING_MODE", "normal")
     )
 
+    # AGGRESSIVE MODE: Trade every market, always pick a side
+    # Set AGGRESSIVE_MODE=true to enable
+    # This overrides normal signal generation with simple momentum-based decisions
+    aggressive_mode: bool = field(
+        default_factory=lambda: os.getenv("AGGRESSIVE_MODE", "false").lower() == "true"
+    )
+
     # Minimum edge required to enter a trade (as decimal, e.g., 0.05 = 5%)
     # Realistic values: 3-8% is typical for arbitrage opportunities
     min_edge: float = field(
