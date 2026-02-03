@@ -4250,12 +4250,13 @@ class TradingBot:
         logger.info(f"{Colors.BRIGHT_CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
 
         # === MINIMUM ORDER SIZE CHECK ===
-        # Polymarket requires minimum 5 shares per order
-        MIN_SHARES = 5.0
+        # LIMIT orders have very low minimum (~1 share)
+        # Only skip if truly tiny (risk management already handles sizing)
+        MIN_SHARES = 1.0
         if signal.size_shares < MIN_SHARES:
             logger.warning(
                 f"[{asset}] ❌ ORDER TOO SMALL: {signal.size_shares:.2f} shares < {MIN_SHARES} minimum | "
-                f"Skipping trade (graduated sizing reduced position too much)"
+                f"Skipping trade"
             )
             return
 
