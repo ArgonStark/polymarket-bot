@@ -224,9 +224,11 @@ class RiskManager:
         # This ensures we NEVER scale UP, only DOWN
         position_size = min(original_size, risk_limit)
 
-        # Ensure minimum viable trade size ($3)
-        if position_size < 3.0:
-            logger.debug(f"[{signal.market.asset}] Size ${position_size:.2f} below $3 min, skipping")
+        # Ensure minimum viable trade size ($1)
+        # Polymarket minimum is ~5 shares, at $0.50 that's $2.50
+        # We use $1 to allow small bankroll users to participate
+        if position_size < 1.0:
+            logger.debug(f"[{signal.market.asset}] Size ${position_size:.2f} below $1 min, skipping")
             signal.size_usd = 0
             signal.size_shares = 0
             return signal
