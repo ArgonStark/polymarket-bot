@@ -3915,7 +3915,7 @@ class TradingBot:
         Returns:
             Position object or None
         """
-        # Check internal tracking first
+        # Check internal tracking
         for pos in self.risk_manager.positions.values():
             if pos.market.asset == asset:
                 return pos
@@ -4118,7 +4118,21 @@ class TradingBot:
                 )
             return
 
-        # Check for existing positions from API (prevents duplicate trades)
+        # CRITICAL: Check API positions FIRST (prevents duplicate trades after restart)
+        if hasattr(self, '_api_positions') and asset in self._api_positions:
+            api_pos = self._api_positions[asset]
+            api_shares = api_pos.get('shares', 0) if isinstance(api_pos, dict) else getattr(api_pos, 'shares', 0)
+            if api_shares > 0:
+                position_key = f"{asset}:api_position"
+                if position_key not in self._logged_rejections:
+                    self._logged_rejections.add(position_key)
+                    logger.warning(
+                        f"[{asset}] ⛔ BLOCKING ORDER: Found {api_shares:.2f} shares in API! "
+                        f"Position not in internal tracking - possible restart. Skipping to prevent duplicate."
+                    )
+                return
+
+        # Check for existing positions from internal tracking
         existing_position = self._get_active_position(asset)
         if existing_position:
             # Check if we should average down instead of skipping
