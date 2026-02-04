@@ -1750,7 +1750,7 @@ class SignalGenerator:
         # Position sizing (use base_position_size as max, apply multiplier)
         base_size = self.config.trading.base_position_size
         size_usd = base_size * simple_sig.size_multiplier
-        size_usd = min(size_usd, 100.0)  # Cap at $100
+        size_usd = min(size_usd, 15.0)  # Cap at $15 per trade (conservative)
 
         # Prices
         if side == Side.UP:
