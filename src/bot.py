@@ -3383,7 +3383,10 @@ class TradingBot:
                         chart_signal_strength = min(1.0, chart_signal_strength + 0.2)
 
                     # Block trades that go AGAINST strong chart signals
-                    if chart_signal_strength >= 0.7:  # Strong chart signal
+                    # EXCEPTION: Allow REVERSAL trades (these intentionally go against the trend!)
+                    is_reversal_trade = "REVERSAL" in signal.reasoning.upper()
+
+                    if chart_signal_strength >= 0.7 and not is_reversal_trade:
                         if chart_says_down and signal.side == Side.UP:
                             logger.info(
                                 f"[{market.asset}] ❌ CHART BLOCK: Taking UP against strong BEARISH chart "
@@ -3396,6 +3399,10 @@ class TradingBot:
                                 f"({market_type}, {chart_bias} {chart_confidence:.0%}, trend={avg_trend:.2f})"
                             )
                             return
+                    elif is_reversal_trade:
+                        logger.info(
+                            f"[{market.asset}] ✓ Chart filter BYPASSED (reversal trade)"
+                        )
 
                     logger.info(f"[{market.asset}] ✓ Chart filter passed")
 
