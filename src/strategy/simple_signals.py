@@ -103,23 +103,30 @@ def generate_simple_signal(
     trend_4h: float = 0.0,      # 4-hour trend
     market_odds_up: float = 0.50,
     market_odds_down: float = 0.50,
+    # NEW: Technical indicators for reversal detection
+    rsi: float = 50.0,          # RSI(14) value
+    bb_position: float = 0.0,   # Bollinger Band position (-1 to +1)
+    rsi_divergence: str = "none",  # "bullish", "bearish", "none"
 ) -> SimpleSignal:
     """
     Generate signal using:
     1. Distance from target (PRIMARY)
-    2. Trend direction (SECONDARY)
-    3. Momentum (CONFIRMATION)
+    2. REVERSAL DETECTION (NEW - catches bounces!)
+    3. Short-term momentum (CONFIRMATION)
 
-    Logic:
+    NEW Logic with Reversal Detection:
     ┌────────────────────────────────────────────────────────────────────┐
-    │ Scenario                          │ Signal │ Conviction │ Win %   │
+    │ Scenario                              │ Signal │ Confidence        │
     ├────────────────────────────────────────────────────────────────────┤
-    │ Far above target (>0.3%)          │ UP     │ HIGH       │ 85%+    │
-    │ Far below target (>0.3%)          │ DOWN   │ HIGH       │ 85%+    │
-    │ Near target + Strong Downtrend    │ DOWN   │ HIGH       │ 75-80%  │
-    │ Near target + Strong Uptrend      │ UP     │ HIGH       │ 75-80%  │
-    │ Near target + Moderate Trend      │ Follow │ MEDIUM     │ 65-70%  │
-    │ Near target + Ranging             │ By pos │ LOW        │ 55-60%  │
+    │ Far above target (>0.3%)              │ UP     │ HIGH (85%+)       │
+    │ Far below target (>0.3%)              │ DOWN   │ HIGH (85%+)       │
+    │ Below target + RSI oversold (<30)     │ UP     │ REVERSAL (70%)    │
+    │ Above target + RSI overbought (>70)   │ DOWN   │ REVERSAL (70%)    │
+    │ Below target + Bullish divergence     │ UP     │ REVERSAL (75%)    │
+    │ Above target + Bearish divergence     │ DOWN   │ REVERSAL (75%)    │
+    │ Below target + No reversal            │ DOWN   │ MEDIUM (65%)      │
+    │ Above target + No reversal            │ UP     │ MEDIUM (65%)      │
+    │ At target                             │ By mom │ LOW (55%)         │
     └────────────────────────────────────────────────────────────────────┘
     """
 
@@ -136,16 +143,30 @@ def generate_simple_signal(
     is_final_5min = time_minutes < 5
     is_final_2min = time_minutes < 2
 
-    # Detect trend
-    trend, trend_strength = detect_trend(trend_15m, trend_1h, trend_4h)
-
-    # Momentum checks
+    # Momentum checks (short-term direction)
     momentum_up = momentum > 0.15
     momentum_down = momentum < -0.15
     momentum_strong = abs(momentum) > 0.35
 
+    # RSI checks for reversal
+    rsi_oversold = rsi < 30
+    rsi_overbought = rsi > 70
+    rsi_low = rsi < 40
+    rsi_high = rsi > 60
+
+    # Bollinger Band checks
+    bb_at_lower = bb_position < -0.7  # Near lower band
+    bb_at_upper = bb_position > 0.7   # Near upper band
+
+    # Divergence checks
+    bullish_divergence = rsi_divergence == "bullish"
+    bearish_divergence = rsi_divergence == "bearish"
+
+    # Detect overall trend (for logging/compatibility, not primary decision)
+    trend, trend_strength = detect_trend(trend_15m, trend_1h, trend_4h)
+
     # ==========================================================================
-    # STEP 2: Make decision
+    # STEP 2: Make decision (NEW LOGIC WITH REVERSAL)
     # ==========================================================================
     direction = None
     win_prob = 0.50
@@ -153,142 +174,146 @@ def generate_simple_signal(
     reason = ""
 
     # -------------------------------------------------------------------------
-    # CASE A: Price FAR from target (>0.3%) - Distance is PRIMARY
+    # CASE A: Price FAR from target (>0.3%) - High confidence in distance
     # -------------------------------------------------------------------------
     if distance_abs > 0.003:
         if is_above:
             direction = "UP"
-            win_prob = 0.78 + min(0.12, distance_abs * 15)
+            win_prob = 0.80 + min(0.10, distance_abs * 10)
             reason = f"{distance_abs:.2%} above target"
         else:
             direction = "DOWN"
-            win_prob = 0.78 + min(0.12, distance_abs * 15)
+            win_prob = 0.80 + min(0.10, distance_abs * 10)
             reason = f"{distance_abs:.2%} below target"
+
+        # Time bonus for final minutes
+        if is_final_5min:
+            win_prob += 0.03
+
+        conviction = Conviction.HIGH
+
+    # -------------------------------------------------------------------------
+    # CASE B: REVERSAL DETECTION - Price one side, indicators say opposite
+    # -------------------------------------------------------------------------
+    # B1: Below target but showing BULLISH reversal signals → bet UP!
+    elif is_below and (rsi_oversold or bullish_divergence or bb_at_lower):
+        direction = "UP"
+
+        if bullish_divergence:
+            win_prob = 0.72
+            reason = f"REVERSAL: Below target but bullish divergence"
+        elif rsi_oversold:
+            win_prob = 0.68
+            reason = f"REVERSAL: Below target but RSI oversold ({rsi:.0f})"
+        else:  # bb_at_lower
+            win_prob = 0.65
+            reason = f"REVERSAL: Below target but at lower BB"
+
+        # Boost if multiple reversal signals
+        if rsi_oversold and bb_at_lower:
+            win_prob += 0.05
+            reason += " + BB"
+        if bullish_divergence and rsi_oversold:
+            win_prob += 0.05
+            reason += " + RSI"
+
+        # Penalty if momentum is still strongly down
+        if momentum_down and momentum_strong:
+            win_prob -= 0.08
+            reason += " (momentum against)"
+
+        conviction = Conviction.MEDIUM if win_prob >= 0.65 else Conviction.LOW
+
+    # B2: Above target but showing BEARISH reversal signals → bet DOWN!
+    elif is_above and (rsi_overbought or bearish_divergence or bb_at_upper):
+        direction = "DOWN"
+
+        if bearish_divergence:
+            win_prob = 0.72
+            reason = f"REVERSAL: Above target but bearish divergence"
+        elif rsi_overbought:
+            win_prob = 0.68
+            reason = f"REVERSAL: Above target but RSI overbought ({rsi:.0f})"
+        else:  # bb_at_upper
+            win_prob = 0.65
+            reason = f"REVERSAL: Above target but at upper BB"
+
+        # Boost if multiple reversal signals
+        if rsi_overbought and bb_at_upper:
+            win_prob += 0.05
+            reason += " + BB"
+        if bearish_divergence and rsi_overbought:
+            win_prob += 0.05
+            reason += " + RSI"
+
+        # Penalty if momentum is still strongly up
+        if momentum_up and momentum_strong:
+            win_prob -= 0.08
+            reason += " (momentum against)"
+
+        conviction = Conviction.MEDIUM if win_prob >= 0.65 else Conviction.LOW
+
+    # -------------------------------------------------------------------------
+    # CASE C: Price moderately from target (0.1%-0.3%) - Trust position
+    # -------------------------------------------------------------------------
+    elif distance_abs > 0.001:
+        if is_above:
+            direction = "UP"
+            win_prob = 0.62 + min(0.10, distance_abs * 30)
+            reason = f"{distance_abs:.2%} above target"
+        else:
+            direction = "DOWN"
+            win_prob = 0.62 + min(0.10, distance_abs * 30)
+            reason = f"{distance_abs:.2%} below target"
+
+        # RSI confirmation/warning
+        if direction == "UP" and rsi_high:
+            reason += " + RSI confirms"
+            win_prob += 0.03
+        elif direction == "UP" and rsi_low:
+            reason += " (RSI warning)"
+            win_prob -= 0.05
+        elif direction == "DOWN" and rsi_low:
+            reason += " + RSI confirms"
+            win_prob += 0.03
+        elif direction == "DOWN" and rsi_high:
+            reason += " (RSI warning)"
+            win_prob -= 0.05
 
         # Time bonus
         if is_final_5min:
             win_prob += 0.03
 
-        # Momentum confirmation/warning
-        if (direction == "UP" and momentum_down and momentum_strong):
-            win_prob -= 0.05
-            reason += " (momentum against)"
-        elif (direction == "DOWN" and momentum_up and momentum_strong):
-            win_prob -= 0.05
-            reason += " (momentum against)"
-        elif (direction == "UP" and momentum_up):
-            win_prob += 0.02
-            reason += " + momentum"
-        elif (direction == "DOWN" and momentum_down):
-            win_prob += 0.02
-            reason += " + momentum"
-
-        conviction = Conviction.HIGH if win_prob >= 0.80 else Conviction.MEDIUM
+        conviction = Conviction.MEDIUM if win_prob >= 0.65 else Conviction.LOW
 
     # -------------------------------------------------------------------------
-    # CASE B: Price MODERATELY from target (0.15%-0.3%) - DISTANCE IS PRIMARY
-    # -------------------------------------------------------------------------
-    elif distance_abs > 0.0015:
-        # Start with distance-based direction - TRUST POSITION!
-        if is_above:
-            base_direction = "UP"
-            base_prob = 0.62 + min(0.08, distance_abs * 25)
-        else:
-            base_direction = "DOWN"
-            base_prob = 0.62 + min(0.08, distance_abs * 25)
-
-        # Trend can BOOST confidence if it agrees, but rarely override
-        if trend in [Trend.STRONG_DOWN, Trend.DOWN]:
-            if base_direction == "DOWN":
-                # Trend confirms distance - boost!
-                direction = "DOWN"
-                win_prob = base_prob + 0.08
-                reason = f"{distance_abs:.2%} below + downtrend"
-                conviction = Conviction.HIGH if win_prob >= 0.75 else Conviction.MEDIUM
-            else:
-                # Above target but downtrend - TRUST POSITION
-                # Only reduce confidence, don't flip direction
-                direction = "UP"
-                win_prob = base_prob - 0.03  # Small penalty
-                reason = f"{distance_abs:.2%} above (downtrend warning)"
-                conviction = Conviction.MEDIUM
-
-        elif trend in [Trend.STRONG_UP, Trend.UP]:
-            if base_direction == "UP":
-                # Trend confirms distance - boost!
-                direction = "UP"
-                win_prob = base_prob + 0.08
-                reason = f"{distance_abs:.2%} above + uptrend"
-                conviction = Conviction.HIGH if win_prob >= 0.75 else Conviction.MEDIUM
-            else:
-                # Below target but uptrend - TRUST POSITION
-                direction = "DOWN"
-                win_prob = base_prob - 0.03
-                reason = f"{distance_abs:.2%} below (uptrend warning)"
-                conviction = Conviction.MEDIUM
-
-        else:  # Ranging
-            direction = base_direction
-            win_prob = base_prob
-            reason = f"{distance_abs:.2%} {'above' if is_above else 'below'}, ranging"
-            conviction = Conviction.MEDIUM
-
-    # -------------------------------------------------------------------------
-    # CASE C: Price AT target (<0.15%) - Use MOMENTUM + SHORT-TERM trend
+    # CASE D: Price AT target (<0.1%) - Use momentum and RSI
     # -------------------------------------------------------------------------
     else:
-        # Detect bounce: 15m trend opposite to longer trends
-        is_bounce_up = trend_15m > 0.1 and (trend_1h < -0.05 or trend_4h < -0.05)
-        is_bounce_down = trend_15m < -0.1 and (trend_1h > 0.05 or trend_4h > 0.05)
+        # Priority 1: RSI extremes
+        if rsi_oversold:
+            direction = "UP"
+            win_prob = 0.60
+            reason = f"At target, RSI oversold ({rsi:.0f})"
+            conviction = Conviction.LOW
+        elif rsi_overbought:
+            direction = "DOWN"
+            win_prob = 0.60
+            reason = f"At target, RSI overbought ({rsi:.0f})"
+            conviction = Conviction.LOW
 
-        # Priority 1: Strong momentum (short-term signal)
-        if momentum_strong:
+        # Priority 2: Strong momentum
+        elif momentum_strong:
             direction = "UP" if momentum_up else "DOWN"
-            win_prob = 0.62 + abs(momentum) * 0.1
+            win_prob = 0.58
             reason = f"At target, strong momentum {'up' if momentum_up else 'down'}"
-            conviction = Conviction.MEDIUM
-
-        # Priority 2: Short-term bounce detection
-        elif is_bounce_up:
-            direction = "UP"
-            win_prob = 0.60
-            reason = f"At target, bounce UP (15m up, longer down)"
-            conviction = Conviction.MEDIUM
-        elif is_bounce_down:
-            direction = "DOWN"
-            win_prob = 0.60
-            reason = f"At target, bounce DOWN (15m down, longer up)"
-            conviction = Conviction.MEDIUM
-
-        # Priority 3: Follow trend if strong and aligned
-        elif trend == Trend.STRONG_DOWN:
-            direction = "DOWN"
-            win_prob = 0.68 + trend_strength * 0.05
-            reason = f"At target, strong downtrend"
-            conviction = Conviction.MEDIUM
-
-        elif trend == Trend.STRONG_UP:
-            direction = "UP"
-            win_prob = 0.68 + trend_strength * 0.05
-            reason = f"At target, strong uptrend"
-            conviction = Conviction.MEDIUM
-
-        elif trend == Trend.DOWN:
-            direction = "DOWN"
-            win_prob = 0.60 + trend_strength * 0.05
-            reason = f"At target, downtrend"
             conviction = Conviction.LOW
 
-        elif trend == Trend.UP:
-            direction = "UP"
-            win_prob = 0.60 + trend_strength * 0.05
-            reason = f"At target, uptrend"
-            conviction = Conviction.LOW
-
-        else:  # Ranging - use micro-distance
-            direction = "UP" if distance_pct > 0 else "DOWN"
+        # Priority 3: Slight position bias
+        else:
+            direction = "UP" if distance_pct >= 0 else "DOWN"
             win_prob = 0.52
-            reason = f"Ranging, slight {'up' if distance_pct > 0 else 'down'} bias"
+            reason = f"At target, slight {'up' if distance_pct >= 0 else 'down'} bias"
             conviction = Conviction.LOW
 
     # ==========================================================================
@@ -300,20 +325,20 @@ def generate_simple_signal(
         edge = win_prob - market_odds_down
 
     # Caps
-    win_prob = min(0.92, max(0.50, win_prob))
+    win_prob = min(0.90, max(0.50, win_prob))
     edge = min(0.15, max(-0.10, edge))
 
     # ==========================================================================
     # STEP 4: Position sizing (CONSERVATIVE)
     # ==========================================================================
     if win_prob >= 0.80:
-        size_mult = 0.50  # Was 0.80 - reduced
+        size_mult = 0.50
     elif win_prob >= 0.70:
-        size_mult = 0.40  # Was 0.60 - reduced
+        size_mult = 0.40
     elif win_prob >= 0.60:
-        size_mult = 0.30  # Was 0.40 - reduced
+        size_mult = 0.30
     else:
-        size_mult = 0.20  # Was 0.25 - reduced
+        size_mult = 0.20
 
     # Time adjustments
     if is_final_2min:
@@ -321,9 +346,9 @@ def generate_simple_signal(
 
     # Negative edge = reduce size significantly
     if edge < 0:
-        size_mult *= 0.4  # Was 0.5 - more aggressive reduction
+        size_mult *= 0.4
 
-    size_mult = max(0.15, min(0.50, size_mult))  # Cap at 50% instead of 80%
+    size_mult = max(0.15, min(0.50, size_mult))
 
     return SimpleSignal(
         direction=direction,

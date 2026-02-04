@@ -1713,21 +1713,43 @@ class SignalGenerator:
             except Exception:
                 pass
 
-        # Get trends from Binance chart data
+        # Get chart data from Binance (trends + technical indicators)
         trend_15m = 0.0
         trend_1h = 0.0
         trend_4h = 0.0
+        rsi = 50.0          # Default neutral
+        bb_position = 0.0   # Default middle
+        rsi_divergence = "none"
+
         try:
             if CHART_ANALYSIS_AVAILABLE:
                 chart_analysis = analyze_chart(market.asset)
                 if chart_analysis:
+                    # Trends
                     trend_15m = chart_analysis.trend_15m
                     trend_1h = chart_analysis.trend_1h
                     trend_4h = chart_analysis.trend_4h
-        except Exception:
-            pass
 
-        # Generate simple signal
+                    # Technical indicators for reversal detection
+                    rsi = chart_analysis.rsi_14
+
+                    # Calculate BB position from bands
+                    if chart_analysis.bb_upper > chart_analysis.bb_lower:
+                        bb_range = chart_analysis.bb_upper - chart_analysis.bb_lower
+                        bb_position = (current_price - chart_analysis.bb_middle) / (bb_range / 2)
+                        bb_position = max(-1.0, min(1.0, bb_position))
+
+                    # RSI divergence
+                    rsi_divergence = chart_analysis.rsi_divergence
+
+                    logger.debug(
+                        f"[{market.asset}] Chart: RSI={rsi:.0f}, BB={bb_position:.2f}, "
+                        f"Divergence={rsi_divergence}"
+                    )
+        except Exception as e:
+            logger.debug(f"[{market.asset}] Chart analysis failed: {e}")
+
+        # Generate simple signal with reversal detection
         simple_sig = generate_simple_signal(
             asset=market.asset,
             current_price=current_price,
@@ -1739,6 +1761,10 @@ class SignalGenerator:
             trend_4h=trend_4h,
             market_odds_up=market.best_ask,
             market_odds_down=1 - market.best_bid,
+            # NEW: Technical indicators for reversal detection
+            rsi=rsi,
+            bb_position=bb_position,
+            rsi_divergence=rsi_divergence,
         )
 
         # Log the signal
@@ -1764,11 +1790,13 @@ class SignalGenerator:
         size_shares = size_usd / recommended_price if recommended_price > 0 else 0
 
         # BUMP UP to minimum 5 shares for LIMIT orders (Polymarket requirement)
+        # Always bump if we have at least 1 share worth (prevents rejections)
         MIN_SHARES = 5.0
-        if size_shares < MIN_SHARES and size_shares >= 2.0:  # At least 2 shares to bump
+        if size_shares < MIN_SHARES and size_shares >= 1.0:
+            old_size = size_usd
             size_shares = MIN_SHARES
             size_usd = size_shares * recommended_price
-            logger.info(f"📏 [{market.asset}] Bumped to minimum {MIN_SHARES} shares (${size_usd:.2f})")
+            logger.info(f"📏 [{market.asset}] Bumped {old_size:.2f} → ${size_usd:.2f} (min {MIN_SHARES} shares)")
 
         return Signal(
             market=market,
