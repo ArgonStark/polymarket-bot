@@ -186,10 +186,10 @@ def generate_simple_signal(
         conviction = Conviction.HIGH if win_prob >= 0.80 else Conviction.MEDIUM
 
     # -------------------------------------------------------------------------
-    # CASE B: Price MODERATELY from target (0.15%-0.3%) - Consider trend
+    # CASE B: Price MODERATELY from target (0.15%-0.3%) - DISTANCE IS PRIMARY
     # -------------------------------------------------------------------------
     elif distance_abs > 0.0015:
-        # Start with distance-based direction
+        # Start with distance-based direction - TRUST POSITION!
         if is_above:
             base_direction = "UP"
             base_prob = 0.62 + min(0.08, distance_abs * 25)
@@ -197,47 +197,35 @@ def generate_simple_signal(
             base_direction = "DOWN"
             base_prob = 0.62 + min(0.08, distance_abs * 25)
 
-        # Check if trend overrides
+        # Trend can BOOST confidence if it agrees, but rarely override
         if trend in [Trend.STRONG_DOWN, Trend.DOWN]:
             if base_direction == "DOWN":
-                # Trend confirms distance
+                # Trend confirms distance - boost!
                 direction = "DOWN"
                 win_prob = base_prob + 0.08
                 reason = f"{distance_abs:.2%} below + downtrend"
                 conviction = Conviction.HIGH if win_prob >= 0.75 else Conviction.MEDIUM
             else:
-                # Conflict: above target but downtrend
-                # Trust distance if significant, else trust trend
-                if distance_abs > 0.002:
-                    direction = "UP"
-                    win_prob = base_prob - 0.05  # Reduced confidence
-                    reason = f"{distance_abs:.2%} above, downtrend warning"
-                    conviction = Conviction.MEDIUM
-                else:
-                    direction = "DOWN"
-                    win_prob = 0.65 + trend_strength * 0.10
-                    reason = f"Near target, following downtrend"
-                    conviction = Conviction.MEDIUM
+                # Above target but downtrend - TRUST POSITION
+                # Only reduce confidence, don't flip direction
+                direction = "UP"
+                win_prob = base_prob - 0.03  # Small penalty
+                reason = f"{distance_abs:.2%} above (downtrend warning)"
+                conviction = Conviction.MEDIUM
 
         elif trend in [Trend.STRONG_UP, Trend.UP]:
             if base_direction == "UP":
-                # Trend confirms distance
+                # Trend confirms distance - boost!
                 direction = "UP"
                 win_prob = base_prob + 0.08
                 reason = f"{distance_abs:.2%} above + uptrend"
                 conviction = Conviction.HIGH if win_prob >= 0.75 else Conviction.MEDIUM
             else:
-                # Conflict: below target but uptrend
-                if distance_abs > 0.002:
-                    direction = "DOWN"
-                    win_prob = base_prob - 0.05
-                    reason = f"{distance_abs:.2%} below, uptrend warning"
-                    conviction = Conviction.MEDIUM
-                else:
-                    direction = "UP"
-                    win_prob = 0.65 + trend_strength * 0.10
-                    reason = f"Near target, following uptrend"
-                    conviction = Conviction.MEDIUM
+                # Below target but uptrend - TRUST POSITION
+                direction = "DOWN"
+                win_prob = base_prob - 0.03
+                reason = f"{distance_abs:.2%} below (uptrend warning)"
+                conviction = Conviction.MEDIUM
 
         else:  # Ranging
             direction = base_direction
@@ -246,45 +234,62 @@ def generate_simple_signal(
             conviction = Conviction.MEDIUM
 
     # -------------------------------------------------------------------------
-    # CASE C: Price AT target (<0.15%) - TREND is PRIMARY
+    # CASE C: Price AT target (<0.15%) - Use MOMENTUM + SHORT-TERM trend
     # -------------------------------------------------------------------------
     else:
-        if trend == Trend.STRONG_DOWN:
-            direction = "DOWN"
-            win_prob = 0.72 + trend_strength * 0.08
-            reason = f"At target, strong downtrend"
-            conviction = Conviction.HIGH if win_prob >= 0.75 else Conviction.MEDIUM
+        # Detect bounce: 15m trend opposite to longer trends
+        is_bounce_up = trend_15m > 0.1 and (trend_1h < -0.05 or trend_4h < -0.05)
+        is_bounce_down = trend_15m < -0.1 and (trend_1h > 0.05 or trend_4h > 0.05)
 
-        elif trend == Trend.DOWN:
+        # Priority 1: Strong momentum (short-term signal)
+        if momentum_strong:
+            direction = "UP" if momentum_up else "DOWN"
+            win_prob = 0.62 + abs(momentum) * 0.1
+            reason = f"At target, strong momentum {'up' if momentum_up else 'down'}"
+            conviction = Conviction.MEDIUM
+
+        # Priority 2: Short-term bounce detection
+        elif is_bounce_up:
+            direction = "UP"
+            win_prob = 0.60
+            reason = f"At target, bounce UP (15m up, longer down)"
+            conviction = Conviction.MEDIUM
+        elif is_bounce_down:
             direction = "DOWN"
-            win_prob = 0.65 + trend_strength * 0.08
-            reason = f"At target, downtrend"
+            win_prob = 0.60
+            reason = f"At target, bounce DOWN (15m down, longer up)"
+            conviction = Conviction.MEDIUM
+
+        # Priority 3: Follow trend if strong and aligned
+        elif trend == Trend.STRONG_DOWN:
+            direction = "DOWN"
+            win_prob = 0.68 + trend_strength * 0.05
+            reason = f"At target, strong downtrend"
             conviction = Conviction.MEDIUM
 
         elif trend == Trend.STRONG_UP:
             direction = "UP"
-            win_prob = 0.72 + trend_strength * 0.08
+            win_prob = 0.68 + trend_strength * 0.05
             reason = f"At target, strong uptrend"
-            conviction = Conviction.HIGH if win_prob >= 0.75 else Conviction.MEDIUM
+            conviction = Conviction.MEDIUM
+
+        elif trend == Trend.DOWN:
+            direction = "DOWN"
+            win_prob = 0.60 + trend_strength * 0.05
+            reason = f"At target, downtrend"
+            conviction = Conviction.LOW
 
         elif trend == Trend.UP:
             direction = "UP"
-            win_prob = 0.65 + trend_strength * 0.08
+            win_prob = 0.60 + trend_strength * 0.05
             reason = f"At target, uptrend"
-            conviction = Conviction.MEDIUM
+            conviction = Conviction.LOW
 
-        else:  # Ranging - use momentum or micro-distance
-            if momentum_strong:
-                direction = "UP" if momentum_up else "DOWN"
-                win_prob = 0.58
-                reason = f"Ranging, strong momentum {'up' if momentum_up else 'down'}"
-                conviction = Conviction.MEDIUM if momentum_strong else Conviction.LOW
-            else:
-                # True coin flip
-                direction = "UP" if distance_pct > 0 else "DOWN"
-                win_prob = 0.52
-                reason = f"Ranging, slight {'up' if distance_pct > 0 else 'down'} bias"
-                conviction = Conviction.LOW
+        else:  # Ranging - use micro-distance
+            direction = "UP" if distance_pct > 0 else "DOWN"
+            win_prob = 0.52
+            reason = f"Ranging, slight {'up' if distance_pct > 0 else 'down'} bias"
+            conviction = Conviction.LOW
 
     # ==========================================================================
     # STEP 3: Calculate edge
@@ -299,26 +304,26 @@ def generate_simple_signal(
     edge = min(0.15, max(-0.10, edge))
 
     # ==========================================================================
-    # STEP 4: Position sizing
+    # STEP 4: Position sizing (CONSERVATIVE)
     # ==========================================================================
     if win_prob >= 0.80:
-        size_mult = 0.80
+        size_mult = 0.50  # Was 0.80 - reduced
     elif win_prob >= 0.70:
-        size_mult = 0.60
+        size_mult = 0.40  # Was 0.60 - reduced
     elif win_prob >= 0.60:
-        size_mult = 0.40
+        size_mult = 0.30  # Was 0.40 - reduced
     else:
-        size_mult = 0.25
+        size_mult = 0.20  # Was 0.25 - reduced
 
     # Time adjustments
     if is_final_2min:
         size_mult *= 0.7
 
-    # Negative edge = reduce size
+    # Negative edge = reduce size significantly
     if edge < 0:
-        size_mult *= 0.5
+        size_mult *= 0.4  # Was 0.5 - more aggressive reduction
 
-    size_mult = max(0.20, min(0.80, size_mult))
+    size_mult = max(0.15, min(0.50, size_mult))  # Cap at 50% instead of 80%
 
     return SimpleSignal(
         direction=direction,
