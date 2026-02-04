@@ -157,6 +157,10 @@ class TradingBot:
         self._last_rejection_clear: Optional[datetime] = None
         self._rejection_clear_interval = 30.0  # Clear rejections every 30s to re-log
 
+        # Status logging throttle - log status every 30 seconds instead of randomly
+        self._last_status_log: Optional[datetime] = None
+        self._status_log_interval = 30.0  # Log status every 30 seconds
+
         # Cooldown tracking - prevent duplicate orders per asset
         self._last_order_time: dict[str, datetime] = {}  # asset -> last order time
         self._order_cooldown_seconds = config.trading.order_cooldown_seconds  # Configurable (default 15s)
@@ -1150,10 +1154,11 @@ class TradingBot:
                 # Generate and execute signals for each active market
                 active_count = len(self.markets)
                 if active_count > 0:
-                    # Periodically log colorful status (roughly every 30s)
-                    import random
-                    if random.random() < 0.02:
+                    # Log status every 30 seconds (instead of randomly)
+                    if (self._last_status_log is None or
+                        (now - self._last_status_log).total_seconds() > self._status_log_interval):
                         self._log_status_line()
+                        self._last_status_log = now
 
                 # Sort markets by asset priority (BTC/ETH first for better liquidity)
                 priority = self.config.trading.asset_priority
@@ -3315,33 +3320,17 @@ class TradingBot:
             logger.debug(f"SKIP {market.asset}: {signal.reasoning}")
             return
 
-        # Log signal details for debugging (only for actionable signals)
-        arb_type = getattr(signal, '_arb_type', 'probability')
-        logger.info(
-            f"📡 SIGNAL [{market.asset}]: {signal.side.value} | "
-            f"Edge: {signal.edge:.1%} | Type: {arb_type} | "
-            f"Size: ${signal.size_usd:.2f} | Action: {signal.recommended_action.value}"
-        )
-
-        # Validate signal against risk limits
-        logger.info(f"[{market.asset}] ✓1 Risk validation")
+        # Validate signal against risk limits (no verbose logging - only log final decision)
         is_valid, reason = self.risk_manager.validate_signal(signal)
         if not is_valid:
-            # Always log the blocking reason (cleared every 30s to avoid spam)
+            # Only log blocking reason once per market (cleared every 30s)
             rejection_key = f"{market.condition_id}:{reason}"
             if rejection_key not in self._logged_rejections:
                 self._logged_rejections.add(rejection_key)
-                logger.info(
-                    f"[{market.asset}] ❌ BLOCKED: {reason} | "
-                    f"Bankroll: ${self.risk_manager.current_bankroll:.2f} | "
-                    f"Positions: {len(self.risk_manager.positions)}"
-                )
-            else:
-                logger.info(f"[{market.asset}] ⏸️ BLOCKED (repeat): {reason}")
+                logger.debug(f"[{market.asset}] BLOCKED: {reason}")
             return
 
         # Trade history filter - check past performance for this asset/side
-        logger.info(f"[{market.asset}] ✓2 History filter")
         trade_history = get_trade_history()
         should_proceed, history_reason = trade_history.evaluate_trade(
             asset=market.asset,
@@ -3355,9 +3344,7 @@ class TradingBot:
             rejection_key = f"{market.condition_id}:history:{signal.side.value}"
             if rejection_key not in self._logged_rejections:
                 self._logged_rejections.add(rejection_key)
-                logger.info(f"[{market.asset}] ❌ HISTORY BLOCK: {history_reason}")
-            else:
-                logger.info(f"[{market.asset}] ⏸️ HISTORY (repeat): {history_reason}")
+                logger.debug(f"[{market.asset}] HISTORY BLOCK: {history_reason}")
             return
 
         # === CHART-BASED FILTER ===
@@ -3388,29 +3375,16 @@ class TradingBot:
 
                     if chart_signal_strength >= 0.7 and not is_reversal_trade:
                         if chart_says_down and signal.side == Side.UP:
-                            logger.info(
-                                f"[{market.asset}] ❌ CHART BLOCK: Taking UP against strong BEARISH chart "
-                                f"({market_type}, {chart_bias} {chart_confidence:.0%}, trend={avg_trend:.2f})"
-                            )
+                            logger.debug(f"[{market.asset}] CHART BLOCK: UP vs BEARISH")
                             return
                         elif chart_says_up and signal.side == Side.DOWN:
-                            logger.info(
-                                f"[{market.asset}] ❌ CHART BLOCK: Taking DOWN against strong BULLISH chart "
-                                f"({market_type}, {chart_bias} {chart_confidence:.0%}, trend={avg_trend:.2f})"
-                            )
+                            logger.debug(f"[{market.asset}] CHART BLOCK: DOWN vs BULLISH")
                             return
-                    elif is_reversal_trade:
-                        logger.info(
-                            f"[{market.asset}] ✓ Chart filter BYPASSED (reversal trade)"
-                        )
-
-                    logger.info(f"[{market.asset}] ✓ Chart filter passed")
 
             except Exception as e:
                 logger.debug(f"Chart analysis failed: {e}")
 
         # ML filter - check predicted win probability (do this BEFORE sizing for Kelly)
-        logger.info(f"[{market.asset}] ✓3 ML filter")
         ml_confidence = None
         if self.ml_predictor:
 
@@ -3430,9 +3404,7 @@ class TradingBot:
                 rejection_key = f"{market.condition_id}:ml"
                 if rejection_key not in self._logged_rejections:
                     self._logged_rejections.add(rejection_key)
-                    logger.info(f"[{market.asset}] ❌ ML BLOCK: {ml_reason} | Confidence: {confidence:.1%}")
-                else:
-                    logger.info(f"[{market.asset}] ⏸️ ML (repeat): {ml_reason} | Conf: {confidence:.1%}")
+                    logger.debug(f"[{market.asset}] ML BLOCK: {ml_reason}")
                 return
 
             # Store ML confidence for Kelly sizing
@@ -3487,7 +3459,6 @@ class TradingBot:
             signal._ml_vwap_position = ml_features.get("vwap_position", "at")
 
         # Adjust size using Kelly criterion (with ML confidence for optimal sizing)
-        logger.info(f"[{market.asset}] ✓4 Kelly sizing (conf: {ml_confidence})")
         signal = self.risk_manager.adjust_signal_size(
             signal,
             ml_confidence=ml_confidence,
@@ -3495,23 +3466,24 @@ class TradingBot:
         )
 
         # Check if signal was rejected due to size
-        logger.info(f"[{market.asset}] ✓5 Size: ${signal.size_usd:.2f} ({signal.size_shares:.1f} shares)")
         if signal.size_usd <= 0 or signal.size_shares <= 0:
             size_key = f"{market.condition_id}:size_too_small"
             if size_key not in self._logged_rejections:
                 self._logged_rejections.add(size_key)
-                max_size = self.risk_manager.current_bankroll * self.config.trading.max_position_pct
-                logger.info(
-                    f"[{market.asset}] ❌ SIZE TOO SMALL: "
-                    f"Max position ${max_size:.2f} (bankroll ${self.risk_manager.current_bankroll:.2f} × "
-                    f"{self.config.trading.max_position_pct:.0%}) < $3 minimum"
-                )
-            else:
-                logger.info(f"[{market.asset}] ⏸️ SIZE (repeat): too small")
+                logger.debug(f"[{market.asset}] SIZE TOO SMALL")
             return
 
+        # === CONSOLIDATED SIGNAL LOG (single line, only for executable trades) ===
+        arb_type = getattr(signal, '_arb_type', 'probability')
+        distance_pct = getattr(signal, '_ml_distance_from_target', 0) * 100
+        rsi = getattr(signal, '_ml_chart_rsi', 50)
+        logger.info(
+            f"🎯 {market.asset} {signal.side.value} ${signal.size_usd:.0f} | "
+            f"edge={signal.edge:.0%} dist={distance_pct:+.1f}% RSI={rsi:.0f} | "
+            f"{signal.reasoning[:40]}"
+        )
+
         # Execute the signal
-        logger.info(f"[{market.asset}] ✓6 EXECUTING TRADE!")
         await self._execute_signal(signal)
 
     def _update_market_from_orderbook(self, market: MarketState):
@@ -3545,48 +3517,47 @@ class TradingBot:
         market.last_updated = datetime.now(timezone.utc)
 
     def _log_status_line(self):
-        """Log a colorful status line with positions and bankroll."""
-        # Get current prices
-        prices = self.chainlink_feed.get_all_prices()
-
-        # Build price string
-        price_parts = []
-        for k, v in prices.items():
-            asset = k.split('/')[0].upper()
-            price_parts.append(f"{asset}: ${v:,.0f}")
-        price_str = " | ".join(price_parts)
-
-        # Get positions from cooldown (assets we're blocking)
+        """Log a clean status line with key info."""
         now = datetime.now(timezone.utc)
-        active_positions = []
-        for asset in ["BTC", "ETH", "SOL", "XRP"]:
-            if asset in self._last_order_time:
-                elapsed = (now - self._last_order_time[asset]).total_seconds()
-                if elapsed < self._order_cooldown_seconds:
-                    active_positions.append(asset)
-
-        # Build status line
         bankroll = self.risk_manager.current_bankroll
         pos_count = len(self.risk_manager.positions)
-
-        # Colorful output
-        status_parts = [
-            f"{Colors.BRIGHT_CYAN}💰 ${bankroll:.2f}{Colors.RESET}",
-        ]
-
-        if active_positions:
-            pos_str = ", ".join(active_positions)
-            status_parts.append(f"{Colors.BRIGHT_YELLOW}📊 {pos_str}{Colors.RESET}")
-
-        # Show pending orders count
         pending_count = len(self._pending_orders) if hasattr(self, '_pending_orders') else 0
-        if pending_count > 0:
-            status_parts.append(f"{Colors.DIM}⏳ {pending_count} pending{Colors.RESET}")
+        market_count = len(self.markets)
 
-        if price_str:
-            status_parts.append(f"{Colors.DIM}{price_str}{Colors.RESET}")
+        # Get prices
+        chainlink_prices = self.chainlink_feed.get_all_prices()
+        binance_prices = self._get_binance_prices()
 
-        logger.info(" │ ".join(status_parts))
+        # Build compact price string with distance info
+        price_parts = []
+        for asset in self.config.supported_assets:
+            asset_key = f"{asset.lower()}/usd"
+            cl_price = chainlink_prices.get(asset_key)
+            bn_price = binance_prices.get(asset)
+
+            # Find market for this asset to get target
+            target = None
+            for m in self.markets.values():
+                if m.asset == asset:
+                    target = m.target_price
+                    break
+
+            if cl_price:
+                part = f"{asset}=${cl_price:,.0f}"
+                if target and target > 0:
+                    dist_pct = ((cl_price - target) / target) * 100
+                    if dist_pct > 0:
+                        part += f"↑{dist_pct:.1f}%"
+                    else:
+                        part += f"↓{abs(dist_pct):.1f}%"
+                price_parts.append(part)
+
+        # Single clean status line
+        status = f"💰${bankroll:.0f} | {market_count} mkts | {pos_count} pos | {pending_count} pnd"
+        if price_parts:
+            status += f" | {' '.join(price_parts)}"
+
+        logger.info(status)
 
     def _calculate_equity(self) -> float:
         """

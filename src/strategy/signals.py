@@ -551,9 +551,7 @@ class SignalGenerator:
         MAX_SPREAD_ABS = 0.12  # Also cap absolute spread at 12 cents
 
         if spread_pct > MAX_SPREAD_PCT or spread > MAX_SPREAD_ABS:
-            logger.info(
-                f"⚠️ WIDE SPREAD [{market.asset}]: {spread:.2f} ({spread_pct:.0%}) - skipping"
-            )
+            logger.debug(f"WIDE SPREAD {market.asset}: {spread:.2f}")
             return Signal(
                 market=market,
                 side=Side.NONE,
@@ -636,16 +634,9 @@ class SignalGenerator:
             f"{binance_info}"
         )
 
-        # Log early Binance signals (WEAK confirmation - Binance crossed but Chainlink hasn't)
+        # Log early Binance signals only at DEBUG level
         if binance_conf["confirmation_type"] == "WEAK":
-            logger.info(
-                f"⚡ BINANCE EARLY SIGNAL [{market.asset}]: "
-                f"Binance ${binance_price:,.2f} crossed target ${market.target_price:,.2f} "
-                f"({binance_conf['binance_direction']}) | "
-                f"Chainlink ${current_price:,.2f} still {binance_conf['chainlink_direction']} | "
-                f"Lead: {binance_conf.get('lead_pct', 0) or 0:+.3%} | "
-                f"Watching for Chainlink to follow..."
-            )
+            logger.debug(f"BINANCE early {market.asset}: {binance_conf['binance_direction']}")
 
         # === COMPREHENSIVE CHART ANALYSIS ===
         # Use Binance candlestick data for advanced trend analysis
@@ -657,22 +648,10 @@ class SignalGenerator:
             try:
                 chart_analysis = analyze_chart(market.asset)
                 if chart_analysis:
-                    # Log comprehensive chart analysis at INFO level for visibility
-                    uncertainty_info = ""
-                    if chart_analysis.is_uncertain:
-                        uncertainty_info = f" | ⚠️ UNCERTAIN ({chart_analysis.uncertainty_score:.0%}): {chart_analysis.uncertainty_reason}"
-
-                    logger.info(
-                        f"📊 CHART ANALYSIS [{market.asset}]: "
-                        f"Type={chart_analysis.market_type.value} | "
-                        f"Bias={chart_analysis.bias} ({chart_analysis.confidence:.0%}) | "
-                        f"RSI={chart_analysis.rsi_14:.0f} | "
-                        f"Trends: 15m={chart_analysis.trend_15m:+.2f}, "
-                        f"1h={chart_analysis.trend_1h:+.2f}, "
-                        f"4h={chart_analysis.trend_4h:+.2f} | "
-                        f"Change={chart_analysis.trend_change.value}"
-                        + (f" | Pattern={chart_analysis.pattern_name}" if chart_analysis.pattern_name else "")
-                        + uncertainty_info
+                    # Chart analysis logged at DEBUG level only
+                    logger.debug(
+                        f"CHART {market.asset}: {chart_analysis.bias} RSI={chart_analysis.rsi_14:.0f} "
+                        f"trend={chart_analysis.trend_15m:+.2f}"
                     )
 
                     # === GRADUATED POSITION SIZING ===
@@ -700,12 +679,7 @@ class SignalGenerator:
 
                     # === HARD PAUSE: Only pause if position multiplier is 0 AND not ready to resume ===
                     if position_multiplier == 0.0 and not chart_analysis.resume_ready:
-                        logger.info(
-                            f"⏸️ MARKET PAUSE [{market.asset}]: Waiting for clearer signal | "
-                            f"Uncertainty: {chart_analysis.uncertainty_score:.0%} | "
-                            f"Resume: {chart_analysis.resume_confidence:.0%} | "
-                            f"Reason: {chart_analysis.uncertainty_reason}"
-                        )
+                        logger.debug(f"PAUSE {market.asset}: uncertain")
                         return Signal(
                             market=market,
                             side=Side.NONE,
@@ -816,15 +790,9 @@ class SignalGenerator:
             if pattern_says_up and short_term_trend > 0:
                 chart_says_up = True
                 chart_signal_strength = 0.7
-                logger.info(
-                    f"🕯️ BULLISH PATTERN [{market.asset}]: {chart_analysis.pattern_name if chart_analysis else 'unknown'} → UP signal"
-                )
             elif pattern_says_down and short_term_trend < 0:
                 chart_says_down = True
                 chart_signal_strength = 0.7
-                logger.info(
-                    f"🕯️ BEARISH PATTERN [{market.asset}]: {chart_analysis.pattern_name if chart_analysis else 'unknown'} → DOWN signal"
-                )
 
             # Strong bearish signals (traditional)
             # RELAXED: lowered confidence threshold from 0.6 to 0.5
@@ -885,9 +853,8 @@ class SignalGenerator:
                     chart_edge_penalty = chart_signal_strength * 0.15
                     edge_up -= chart_edge_penalty
 
-                    logger.info(
-                        f"🔴 CHART [{market.asset}]: BEARISH ({chart_signal_strength:.0%}) + "
-                        f"above target → DOWN +{chart_edge_boost:.1%}, UP -{chart_edge_penalty:.1%}"
+                    logger.debug(
+                        f"CHART {market.asset}: BEARISH + above → DOWN +{chart_edge_boost:.1%}"
                     )
 
                 elif price_below_target and distance_from_target < 0.01:
@@ -895,10 +862,7 @@ class SignalGenerator:
                     chart_edge_penalty = chart_signal_strength * 0.08  # Reduced from 25%
                     edge_up -= chart_edge_penalty
 
-                    logger.info(
-                        f"🔴 CHART [{market.asset}]: BEARISH ({chart_signal_strength:.0%}) + "
-                        f"barely below target → UP -{chart_edge_penalty:.1%}"
-                    )
+                    logger.debug(f"CHART {market.asset}: BEARISH + barely below")
 
             elif chart_says_up and chart_signal_strength >= 0.6:
                 # Chart says UP
@@ -912,9 +876,8 @@ class SignalGenerator:
                     chart_edge_penalty = chart_signal_strength * 0.15
                     edge_down -= chart_edge_penalty
 
-                    logger.info(
-                        f"🟢 CHART [{market.asset}]: BULLISH ({chart_signal_strength:.0%}) + "
-                        f"below target → UP +{chart_edge_boost:.1%}, DOWN -{chart_edge_penalty:.1%}"
+                    logger.debug(
+                        f"CHART {market.asset}: BULLISH + below → UP +{chart_edge_boost:.1%}"
                     )
 
                 elif price_above_target and distance_from_target < 0.01:
@@ -922,253 +885,152 @@ class SignalGenerator:
                     chart_edge_penalty = chart_signal_strength * 0.08  # Reduced from 25%
                     edge_down -= chart_edge_penalty
 
-                    logger.info(
-                        f"🟢 CHART [{market.asset}]: BULLISH ({chart_signal_strength:.0%}) + "
-                        f"barely above target → DOWN -{chart_edge_penalty:.1%}"
-                    )
+                    logger.debug(f"CHART {market.asset}: BULLISH + barely above")
 
             # === RSI EXTREMES ===
             # RSI overrides trend in extreme cases (mean reversion)
             if chart_analysis:
                 if rsi < 20:  # Extremely oversold
-                    # Expect bounce - reduce bearish conviction
                     if chart_says_down:
-                        logger.info(f"⚠️ RSI WARNING [{market.asset}]: Extremely oversold ({rsi:.0f}) - bearish signal may reverse")
-                        # Don't fully trust the bearish signal
                         edge_down -= 0.05
-
                 elif rsi > 80:  # Extremely overbought
-                    # Expect pullback - reduce bullish conviction
                     if chart_says_up:
-                        logger.info(f"⚠️ RSI WARNING [{market.asset}]: Extremely overbought ({rsi:.0f}) - bullish signal may reverse")
                         edge_up -= 0.05
 
             # === PATTERN RECOGNITION BONUS ===
             if is_bullish_pattern and chart_says_up:
                 edge_up += 0.03
-                logger.info(f"🕯️ PATTERN CONFIRMS [{market.asset}]: Bullish pattern confirms UP signal +3%")
             elif is_bearish_pattern and chart_says_down:
                 edge_down += 0.03
-                logger.info(f"🕯️ PATTERN CONFIRMS [{market.asset}]: Bearish pattern confirms DOWN signal +3%")
 
             # === TREND REVERSAL SIGNALS ===
             if trend_change == "bullish_reversal":
                 edge_up += 0.05
                 edge_down -= 0.05
-                logger.info(f"🔄 TREND REVERSAL [{market.asset}]: Bullish reversal detected → UP +5%, DOWN -5%")
             elif trend_change == "bearish_reversal":
                 edge_down += 0.05
                 edge_up -= 0.05
-                logger.info(f"🔄 TREND REVERSAL [{market.asset}]: Bearish reversal detected → DOWN +5%, UP -5%")
 
             # === MULTI-TIMEFRAME EDGE ADJUSTMENT ===
-            # When 1h and 15m trends align, boost edge
-            # When they disagree, penalize the signal going against 1h
             if chart_analysis:
                 higher_tf_bias = chart_analysis.higher_timeframe_bias
                 alignment = chart_analysis.alignment_score
 
                 if alignment >= 0.8:
-                    # Strong alignment - boost the aligned direction
                     if higher_tf_bias == "bullish":
                         edge_up += 0.03
-                        logger.info(f"🎯 TIMEFRAME ALIGNMENT [{market.asset}]: Strong bullish alignment ({alignment:.0%}) → UP +3%")
                     elif higher_tf_bias == "bearish":
                         edge_down += 0.03
-                        logger.info(f"🎯 TIMEFRAME ALIGNMENT [{market.asset}]: Strong bearish alignment ({alignment:.0%}) → DOWN +3%")
                 elif alignment < 0.5:
-                    # Poor alignment - penalize trades against 1h trend
                     if higher_tf_bias == "bullish" and chart_says_down:
                         edge_down -= 0.05
-                        logger.info(f"⚠️ TIMEFRAME CONFLICT [{market.asset}]: DOWN signal against 1h bullish → DOWN -5%")
                     elif higher_tf_bias == "bearish" and chart_says_up:
                         edge_up -= 0.05
-                        logger.info(f"⚠️ TIMEFRAME CONFLICT [{market.asset}]: UP signal against 1h bearish → UP -5%")
 
             # === SUPPLY/DEMAND ZONE ANALYSIS ===
-            # Boost edge when price is at a strong zone, penalize when going against it
             if chart_analysis:
-                # Price at demand zone (support) - bullish bias
                 if chart_analysis.in_demand_zone:
                     zone_boost = min(0.05, chart_analysis.demand_zone_strength * 0.02)
                     edge_up += zone_boost
                     edge_down -= zone_boost * 0.5
-                    logger.info(
-                        f"📍 DEMAND ZONE [{market.asset}]: Price at support (strength={chart_analysis.demand_zone_strength}) → "
-                        f"UP +{zone_boost:.1%}, DOWN -{zone_boost*0.5:.1%}"
-                    )
-
-                # Price at supply zone (resistance) - bearish bias
                 elif chart_analysis.in_supply_zone:
                     zone_boost = min(0.05, chart_analysis.supply_zone_strength * 0.02)
                     edge_down += zone_boost
                     edge_up -= zone_boost * 0.5
-                    logger.info(
-                        f"📍 SUPPLY ZONE [{market.asset}]: Price at resistance (strength={chart_analysis.supply_zone_strength}) → "
-                        f"DOWN +{zone_boost:.1%}, UP -{zone_boost*0.5:.1%}"
-                    )
-
-                # Price approaching demand zone - bullish if bouncing
                 elif chart_analysis.nearest_demand and chart_says_up:
                     distance_to_demand = (current_price - chart_analysis.nearest_demand) / current_price
-                    if distance_to_demand < 0.005:  # Within 0.5% of demand zone
+                    if distance_to_demand < 0.005:
                         edge_up += 0.02
-                        logger.info(
-                            f"📍 NEAR DEMAND [{market.asset}]: Price near support ${chart_analysis.nearest_demand:,.2f} → UP +2%"
-                        )
-
-                # Price approaching supply zone - bearish if rejecting
                 elif chart_analysis.nearest_supply and chart_says_down:
                     distance_to_supply = (chart_analysis.nearest_supply - current_price) / current_price
-                    if distance_to_supply < 0.005:  # Within 0.5% of supply zone
+                    if distance_to_supply < 0.005:
                         edge_down += 0.02
-                        logger.info(
-                            f"📍 NEAR SUPPLY [{market.asset}]: Price near resistance ${chart_analysis.nearest_supply:,.2f} → DOWN +2%"
-                        )
 
-            # === NEW INDICATOR SIGNALS ===
+            # === INDICATOR SIGNALS (no verbose logging) ===
             if chart_analysis:
-                # --- MACD Crossover (strong momentum signal) ---
+                # MACD Crossover
                 if chart_analysis.macd_crossover == "bullish":
                     edge_up += 0.04
                     edge_down -= 0.02
-                    logger.info(f"📈 MACD BULLISH CROSSOVER [{market.asset}]: Momentum shifting up → UP +4%")
                 elif chart_analysis.macd_crossover == "bearish":
                     edge_down += 0.04
                     edge_up -= 0.02
-                    logger.info(f"📉 MACD BEARISH CROSSOVER [{market.asset}]: Momentum shifting down → DOWN +4%")
 
-                # MACD histogram direction (momentum strength)
+                # MACD histogram
                 if chart_analysis.macd_histogram > 0 and chart_says_up:
                     edge_up += 0.02
                 elif chart_analysis.macd_histogram < 0 and chart_says_down:
                     edge_down += 0.02
 
-                # --- Bollinger Bands (mean reversion + breakout) ---
+                # Bollinger Bands
                 if chart_analysis.bb_position == "below_lower":
-                    # Price below lower band - oversold, expect bounce
                     edge_up += 0.03
                     edge_down -= 0.02
-                    logger.info(f"📊 BOLLINGER [{market.asset}]: Price below lower band (oversold) → UP +3%")
                 elif chart_analysis.bb_position == "above_upper":
-                    # Price above upper band - overbought, expect pullback
                     edge_down += 0.03
                     edge_up -= 0.02
-                    logger.info(f"📊 BOLLINGER [{market.asset}]: Price above upper band (overbought) → DOWN +3%")
 
-                # Bollinger squeeze (low bandwidth = big move coming)
-                if chart_analysis.bb_bandwidth < 1.5:  # Tight squeeze
-                    # Increase edge in the direction of momentum
+                # Bollinger squeeze
+                if chart_analysis.bb_bandwidth < 1.5:
                     if chart_analysis.momentum > 0:
                         edge_up += 0.02
-                        logger.info(f"🔥 BOLLINGER SQUEEZE [{market.asset}]: Low volatility + bullish momentum → UP +2%")
                     elif chart_analysis.momentum < 0:
                         edge_down += 0.02
-                        logger.info(f"🔥 BOLLINGER SQUEEZE [{market.asset}]: Low volatility + bearish momentum → DOWN +2%")
 
-                # --- Stochastic (faster overbought/oversold) ---
+                # Stochastic
                 if chart_analysis.stoch_signal == "oversold" and chart_says_up:
                     edge_up += 0.03
-                    logger.info(f"📉 STOCHASTIC OVERSOLD [{market.asset}]: K={chart_analysis.stoch_k:.0f}, D={chart_analysis.stoch_d:.0f} → UP +3%")
                 elif chart_analysis.stoch_signal == "overbought" and chart_says_down:
                     edge_down += 0.03
-                    logger.info(f"📈 STOCHASTIC OVERBOUGHT [{market.asset}]: K={chart_analysis.stoch_k:.0f}, D={chart_analysis.stoch_d:.0f} → DOWN +3%")
 
-                # --- RSI Divergence (powerful reversal signal) ---
+                # RSI Divergence
                 if chart_analysis.rsi_divergence == "bullish" and chart_analysis.rsi_divergence_strength > 0.3:
                     edge_up += 0.05
                     edge_down -= 0.03
-                    logger.info(
-                        f"🔄 RSI BULLISH DIVERGENCE [{market.asset}]: "
-                        f"Strength={chart_analysis.rsi_divergence_strength:.0%} → UP +5%, DOWN -3%"
-                    )
                 elif chart_analysis.rsi_divergence == "bearish" and chart_analysis.rsi_divergence_strength > 0.3:
                     edge_down += 0.05
                     edge_up -= 0.03
-                    logger.info(
-                        f"🔄 RSI BEARISH DIVERGENCE [{market.asset}]: "
-                        f"Strength={chart_analysis.rsi_divergence_strength:.0%} → DOWN +5%, UP -3%"
-                    )
 
-                # --- Volume Confirmation ---
-                # High volume confirms the move
+                # Volume
                 if chart_analysis.is_high_volume:
                     if chart_says_up:
                         edge_up += 0.02
-                        logger.info(f"📊 HIGH VOLUME [{market.asset}]: Volume {chart_analysis.volume_ratio:.1f}x avg confirms UP → +2%")
                     elif chart_says_down:
                         edge_down += 0.02
-                        logger.info(f"📊 HIGH VOLUME [{market.asset}]: Volume {chart_analysis.volume_ratio:.1f}x avg confirms DOWN → +2%")
 
-                # OBV trend confirmation
+                # OBV
                 if chart_analysis.obv_trend > 0.3 and chart_says_up:
                     edge_up += 0.02
-                    logger.info(f"📈 OBV BULLISH [{market.asset}]: Volume flowing into asset → UP +2%")
                 elif chart_analysis.obv_trend < -0.3 and chart_says_down:
                     edge_down += 0.02
-                    logger.info(f"📉 OBV BEARISH [{market.asset}]: Volume flowing out of asset → DOWN +2%")
 
-                # --- HEIKEN ASHI TREND ---
-                # Smoothed trend indicator - consecutive same-color candles = strong trend
+                # Heiken Ashi
                 if chart_analysis.ha_consecutive >= 3:
                     ha_boost = min(0.04, chart_analysis.ha_strength * 0.05)
                     if chart_analysis.ha_trend == "bullish":
                         edge_up += ha_boost
-                        logger.info(
-                            f"🕯️ HEIKEN ASHI [{market.asset}]: {chart_analysis.ha_consecutive} bullish candles "
-                            f"(strength={chart_analysis.ha_strength:.0%}) → UP +{ha_boost:.1%}"
-                        )
                     elif chart_analysis.ha_trend == "bearish":
                         edge_down += ha_boost
-                        logger.info(
-                            f"🕯️ HEIKEN ASHI [{market.asset}]: {chart_analysis.ha_consecutive} bearish candles "
-                            f"(strength={chart_analysis.ha_strength:.0%}) → DOWN +{ha_boost:.1%}"
-                        )
 
-                # --- VWAP (Volume Weighted Average Price) ---
-                # Institutional level - price tends to revert to VWAP
+                # VWAP
                 if chart_analysis.vwap > 0:
                     if chart_analysis.vwap_position == "below" and abs(chart_analysis.vwap_distance_pct) > 0.003:
-                        # Price significantly below VWAP - expect mean reversion UP
                         vwap_boost = min(0.03, abs(chart_analysis.vwap_distance_pct) * 5)
                         edge_up += vwap_boost
-                        logger.info(
-                            f"📊 VWAP [{market.asset}]: Price {chart_analysis.vwap_distance_pct:.2%} below VWAP "
-                            f"(${chart_analysis.vwap:,.0f}) → Mean reversion UP +{vwap_boost:.1%}"
-                        )
                     elif chart_analysis.vwap_position == "above" and abs(chart_analysis.vwap_distance_pct) > 0.003:
-                        # Price significantly above VWAP - expect mean reversion DOWN
                         vwap_boost = min(0.03, abs(chart_analysis.vwap_distance_pct) * 5)
                         edge_down += vwap_boost
-                        logger.info(
-                            f"📊 VWAP [{market.asset}]: Price {chart_analysis.vwap_distance_pct:.2%} above VWAP "
-                            f"(${chart_analysis.vwap:,.0f}) → Mean reversion DOWN +{vwap_boost:.1%}"
-                        )
 
-                # --- VOLATILITY-DISTANCE CHECK ---
-                # Can price realistically reach the target in 15 minutes?
+                # Volatility-Distance check
                 distance_to_target = abs(current_price - market.target_price)
-                atr_15min = chart_analysis.atr  # ATR is already in price units
-
-                # Typical 15-min move is about 0.5-1x ATR
+                atr_15min = chart_analysis.atr
                 expected_move = atr_15min * 0.75
 
                 if distance_to_target > expected_move * 2:
-                    # Target is far - price unlikely to reach it
                     if price_below_target:
-                        # Price below target, unlikely to go UP to target
                         edge_down += 0.03
-                        logger.info(
-                            f"📏 VOLATILITY-DISTANCE [{market.asset}]: Target ${market.target_price:,.0f} is "
-                            f"${distance_to_target:,.0f} away (ATR=${atr_15min:,.0f}) → Price likely stays DOWN"
-                        )
                     else:
-                        # Price above target, unlikely to go DOWN to target
                         edge_up += 0.03
-                        logger.info(
-                            f"📏 VOLATILITY-DISTANCE [{market.asset}]: Target ${market.target_price:,.0f} is "
-                            f"${distance_to_target:,.0f} away (ATR=${atr_15min:,.0f}) → Price likely stays UP"
-                        )
 
             # === BTC TREND FOLLOWING ===
             # BTC leads the market - follow its trend for all assets
@@ -1192,23 +1054,13 @@ class SignalGenerator:
                             impact_multiplier = 1.3  # XRP moderately correlated
 
                         if btc_velocity < -BTC_VELOCITY_THRESHOLD:
-                            # BTC dumping - bearish bias
-                            btc_impact = min(0.08, abs(btc_velocity) * 150 * impact_multiplier)  # Cap at 8%
+                            btc_impact = min(0.08, abs(btc_velocity) * 150 * impact_multiplier)
                             edge_down += btc_impact
-                            edge_up -= btc_impact * 0.7  # Stronger penalty for going against BTC
-                            logger.info(
-                                f"₿ BTC TREND [{market.asset}]: BTC dumping ({btc_velocity:.4%}/s) → "
-                                f"DOWN +{btc_impact:.1%}, UP -{btc_impact*0.7:.1%}"
-                            )
+                            edge_up -= btc_impact * 0.7
                         elif btc_velocity > BTC_VELOCITY_THRESHOLD:
-                            # BTC pumping - bullish bias
-                            btc_impact = min(0.08, abs(btc_velocity) * 150 * impact_multiplier)  # Cap at 8%
+                            btc_impact = min(0.08, abs(btc_velocity) * 150 * impact_multiplier)
                             edge_up += btc_impact
-                            edge_down -= btc_impact * 0.7  # Stronger penalty for going against BTC
-                            logger.info(
-                                f"₿ BTC TREND [{market.asset}]: BTC pumping ({btc_velocity:.4%}/s) → "
-                                f"UP +{btc_impact:.1%}, DOWN -{btc_impact*0.7:.1%}"
-                            )
+                            edge_down -= btc_impact * 0.7
                 except Exception as e:
                     logger.debug(f"BTC trend check failed: {e}")
 
@@ -1249,43 +1101,21 @@ class SignalGenerator:
                         time_boost = time_decay * 0.10  # Up to 10% boost
 
                         if price_below_target:
-                            # Price below target, unlikely to reach → DOWN wins
                             edge_down += time_boost
                             edge_up -= time_boost * 0.5
-                            logger.info(
-                                f"⏱️ TIME-AWARE [{market.asset}]: {time_remaining:.0f}s left, "
-                                f"price ${current_price:,.0f} needs to rise {distance_pct:.2%} to reach ${market.target_price:,.0f} "
-                                f"(expected move: {expected_move_pct:.2%}) → DOWN +{time_boost:.1%}"
-                            )
                         else:
-                            # Price above target, unlikely to drop → UP wins
                             edge_up += time_boost
                             edge_down -= time_boost * 0.5
-                            logger.info(
-                                f"⏱️ TIME-AWARE [{market.asset}]: {time_remaining:.0f}s left, "
-                                f"price ${current_price:,.0f} needs to drop {distance_pct:.2%} to reach ${market.target_price:,.0f} "
-                                f"(expected move: {expected_move_pct:.2%}) → UP +{time_boost:.1%}"
-                            )
                         time_adjustment_applied = True
 
-                    # If price is very close to target with little time → uncertain
                     elif distance_pct < expected_move_pct * 0.5 and time_remaining < 120:
-                        # Too close to call - reduce both edges (avoid risky trades)
                         uncertainty_penalty = time_decay * 0.05
                         edge_up -= uncertainty_penalty
                         edge_down -= uncertainty_penalty
-                        logger.info(
-                            f"⏱️ TIME-AWARE [{market.asset}]: {time_remaining:.0f}s left, "
-                            f"price very close to target ({distance_pct:.2%}) → Too risky, edges reduced"
-                        )
                         time_adjustment_applied = True
 
-            # Log final decision
-            logger.info(
-                f"📈 FINAL EDGES [{market.asset}]: UP={edge_up:.1%}, DOWN={edge_down:.1%} | "
-                f"Chart: {'DOWN' if chart_says_down else 'UP' if chart_says_up else 'NEUTRAL'} ({chart_signal_strength:.0%})"
-                + (f" | ⏱️ Time-adjusted" if time_adjustment_applied else "")
-            )
+            # Log final decision only at DEBUG level
+            logger.debug(f"EDGES {market.asset}: UP={edge_up:.1%}, DOWN={edge_down:.1%}")
 
         except Exception as e:
             logger.debug(f"Chart-based analysis failed for {market.asset}: {e}")
@@ -1406,10 +1236,7 @@ class SignalGenerator:
             )
 
             if not trend_result.should_trade:
-                logger.info(
-                    f"🛡️ TREND PROTECTION BLOCKED [{market.asset}]: "
-                    f"{side.value} signal blocked | {trend_result.reason}"
-                )
+                logger.debug(f"TREND BLOCK {market.asset}: {side.value}")
                 return Signal(
                     market=market,
                     side=Side.NONE,
@@ -1456,11 +1283,6 @@ class SignalGenerator:
 
             # Apply edge boost from smart analysis
             if smart_decision.edge_boost > 0:
-                logger.info(
-                    f"📈 SMART TREND BOOST [{market.asset}]: "
-                    f"Edge {edge:.1%} -> {edge + smart_decision.edge_boost:.1%} | "
-                    f"{smart_decision.reason}"
-                )
                 edge += smart_decision.edge_boost
 
         except Exception as e:
@@ -1608,12 +1430,7 @@ class SignalGenerator:
         # This reduces position size during uncertain/transitional markets
         position_multiplier = getattr(self, '_position_multiplier', 1.0)
         if position_multiplier < 1.0:
-            original_size = size_usd
             size_usd *= position_multiplier
-            logger.info(
-                f"📏 GRADUATED SIZING: ${original_size:.2f} × {position_multiplier:.0%} = ${size_usd:.2f} | "
-                f"Reason: {getattr(self, '_position_multiplier_reason', 'unknown')}"
-            )
 
         # Convert to shares
         price = max(0.01, min(0.99, price))
@@ -1624,10 +1441,9 @@ class SignalGenerator:
         # Bump up to minimum if within reasonable range (allows up to 2x bump)
         MIN_SHARES = 5.0
         if size_shares < MIN_SHARES:
-            if size_shares >= MIN_SHARES / 2:  # At least 2.5 shares
+            if size_shares >= MIN_SHARES / 2:
                 size_shares = MIN_SHARES
                 size_usd = size_shares * price
-                logger.info(f"📏 ORDER SIZE: Bumped to minimum {MIN_SHARES} shares (${size_usd:.2f})")
             else:
                 # Too small even with bump - will be filtered by bot.py
                 logger.debug(f"📏 ORDER SIZE: {size_shares:.2f} shares too small (min {MIN_SHARES} for LIMIT)")
@@ -1767,8 +1583,7 @@ class SignalGenerator:
             rsi_divergence=rsi_divergence,
         )
 
-        # Log the signal
-        log_simple_signal(market.asset, simple_sig, market.target_price, current_price)
+        # Signal logging moved to bot.py for consolidated output
 
         # Convert to Signal object
         side = Side.UP if simple_sig.direction == "UP" else Side.DOWN
@@ -1793,10 +1608,8 @@ class SignalGenerator:
         # Always bump if we have at least 1 share worth (prevents rejections)
         MIN_SHARES = 5.0
         if size_shares < MIN_SHARES and size_shares >= 1.0:
-            old_size = size_usd
             size_shares = MIN_SHARES
             size_usd = size_shares * recommended_price
-            logger.info(f"📏 [{market.asset}] Bumped {old_size:.2f} → ${size_usd:.2f} (min {MIN_SHARES} shares)")
 
         return Signal(
             market=market,
@@ -1960,11 +1773,8 @@ class SignalGenerator:
         if not best:
             return None
 
-        # Log the opportunity
-        logger.info(
-            f"🎯 ARB [{market.asset}]: {best['type'].upper()} | "
-            f"Edge: {best['edge']:.1%} | {best['reasoning']}"
-        )
+        # Arbitrage opportunity logged only at DEBUG
+        logger.debug(f"ARB {market.asset}: {best['type']} edge={best['edge']:.1%}")
 
         # Create signal from opportunity
         side = best["side"]
