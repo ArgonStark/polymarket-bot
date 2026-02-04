@@ -1763,6 +1763,13 @@ class SignalGenerator:
         # Calculate shares
         size_shares = size_usd / recommended_price if recommended_price > 0 else 0
 
+        # BUMP UP to minimum 5 shares for LIMIT orders (Polymarket requirement)
+        MIN_SHARES = 5.0
+        if size_shares < MIN_SHARES and size_shares >= 2.0:  # At least 2 shares to bump
+            size_shares = MIN_SHARES
+            size_usd = size_shares * recommended_price
+            logger.info(f"📏 [{market.asset}] Bumped to minimum {MIN_SHARES} shares (${size_usd:.2f})")
+
         return Signal(
             market=market,
             side=side,
