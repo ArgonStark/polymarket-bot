@@ -178,8 +178,8 @@ class RiskManager:
                 f"Max positions ({trading.max_concurrent_positions}) reached",
             )
 
-        # Basic capital check - need at least $3 available to trade
-        min_trade_size = 3.0
+        # Basic capital check - need at least $1 available to trade
+        min_trade_size = 1.0
         available = self.current_bankroll * 0.90  # Keep 10% buffer
         if available < min_trade_size:
             return (
