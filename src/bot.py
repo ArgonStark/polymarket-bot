@@ -3046,10 +3046,18 @@ class TradingBot:
         position_side = position.side.value  # "UP" or "DOWN"
 
         # --- Token-ID based payout (authoritative) ---
-        winning_token_id = (
-            market.up_token_id if winning_outcome == "UP"
-            else market.down_token_id
-        )
+        # Prefer position's own token IDs (captured at open time, immutable)
+        # over market's current token IDs which could theoretically drift.
+        pos_yes = position.yes_token_id
+        pos_no = position.no_token_id
+
+        if pos_yes and pos_no:
+            winning_token_id = pos_yes if winning_outcome == "UP" else pos_no
+        else:
+            winning_token_id = (
+                market.up_token_id if winning_outcome == "UP"
+                else market.down_token_id
+            )
 
         # Use explicit held_token_id if available, fall back to token_id
         held_token = position.held_token_id or position.token_id
@@ -3061,9 +3069,12 @@ class TradingBot:
         if won != side_match:
             logger.error(
                 "SETTLE_MISMATCH token-based won=%s but side-match=%s | "
-                "side=%s winner=%s held=%s winning_token=%s",
+                "side=%s winner=%s held=%s winning_token=%s "
+                "pos_yes=%s pos_no=%s mkt_up=%s mkt_down=%s",
                 won, side_match, position_side, winning_outcome,
                 held_token[:16], winning_token_id[:16],
+                (pos_yes or "")[:16], (pos_no or "")[:16],
+                market.up_token_id[:16], market.down_token_id[:16],
             )
 
         # Calculate P&L

@@ -864,29 +864,72 @@ class GammaAPI:
 
         try:
             resolved = market.get("resolved", False)
-            if not resolved:
-                return {"resolved": False, "winning_outcome": None, "resolution_price": None}
-
-            # Determine winning outcome from token payouts
-            tokens = market.get("tokens", [])
-            winning_outcome = None
             resolution_price = market.get("resolutionPrice")
 
-            for token in tokens:
-                winner = token.get("winner", False)
-                if winner:
-                    outcome = token.get("outcome", "").lower()
-                    if "up" in outcome or "yes" in outcome or ">=" in outcome:
-                        winning_outcome = "UP"
-                    elif "down" in outcome or "no" in outcome or "<" in outcome:
-                        winning_outcome = "DOWN"
-                    break
+            # Method 1: Standard resolved flag + tokens[].winner
+            if resolved:
+                tokens = market.get("tokens", [])
+                winning_outcome = None
 
-            return {
-                "resolved": True,
-                "winning_outcome": winning_outcome,
-                "resolution_price": resolution_price,
-            }
+                for token in tokens:
+                    winner = token.get("winner", False)
+                    if winner:
+                        outcome = token.get("outcome", "").lower()
+                        if "up" in outcome or "yes" in outcome or ">=" in outcome:
+                            winning_outcome = "UP"
+                        elif "down" in outcome or "no" in outcome or "<" in outcome:
+                            winning_outcome = "DOWN"
+                        break
+
+                return {
+                    "resolved": True,
+                    "winning_outcome": winning_outcome,
+                    "resolution_price": resolution_price,
+                }
+
+            # Method 2: Auto-resolved 15-min markets — resolved is None but
+            # outcomePrices shows clear winner (["1","0"] or ["0","1"]).
+            # These markets have automaticallyResolved=True and empty tokens[].
+            outcome_prices_raw = market.get("outcomePrices")
+            outcomes_raw = market.get("outcomes")
+            is_closed = market.get("closed", False)
+
+            if outcome_prices_raw and is_closed:
+                try:
+                    outcome_prices = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+                    outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or [])
+                except (json.JSONDecodeError, TypeError):
+                    outcome_prices = []
+                    outcomes = []
+
+                if len(outcome_prices) >= 2 and len(outcomes) >= 2:
+                    prices = [float(p) for p in outcome_prices]
+
+                    # Clear resolution: one outcome at 1.0 and the other at 0.0
+                    if max(prices) >= 0.99 and min(prices) <= 0.01:
+                        winner_idx = prices.index(max(prices))
+                        winner_label = str(outcomes[winner_idx]).lower()
+
+                        winning_outcome = None
+                        if "up" in winner_label or "yes" in winner_label or ">=" in winner_label:
+                            winning_outcome = "UP"
+                        elif "down" in winner_label or "no" in winner_label or "<" in winner_label:
+                            winning_outcome = "DOWN"
+
+                        if winning_outcome:
+                            logger.info(
+                                "RESOLVE_FROM_PRICES market=%s winner=%s "
+                                "outcomePrices=%s outcomes=%s",
+                                condition_id[:16], winning_outcome,
+                                outcome_prices, outcomes,
+                            )
+                            return {
+                                "resolved": True,
+                                "winning_outcome": winning_outcome,
+                                "resolution_price": resolution_price,
+                            }
+
+            return {"resolved": False, "winning_outcome": None, "resolution_price": None}
 
         except Exception as e:
             logger.error(f"Failed to parse resolution for {condition_id}: {e}")
