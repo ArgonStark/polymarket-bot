@@ -7,13 +7,15 @@ risk management, and order execution.
 
 import asyncio
 import logging
+import os
+from collections import deque
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from .config import BotConfig
-from .models import MarketState, ChainlinkPrice, Signal, OrderAction, Side
-from .data import (
+from src.config import BotConfig
+from src.models import MarketState, ChainlinkPrice, Signal, OrderAction, Side, PositionState
+from src.data import (
     ChainlinkFeed,
     CLOBFeed,
     GammaAPI,
@@ -23,11 +25,19 @@ from .data import (
     get_data_api,
     get_settlement_verifier,
 )
-from .data.binance import BinancePrice
-from .execution import create_trading_client, OrderExecutor
-from .execution.client import get_account_balance, get_trades
-from .strategy import SignalGenerator, RiskManager, init_auto_retrainer, get_auto_retrainer
-from .strategy.ml_predictor import (
+from src.data.binance import BinancePrice
+from src.execution import create_trading_client, OrderExecutor
+from src.execution.client import get_account_balance, get_trades
+from src.execution.orders import OrderSafetyGuard, get_safety_guard
+from src.strategy import SignalGenerator, RiskManager, init_auto_retrainer, get_auto_retrainer
+from src.strategy.meta import MultiStrategyMeta, StrategyWeights
+from src.strategy.risk_sizing import RiskSizer, RiskSizingConfig
+from src.strategy.strategies.context import StrategyContext
+from src.prediction import FeatureBuilder, ProbabilityModel
+from src.monitoring.metrics import MetricsCollector, MetricsConfig
+from src.execution.low_latency.router import SmartOrderRouter, SmartRouterConfig
+from src.execution.paper import PaperOrderExecutor, PaperTradingConfig
+from src.strategy.ml_predictor import (
     get_ml_predictor,
     MLSignalPredictor,
     extract_ml_features_from_market,
@@ -40,7 +50,7 @@ from .strategy.ml_predictor import (
 #        decision = ml.evaluate_trade(ml_input)
 #        if decision.should_trade: execute()
 #        ml.record_outcome(trade_id, ml_input, won=True)
-from .ml import (
+from src.ml import (
     MLInterface,
     MLInput,
     MLDecision,
@@ -54,12 +64,15 @@ from .ml import (
     IndicatorContext,
     PriceContext,
 )
-from .strategy.trade_history import get_trade_history
-from .utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
+from src.ml.infer import ModelBundle, InferenceEngine
+from src.ml.policy import Policy, PolicyConfig
+from src.state import BotStateManager
+from src.strategy.trade_history import get_trade_history
+from src.utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
 
 # Import Binance chart analyzer for ML features
 try:
-    from .data.binance_chart import analyze_chart
+    from src.data.binance_chart import analyze_chart
     CHART_ANALYSIS_AVAILABLE = True
 except ImportError:
     CHART_ANALYSIS_AVAILABLE = False
@@ -111,8 +124,74 @@ class TradingBot:
         # Trading components
         self.client = None
         self.executor = None
+        self.smart_router = None
         self.signal_generator = SignalGenerator(config=config)
         self.risk_manager = RiskManager(config=config)
+
+        # Multi-strategy meta layer
+        self.meta_strategy = None
+        if config.strategy.multi_strategy_enabled:
+            weights = StrategyWeights(
+                trend=config.strategy.trend_weight,
+                mean_reversion=config.strategy.mean_reversion_weight,
+                momentum_spike=config.strategy.momentum_weight,
+            )
+            self.meta_strategy = MultiStrategyMeta(weights)
+            logger.info("🧠 Multi-strategy meta-layer enabled")
+
+        # Probabilistic prediction model
+        self.feature_builder = FeatureBuilder(
+            velocity_window=config.prediction.velocity_window,
+            vol_window=config.prediction.vol_window,
+        )
+        self.prediction_model = None
+        if config.prediction.enabled:
+            self.prediction_model = ProbabilityModel(model_path=config.prediction.model_path)
+            logger.info("🧪 Probabilistic prediction layer enabled")
+
+        # Dynamic risk sizing
+        self.risk_sizer = RiskSizer(
+            RiskSizingConfig(
+                enabled=config.risk_sizing.enabled,
+                target_volatility=config.risk_sizing.target_volatility,
+                kelly_cap=config.risk_sizing.kelly_cap,
+                max_exposure_pct=config.risk_sizing.max_exposure_pct,
+                min_trade_usd=config.risk_sizing.min_trade_usd,
+            )
+        )
+
+        # Monitoring
+        self.metrics = MetricsCollector(
+            MetricsConfig(
+                enabled=config.monitoring.enabled,
+                output_path=config.monitoring.output_path,
+                rolling_window=config.monitoring.rolling_window,
+            )
+        )
+
+        # EV-based ML engine
+        self.ml_engine = None
+        self.ml_policy = None
+        if config.ml_engine.enabled:
+            try:
+                bundle = ModelBundle(config.ml_engine.bundle_path)
+                self.ml_engine = InferenceEngine(bundle)
+                self.ml_policy = Policy(
+                    PolicyConfig(
+                        min_ev=config.ml_engine.min_ev,
+                        max_uncertainty=config.ml_engine.max_uncertainty,
+                        max_spread=config.ml_engine.max_spread,
+                        min_depth=config.ml_engine.min_depth,
+                        max_exposure_pct=config.ml_engine.max_exposure_pct,
+                        ev_sizing_scale=config.ml_engine.ev_sizing_scale,
+                        target_volatility=config.ml_engine.target_volatility,
+                    )
+                )
+                logger.info("🧠 EV-based ML engine enabled")
+            except Exception as e:
+                logger.error(f"Failed to load ML bundle: {e}")
+                self.ml_engine = None
+                self.ml_policy = None
 
         # ML Signal Predictor
         self.ml_predictor: Optional[MLSignalPredictor] = None
@@ -126,6 +205,24 @@ class TradingBot:
             )
         else:
             logger.info("🤖 ML disabled (set ML_ENABLED=true to enable)")
+
+        # Optional ML interface (bundle-aware)
+        self.ml_interface: Optional[MLInterface] = None
+        bundle_path = os.getenv("ML_BUNDLE") or os.getenv("ML_BUNDLE_PATH") or None
+        min_edge_env = os.getenv("ML_MIN_EDGE", "0.02")
+        try:
+            min_edge = float(min_edge_env)
+        except ValueError:
+            min_edge = 0.02
+        if bundle_path or config.trading.ml_enabled:
+            if bundle_path:
+                logger.info(f"ML bundle path resolved: {bundle_path}")
+            self.ml_interface = MLPredictor(
+                min_confidence=config.trading.ml_min_confidence,
+                min_samples=config.trading.ml_min_samples,
+                bundle_path=bundle_path,
+                min_edge=min_edge,
+            )
 
         # Settlement verifier (on-chain verification via The Graph)
         self.settlement_verifier = get_settlement_verifier()
@@ -156,6 +253,11 @@ class TradingBot:
         self._logged_rejections: set[str] = set()
         self._last_rejection_clear: Optional[datetime] = None
         self._rejection_clear_interval = 30.0  # Clear rejections every 30s to re-log
+        self._ml_decision_log_ts: dict[str, float] = {}
+        self._signal_log_ts: dict[str, float] = {}
+        self._price_log_ts: dict[str, float] = {}
+        self._order_submit_ts: deque[float] = deque()
+        self._last_order_time_by_market: dict[tuple[str, str], float] = {}
 
         # Status logging throttle - log status every 30 seconds instead of randomly
         self._last_status_log: Optional[datetime] = None
@@ -190,6 +292,23 @@ class TradingBot:
         self._period_transition_wait_until: Optional[datetime] = None  # Wait for price data
         self._captured_period_prices: dict[str, float] = {}  # asset -> price captured at period boundary
 
+        # Active market tracking per asset - used to detect market transitions and cancel stale orders
+        # Key: asset (BTC, ETH, etc.), Value: condition_id of the currently active market
+        self._active_market_per_asset: dict[str, str] = {}
+
+        # Safety guard for order submission (initialized lazily via get_safety_guard())
+        self.safety_guard: Optional[OrderSafetyGuard] = None
+
+        # State persistence
+        state_file = config.paper_trading.state_file if config.paper_trading.enabled else "bot_state.json"
+        self.state_manager = BotStateManager(state_file)
+        self._last_state_save: Optional[datetime] = None
+        self._state_save_interval = 60.0  # Save state every 60 seconds
+
+        # Period boundary deduplication - prevent concurrent transitions
+        self._period_boundary_lock = asyncio.Lock()
+        self._last_handled_period_ts: int = 0  # Last period we completed transition for
+
         # Intervals (seconds)
         self.settlement_check_interval = 5.0  # Check settlements frequently
         self.market_discovery_interval = 15.0  # Discover new markets every 15s
@@ -204,6 +323,11 @@ class TradingBot:
         self._ml_synced_trades: set[str] = set()  # Set of trade IDs already synced to ML
         self.ml_sync_interval = 60.0  # Sync ML every 60 seconds
         self.last_ml_sync = None  # Track last ML sync time
+
+        # ORDER_BLOCK log throttling - prevent spam for repeated blocks
+        # Key: "asset:reason" -> last log timestamp
+        self._order_block_log_ts: dict[str, float] = {}
+        self._order_block_log_interval = 15.0  # Only log same block once per 15s
 
         # Control flags
         self._running = False
@@ -230,26 +354,66 @@ class TradingBot:
                 logger.error(f"Config error: {error}")
             return False
 
-        # Always try to create trading client to fetch account info
-        # (even in dry-run mode, we want to show real balance if configured)
-        self.client = create_trading_client(self.config)
-
-        if not self.config.dry_run:
-            if not self.client:
-                logger.error("Failed to create trading client")
-                return False
-
-            self.executor = OrderExecutor(
-                client=self.client,
-                config=self.config,
+        if self.config.paper_trading.enabled:
+            logger.info("📝 Paper trading enabled - using simulated execution")
+            self.client = None
+            self.executor = PaperOrderExecutor(
+                PaperTradingConfig(
+                    enabled=True,
+                    initial_balance=self.config.paper_trading.initial_balance,
+                    maker_fee_bps=self.config.paper_trading.maker_fee_bps,
+                    taker_fee_bps=self.config.paper_trading.taker_fee_bps,
+                    slippage_bps=self.config.paper_trading.slippage_bps,
+                ),
+                self.clob_feed,
             )
         else:
-            logger.info("Running in DRY RUN mode - no actual trades")
-            # Create dummy executor for dry run
-            self.executor = OrderExecutor(
-                client=None,
-                config=self.config,
-            )
+            # Always try to create trading client to fetch account info
+            # (even in dry-run mode, we want to show real balance if configured)
+            self.client = create_trading_client(self.config)
+
+            if not self.config.dry_run:
+                if not self.client:
+                    logger.error("Failed to create trading client")
+                    return False
+
+                self.executor = OrderExecutor(
+                    client=self.client,
+                    config=self.config,
+                )
+            else:
+                logger.info("Running in DRY RUN mode - no actual trades")
+                # Create dummy executor for dry run
+                self.executor = OrderExecutor(
+                    client=None,
+                    config=self.config,
+                )
+
+        # Smart order router
+        self.smart_router = SmartOrderRouter(
+            SmartRouterConfig(
+                enabled=self.config.execution.smart_router_enabled,
+                maker_edge_threshold=self.config.execution.maker_edge_threshold,
+                taker_edge_threshold=self.config.execution.taker_edge_threshold,
+                max_spread=self.config.execution.max_spread,
+                stale_order_seconds=self.config.execution.stale_order_seconds,
+            ),
+            self.executor,
+            self.clob_feed,
+        )
+
+        # Log executor path for debugging
+        executor_class = type(self.executor).__name__
+        executor_module = type(self.executor).__module__
+        mode = "PAPER" if self.config.paper_trading.enabled else ("DRY" if self.config.dry_run else "LIVE")
+        router_status = "enabled" if self.config.execution.smart_router_enabled else "disabled"
+        logger.info(
+            "EXECUTOR_PATH class=%s module=%s mode=%s smart_router=%s",
+            executor_class, executor_module, mode, router_status
+        )
+
+        # Initialize safety guard for order submission limits
+        self.safety_guard = get_safety_guard()
 
         # Display startup info (balance, account status, etc.)
         await self._display_startup_info()
@@ -260,6 +424,19 @@ class TradingBot:
             logger.error("Cannot start: No bankroll available")
             return False
         self.risk_manager.initialize(initial_bankroll)
+
+        # Restore persisted state (overwrites defaults if saved state exists)
+        saved_state = self.state_manager.load()
+        if saved_state:
+            self.state_manager.restore_risk_manager(self.risk_manager, saved_state)
+            if self.config.paper_trading.enabled and hasattr(self.executor, 'account'):
+                self.state_manager.restore_paper_executor(self.executor, saved_state)
+            logger.info(
+                "STATE_RESTORED bankroll=%.2f peak=%.2f positions=%d",
+                self.risk_manager.current_bankroll,
+                self.risk_manager.peak_bankroll,
+                len(self.risk_manager.positions),
+            )
 
         # Sync existing orders to prevent duplicates
         await self._sync_existing_orders(force=True)
@@ -298,6 +475,12 @@ class TradingBot:
             elapsed = (now - self.last_orders_sync).total_seconds()
             if elapsed < self.orders_sync_interval:
                 return
+
+        if self.config.paper_trading.enabled and isinstance(self.executor, PaperOrderExecutor):
+            balance = self.executor.get_balance()
+            self.risk_manager.sync_bankroll(balance)
+            self.last_balance_sync = now
+            return
 
         if self.client is None:
             return
@@ -421,6 +604,34 @@ class TradingBot:
         except Exception as e:
             logger.debug(f"Balance sync failed: {e}")
 
+    def _refresh_paper_quotes(self):
+        """
+        Feed current market quotes into the paper executor's quote cache.
+
+        Must run every tick (not just when pending orders exist) so that
+        mark-to-market valuation always has fresh prices. Cache is keyed by
+        token_id so two markets for the same asset cannot collide.
+        """
+        if not self.config.paper_trading.enabled:
+            return
+        if not self.executor or not hasattr(self.executor, 'update_quotes'):
+            return
+
+        for mkt in list(self.markets.values()) + list(self.expiring_markets.values()):
+            if mkt.best_bid and mkt.best_ask:
+                # YES (UP) token quotes come directly from MarketState
+                self.executor.update_quotes(
+                    mkt.up_token_id, mkt.best_bid, mkt.best_ask,
+                    market_id=mkt.condition_id, source="market_state_up",
+                )
+                # NO (DOWN) token quotes are derived (complement of UP book)
+                no_bid = 1.0 - mkt.best_ask  # best we can sell NO at
+                no_ask = 1.0 - mkt.best_bid  # best we can buy NO at
+                self.executor.update_quotes(
+                    mkt.down_token_id, no_bid, no_ask,
+                    market_id=mkt.condition_id, source="market_state_down_derived",
+                )
+
     async def _check_pending_orders(self):
         """
         Check pending orders for fills and update positions accordingly.
@@ -438,18 +649,32 @@ class TradingBot:
 
         self.last_order_check = now
 
-        if not self._pending_orders:
+        async with self._pending_orders_lock:
+            if not self._pending_orders:
+                return
+            pending_items = list(self._pending_orders.items())
+
+        if self.executor is None:
             return
 
-        if self.client is None or self.executor is None:
-            return
+        # For paper trading, feed market quotes into executor, then run fill simulation
+        is_paper = self.config.paper_trading.enabled
+        self._refresh_paper_quotes()
+        if is_paper and hasattr(self.executor, 'check_pending_orders'):
+            filled_paper_orders = self.executor.check_pending_orders()
+            if filled_paper_orders:
+                logger.info(
+                    "PAPER_FILL_CHECK filled=%d pending_executor=%d",
+                    len(filled_paper_orders),
+                    self.executor.get_pending_count() if hasattr(self.executor, 'get_pending_count') else 0
+                )
 
         # Log that we're checking pending orders
-        logger.debug(f"Checking {len(self._pending_orders)} pending orders...")
+        logger.debug(f"Checking {len(pending_items)} pending orders... (paper={is_paper})")
 
         orders_to_remove = []
 
-        for order_id, order_data in list(self._pending_orders.items()):
+        for order_id, order_data in pending_items:
             try:
                 asset = order_data.get("asset", "???")
                 placed_time = order_data.get("placed_time")
@@ -476,9 +701,15 @@ class TradingBot:
                 asset = order_data.get("asset", signal.market.asset if signal else "???")
 
                 # Log the status we received
+                side_val = order_data.get("side", "???")
+                market_id_val = order_data.get("market_id", "????????")
+                limit_price_val = order_data.get("price", 0)
+                remaining = order_info.size - order_info.filled_size if order_info.size else 0
                 logger.info(
-                    f"📋 Order {order_id[:8]}... ({asset}): status={order_info.status.value} | "
-                    f"filled={order_info.filled_size:.2f} | wait={wait_time:.0f}s"
+                    f"📋 Order {order_id[:8]}... market={market_id_val[:8]} side={side_val} "
+                    f"limit={limit_price_val:.4f} status={order_info.status.value} "
+                    f"filled={order_info.filled_size:.2f} remaining={remaining:.2f} "
+                    f"age={wait_time:.0f}s"
                 )
 
                 if order_info.status.value == "FILLED":
@@ -700,12 +931,15 @@ class TradingBot:
                         del self._last_order_time[asset]
 
         # Remove processed orders
-        for order_id in orders_to_remove:
-            self._pending_orders.pop(order_id, None)
+        if orders_to_remove:
+            async with self._pending_orders_lock:
+                for order_id in orders_to_remove:
+                    self._pending_orders.pop(order_id, None)
 
         # Log pending orders count
-        if self._pending_orders:
-            logger.debug(f"Pending orders: {len(self._pending_orders)}")
+        async with self._pending_orders_lock:
+            if self._pending_orders:
+                logger.debug(f"Pending orders: {len(self._pending_orders)}")
 
     async def _display_startup_info(self):
         """
@@ -714,15 +948,20 @@ class TradingBot:
         Shows balance, trading mode, and key configuration parameters
         regardless of whether running in simulation or live mode.
         """
-        mode = "SIMULATION" if self.config.dry_run else "LIVE TRADING"
+        if self.config.paper_trading.enabled:
+            mode = "PAPER TRADING"
+        else:
+            mode = "SIMULATION" if self.config.dry_run else "LIVE TRADING"
         trading_mode = self.config.trading.mode.upper()
 
         balance = None
         open_orders_count = 0
         positions_count = 0
 
+        if self.config.paper_trading.enabled and isinstance(self.executor, PaperOrderExecutor):
+            balance = self.executor.get_balance()
         # Try to fetch real account info if client is available and configured
-        if self.client is not None:
+        elif self.client is not None:
             try:
                 # Fetch balance using SDK
                 balance = get_account_balance(self.client)
@@ -899,8 +1138,12 @@ class TradingBot:
         self._running = False
         self._shutdown_event.set()
 
-        # Cancel any open orders
-        if self.executor and not self.config.dry_run:
+        # Save state before disconnecting
+        if self.state_manager:
+            self.state_manager.save(self.risk_manager, self.markets)
+
+        # Cancel any open orders (only for live executor, not paper)
+        if self.executor and not self.config.dry_run and hasattr(self.executor, 'cancel_all_orders'):
             self.executor.cancel_all_orders()
 
         # Disconnect data feeds
@@ -937,6 +1180,10 @@ class TradingBot:
         Returns:
             USDC balance, or fallback amount in dry run mode
         """
+        if self.config.paper_trading.enabled:
+            logger.info(f"[PAPER] Using virtual bankroll: ${self.config.paper_trading.initial_balance:.2f}")
+            return self.config.paper_trading.initial_balance
+
         if self.config.dry_run:
             # Use configured fallback for dry run
             fallback = (
@@ -991,6 +1238,62 @@ class TradingBot:
             await self.binance_feed.connect_async()
         except Exception as e:
             logger.error(f"Binance feed error: {e}")
+
+    def _check_data_health(self) -> tuple[bool, str]:
+        """
+        Check if data feeds are healthy enough for trading.
+
+        Returns:
+            Tuple of (is_healthy, reason_if_not).
+            is_healthy=True means all feeds are fresh and connected.
+        """
+        max_stale_sec = 60.0  # Max seconds before data is considered stale
+
+        # Check circuit breakers
+        chainlink_ok = not self.chainlink_feed._circuit_open
+        clob_ok = not self.clob_feed._circuit_open
+
+        if not chainlink_ok and not clob_ok:
+            reason = "Both Chainlink and CLOB circuit breakers open"
+            logger.warning("DATA_HEALTH FAIL: %s", reason)
+            return (False, reason)
+
+        if not chainlink_ok:
+            reason = "Chainlink circuit breaker open"
+            logger.warning("DATA_HEALTH DEGRADED: %s", reason)
+            return (False, reason)
+
+        if not clob_ok:
+            reason = "CLOB circuit breaker open"
+            logger.warning("DATA_HEALTH DEGRADED: %s", reason)
+            return (False, reason)
+
+        # Check connection state
+        if not self.chainlink_feed.is_connected:
+            reason = "Chainlink feed disconnected"
+            logger.warning("DATA_HEALTH FAIL: %s", reason)
+            return (False, reason)
+
+        if not self.clob_feed.is_connected:
+            reason = "CLOB feed disconnected"
+            logger.warning("DATA_HEALTH FAIL: %s", reason)
+            return (False, reason)
+
+        # Check CLOB orderbook freshness for active markets
+        now = datetime.now(timezone.utc)
+        for market in self.markets.values():
+            ob = self.clob_feed.get_orderbook(market.up_token_id)
+            if ob and ob.timestamp:
+                age = (now - ob.timestamp).total_seconds()
+                if age > max_stale_sec:
+                    reason = (
+                        f"CLOB orderbook stale for {market.asset} "
+                        f"({age:.0f}s old, max {max_stale_sec:.0f}s)"
+                    )
+                    logger.warning("DATA_HEALTH STALE: %s", reason)
+                    return (False, reason)
+
+        return (True, "")
 
     async def _run_trading_loop(self):
         """Main trading loop - handles market discovery and signal execution."""
@@ -1093,18 +1396,14 @@ class TradingBot:
                             f"{' | '.join(price_summary)}"
                         )
 
-                # Check if data feeds are healthy (circuit breakers)
-                if self.chainlink_feed._circuit_open and self.clob_feed._circuit_open:
-                    logger.critical(
-                        "CRITICAL: Both data feeds have circuit breakers open. "
-                        "Trading halted until feeds recover."
-                    )
-                    await asyncio.sleep(30.0)
+                # Check data feed health before trading
+                data_ok, data_reason = self._check_data_health()
+                if not data_ok:
+                    logger.warning("DATA_HEALTH gate: %s — skipping trade cycle", data_reason)
+                    # Still run settlement and expiry checks even with degraded data
+                    await self._check_expiring_markets()
+                    await asyncio.sleep(10.0)
                     continue
-                elif self.chainlink_feed._circuit_open:
-                    logger.warning("Chainlink feed circuit breaker open - trading with stale prices")
-                elif self.clob_feed._circuit_open:
-                    logger.warning("CLOB feed circuit breaker open - trading with stale order books")
 
                 # Binance feed is optional (confirmation only) - just log if down
                 # Only check circuit breaker when using direct Binance connection
@@ -1128,12 +1427,20 @@ class TradingBot:
                 # Move expiring markets out of active trading
                 await self._check_expiring_markets()
 
+                # Refresh paper quote cache every tick so mark-to-market is fresh
+                self._refresh_paper_quotes()
+
                 # Log position status periodically (every 30s)
                 self._log_position_status()
 
                 # Calculate equity (cash + unrealized position value)
                 # This prevents false drawdown triggers when positions are open
-                equity = self._calculate_equity()
+                # Reuse cached value if _log_position_status just computed it
+                detail = getattr(self, '_last_equity_detail', None)
+                equity = detail["equity"] if detail else self._calculate_equity()
+
+                # Update peak equity (only increases, never decreases)
+                self.risk_manager.update_peak_equity(equity)
 
                 # Check if trading is allowed (use equity for drawdown check)
                 can_trade, reason = self.risk_manager.can_trade(equity=equity)
@@ -1184,6 +1491,15 @@ class TradingBot:
                     # Sequential execution
                     for market in sorted_markets:
                         await self._process_market(market)
+
+                # Periodic state save (crash protection)
+                now_save = datetime.now(timezone.utc)
+                if (
+                    self._last_state_save is None
+                    or (now_save - self._last_state_save).total_seconds() >= self._state_save_interval
+                ):
+                    self.state_manager.save(self.risk_manager, self.markets)
+                    self._last_state_save = now_save
 
                 # Wait before next iteration
                 await asyncio.sleep(self.config.loop_interval)
@@ -1290,48 +1606,60 @@ class TradingBot:
         # Calculate current 15-minute period (rounds down to :00, :15, :30, :45)
         current_period_ts = (current_ts // 900) * 900
 
-        # Detect period boundary crossing
+        # Detect period boundary crossing with single-flight lock
         if self._current_period_ts > 0 and current_period_ts != self._current_period_ts:
-            logger.info(
-                f"⏰ PERIOD BOUNDARY: Transitioning from {self._current_period_ts} "
-                f"to {current_period_ts}"
-            )
+            # Use lock to ensure only one transition runs at a time
+            async with self._period_boundary_lock:
+                # Double-check after acquiring lock (another coroutine may have handled it)
+                if self._last_handled_period_ts >= current_period_ts:
+                    # Already handled this transition, skip
+                    self._current_period_ts = current_period_ts
+                    return
 
-            # REAL-TIME: Capture current Chainlink prices as target prices for new period
-            # This eliminates the need to wait for the API
-            self._capture_period_boundary_prices(current_period_ts)
+                # Mark this period as being handled IMMEDIATELY to prevent duplicates
+                # (even if we return early during wait phase)
+                self._last_handled_period_ts = current_period_ts
 
-            # Brief wait to ensure price capture is stable (reduced from 15s to 2s)
-            if self._period_transition_wait_until is None:
-                wait_seconds = self.period_transition_delay
-                self._period_transition_wait_until = now + timedelta(seconds=wait_seconds)
-                logger.debug(f"Brief {wait_seconds}s stabilization wait...")
+                logger.info(
+                    f"⏰ PERIOD BOUNDARY: Transitioning from {self._current_period_ts} "
+                    f"to {current_period_ts}"
+                )
 
-            # If still waiting, don't refresh yet
-            if now < self._period_transition_wait_until:
-                return
+                # REAL-TIME: Capture current Chainlink prices as target prices for new period
+                # This eliminates the need to wait for the API
+                self._capture_period_boundary_prices(current_period_ts)
 
-            # Transition complete - clear old data and proceed
-            logger.info("✅ Period transition complete - using captured prices")
-            self._period_transition_wait_until = None
+                # Brief wait to ensure price capture is stable (reduced from 15s to 2s)
+                if self._period_transition_wait_until is None:
+                    wait_seconds = self.period_transition_delay
+                    self._period_transition_wait_until = now + timedelta(seconds=wait_seconds)
+                    logger.debug(f"Brief {wait_seconds}s stabilization wait...")
 
-            # Clear stale target price cache
-            self.gamma_api.clear_stale_price_cache(current_period_ts)
+                # If still waiting, don't refresh yet (but dedup flag is already set)
+                if now < self._period_transition_wait_until:
+                    return
 
-            # Inject captured prices into gamma API cache for immediate use
-            self._inject_captured_prices_to_gamma(current_period_ts)
+                # Transition complete - clear old data and proceed
+                logger.info("✅ Period transition complete - using captured prices")
+                self._period_transition_wait_until = None
 
-            # Clear markets from old period (they should be in expiring/settled by now)
-            async with self._markets_lock:
-                old_markets = list(self.markets.keys())
-                for market_id in old_markets:
-                    market = self.markets.get(market_id)
-                    if market and market.time_remaining <= 0:
-                        self.markets.pop(market_id, None)
-                        logger.debug(f"Removed expired market: {market.asset}")
+                # Clear stale target price cache
+                self.gamma_api.clear_stale_price_cache(current_period_ts)
 
-            # Force refresh by clearing last_market_refresh
-            self.last_market_refresh = None
+                # Inject captured prices into gamma API cache for immediate use
+                self._inject_captured_prices_to_gamma(current_period_ts)
+
+                # Clear markets from old period (they should be in expiring/settled by now)
+                async with self._markets_lock:
+                    old_markets = list(self.markets.keys())
+                    for market_id in old_markets:
+                        market = self.markets.get(market_id)
+                        if market and market.time_remaining <= 0:
+                            self.markets.pop(market_id, None)
+                            logger.debug(f"Removed expired market: {market.asset}")
+
+                # Force refresh by clearing last_market_refresh
+                self.last_market_refresh = None
 
         # Update current period tracking
         self._current_period_ts = current_period_ts
@@ -1343,6 +1671,9 @@ class TradingBot:
                 return
 
         logger.debug("Refreshing active markets...")
+
+        # Collect stale order cancellations to run outside the lock
+        stale_cancellations: list[tuple[str, str]] = []  # [(asset, old_market_id), ...]
 
         try:
             # Fetch active 15-min crypto markets
@@ -1374,6 +1705,19 @@ class TradingBot:
                         self.clob_feed.subscribe(market.up_token_id)
                         self.clob_feed.subscribe(market.down_token_id)
 
+                        # Check for market transition - collect for cancellation outside lock
+                        asset = market.asset
+                        old_market_id = self._active_market_per_asset.get(asset)
+                        if old_market_id and old_market_id != market_id:
+                            # Market transition detected - queue for cancellation
+                            stale_cancellations.append((asset, old_market_id))
+
+                        # Update active market tracking (both local and safety guard)
+                        self._active_market_per_asset[asset] = market_id
+                        guard = self.safety_guard or get_safety_guard()
+                        if guard:
+                            guard.set_active_market(asset, market_id)
+
                         # Target price is now fetched from Polymarket API in gamma.py
                         logger.info(
                             f"NEW MARKET: {market.asset} | "
@@ -1397,6 +1741,10 @@ class TradingBot:
                             existing.target_price = market.target_price
 
             self.last_market_refresh = now
+
+            # Run stale order cancellations outside the lock (once per transition)
+            for asset, old_market_id in stale_cancellations:
+                await self._cancel_stale_orders(asset, old_market_id)
 
             # Clear old rejection logs for settled markets
             self._logged_rejections = {
@@ -1432,6 +1780,32 @@ class TradingBot:
             # Move them to expiring queue
             for market_id in markets_to_expire:
                 market = self.markets.pop(market_id)
+
+                # Snapshot Chainlink price at expiry for local resolution
+                # Only set once (guard against duplicate snapshots on re-entry)
+                if market.expiry_chainlink_price is None:
+                    try:
+                        snap_price = self.signal_generator.get_price(market.asset)
+                        market.expiry_chainlink_price = snap_price
+                        tr = market.time_remaining
+                        if tr < -5.0:
+                            logger.warning(
+                                "EXPIRY_SNAPSHOT_LATE market=%s asset=%s "
+                                "chainlink=%.2f target=%.2f time_remaining=%.1fs "
+                                "(snapshot taken >5s after expiry)",
+                                market_id[:8], market.asset,
+                                snap_price or 0, market.target_price, tr,
+                            )
+                        else:
+                            logger.info(
+                                "EXPIRY_SNAPSHOT market=%s asset=%s "
+                                "chainlink=%.2f target=%.2f time_remaining=%.1fs",
+                                market_id[:8], market.asset,
+                                snap_price or 0, market.target_price, tr,
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to snapshot expiry price for {market.asset}: {e}")
+
                 self.expiring_markets[market_id] = market
 
                 # Cancel any pending orders for this market's asset
@@ -1463,24 +1837,172 @@ class TradingBot:
         Args:
             asset: Asset symbol (BTC, ETH, SOL, XRP)
         """
-        if not self._pending_orders:
-            return
+        async with self._pending_orders_lock:
+            if not self._pending_orders:
+                return
+            pending_items = list(self._pending_orders.items())
 
         orders_to_cancel = []
-        for order_id, order_data in self._pending_orders.items():
+        for order_id, order_data in pending_items:
             if order_data.get("asset") == asset:
                 orders_to_cancel.append(order_id)
 
-        for order_id in orders_to_cancel:
+        if orders_to_cancel:
+            async with self._pending_orders_lock:
+                for order_id in orders_to_cancel:
+                    try:
+                        if self.executor:
+                            logger.info(f"Cancelling pending order for {asset} (market expiring)")
+                            self.executor.cancel_order(order_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel order {order_id[:16]}...: {e}")
+                    finally:
+                        # Remove from pending regardless of cancel success
+                        self._pending_orders.pop(order_id, None)
+
+    async def _cancel_stale_orders(self, asset: str, old_market_id: str):
+        """
+        Cancel all orders for an old market when a new market becomes active.
+
+        Called during market transitions (period rollovers) to prevent stale orders
+        from the old market from getting filled incorrectly.
+
+        This method is wrapped in try/except to prevent exceptions from propagating
+        and causing "Task exception was never retrieved" errors.
+
+        Args:
+            asset: Asset symbol (BTC, ETH, SOL, XRP)
+            old_market_id: condition_id of the old market being replaced
+        """
+        try:
+            await self._cancel_stale_orders_impl(asset, old_market_id)
+        except Exception as e:
+            logger.error(
+                f"ORDER_CANCEL_ERROR asset={asset} market={old_market_id[:8]} "
+                f"error={str(e)[:100]}"
+            )
+            logger.debug("Stale order cancellation traceback:", exc_info=True)
+
+    async def _cancel_stale_orders_impl(self, asset: str, old_market_id: str):
+        """Internal implementation of stale order cancellation."""
+        cancelled = 0
+        already_filled = 0
+        not_found = 0
+        failed = 0
+        orders_found = []
+
+        is_paper = self.config.paper_trading.enabled
+
+        # 0. Log paper order registry state for diagnostics
+        if is_paper and self.executor and hasattr(self.executor, '_pending_orders'):
+            with self.executor._orders_lock:
+                executor_pending = list(self.executor._pending_orders.keys())
+                executor_filled = list(self.executor._filled_orders.keys())
+                stale_in_executor = [
+                    oid for oid, order in self.executor._pending_orders.items()
+                    if order.asset == asset and order.market_id == old_market_id
+                ]
+            logger.info(
+                f"PAPER_ORDER_REGISTRY_DUMP asset={asset} old_market={old_market_id[:8]} "
+                f"executor_pending={len(executor_pending)} executor_filled={len(executor_filled)} "
+                f"stale_in_executor={len(stale_in_executor)} stale_ids={[o[:12] for o in stale_in_executor]}"
+            )
+
+        # 1. Collect orders from local pending tracking
+        async with self._pending_orders_lock:
+            pending_items = list(self._pending_orders.items())
+
+        for order_id, order_data in pending_items:
+            order_market_id = order_data.get("market_id", "")
+            if order_data.get("asset") == asset and order_market_id == old_market_id:
+                orders_found.append((order_id, order_data.get("side", "UNKNOWN")))
+
+        # 2. Also check safety guard's open orders tracking (with defensive None check)
+        guard = self.safety_guard or get_safety_guard()
+        if guard:
+            with guard._lock:
+                for (a, m, s), oid in list(guard._open_orders.items()):
+                    if a == asset and m == old_market_id:
+                        if (oid, s) not in orders_found:
+                            orders_found.append((oid, s))
+
+        order_count = len(orders_found)
+        if order_count == 0:
+            logger.debug(
+                f"ORDER_CANCEL_REQUEST asset={asset} market={old_market_id[:8]} order_count=0 "
+                f"reason=market_transition (no orders to cancel)"
+            )
+            return
+
+        # Log ORDER_CANCEL_REQUEST
+        logger.info(
+            f"ORDER_CANCEL_REQUEST asset={asset} market={old_market_id[:8]} order_count={order_count} "
+            f"reason=market_transition"
+        )
+
+        # 3. Cancel each order (both in executor and local tracking)
+        for order_id, side in orders_found:
             try:
-                if self.executor:
-                    logger.info(f"Cancelling pending order for {asset} (market expiring)")
-                    self.executor.cancel_order(order_id)
+                # Cancel in executor (works for both paper and live)
+                if self.executor and hasattr(self.executor, 'cancel_order'):
+                    result = self.executor.cancel_order(order_id)
+                    # Handle both old (bool) and new (tuple) return types
+                    if isinstance(result, tuple):
+                        success, reason = result
+                    else:
+                        success, reason = result, "ok" if result else "failed"
+                else:
+                    success, reason = True, "no_executor"
+
+                if success:
+                    if reason == "cancelled":
+                        cancelled += 1
+                    elif reason == "already_filled":
+                        already_filled += 1
+                    elif reason == "not_found":
+                        not_found += 1
+                    else:
+                        cancelled += 1  # Generic success
+
+                    logger.info(
+                        f"ORDER_CANCEL_RESULT asset={asset} market={old_market_id[:8]} "
+                        f"order_id={order_id[:12]} side={side} status=success reason={reason}"
+                    )
+                else:
+                    failed += 1
+                    logger.warning(
+                        f"ORDER_CANCEL_RESULT asset={asset} market={old_market_id[:8]} "
+                        f"order_id={order_id[:12]} side={side} status=failed reason={reason}"
+                    )
             except Exception as e:
-                logger.warning(f"Failed to cancel order {order_id[:16]}...: {e}")
-            finally:
-                # Remove from pending regardless of cancel success
+                failed += 1
+                logger.warning(
+                    f"ORDER_CANCEL_RESULT asset={asset} market={old_market_id[:8]} "
+                    f"order_id={order_id[:12]} side={side} status=error error={str(e)[:50]}"
+                )
+
+        # 4. Clear from local tracking regardless of cancel success
+        async with self._pending_orders_lock:
+            for order_id, _ in orders_found:
                 self._pending_orders.pop(order_id, None)
+
+        # 5. Clear from safety guard (with defensive None check)
+        guard = self.safety_guard or get_safety_guard()
+        if guard:
+            with guard._lock:
+                keys_to_remove = [
+                    k for k in guard._open_orders
+                    if k[0] == asset and k[1] == old_market_id
+                ]
+                for key in keys_to_remove:
+                    del guard._open_orders[key]
+
+        # Log ORDER_CANCEL_SUMMARY with detailed breakdown
+        mode = "paper" if is_paper else "live"
+        logger.info(
+            f"ORDER_CANCEL_SUMMARY asset={asset} market={old_market_id[:8]} "
+            f"cancelled={cancelled} already_filled={already_filled} not_found={not_found} failed={failed} mode={mode}"
+        )
 
     async def _check_early_exits(self):
         """
@@ -1550,6 +2072,19 @@ class TradingBot:
                     )
                     await self._execute_early_exit(market, position, current_price, "stop_loss")
                     continue
+
+                # Time-based exit if edge decays near settlement
+                if trading.time_exit_enabled and market.time_remaining <= trading.time_exit_seconds:
+                    decay_signal = self.signal_generator.generate_signal(market)
+                    decay_edge = decay_signal.edge if decay_signal else 0.0
+                    if decay_edge < trading.exit_edge_threshold:
+                        logger.info(
+                            f"{Colors.BRIGHT_YELLOW}⏱️ TIME EXIT: {market.asset} {position.side.value} | "
+                            f"Edge {decay_edge:.2%} < {trading.exit_edge_threshold:.2%} | "
+                            f"{market.time_remaining:.0f}s remaining{Colors.RESET}"
+                        )
+                        await self._execute_early_exit(market, position, current_price, "time_exit")
+                        continue
 
                 # === CHART-BASED POSITION MONITORING ===
                 # Check 15m chart to decide: hold, close, or DCA
@@ -1671,7 +2206,30 @@ class TradingBot:
         )
 
         # Execute the order
-        result = self.executor.execute_signal(signal)
+        start_exec = time.perf_counter()
+        try:
+            if self.smart_router:
+                result = await self.smart_router.execute(signal)
+            else:
+                result = await self.executor.execute_signal_async(signal)
+        except Exception as e:
+            logger.error(
+                "ORDER_RESULT asset=%s side=%s status=exception error=%s mode=%s",
+                asset, signal.side.value, str(e)[:200],
+                "paper" if self.config.paper_trading.enabled else "live"
+            )
+            logger.debug("Chart execution exception traceback:", exc_info=True)
+            return  # Exit gracefully
+        exec_latency_ms = (time.perf_counter() - start_exec) * 1000
+        self.metrics.record_latency("execute_signal", exec_latency_ms)
+
+        ml_ev_info = getattr(signal, "_ml_ev_info", None)
+        if ml_ev_info:
+            logger.info(
+                f"[{asset}] ML_EV p_up={ml_ev_info['p_up']:.3f} ev_up={ml_ev_info['ev_up']:.3f} "
+                f"ev_down={ml_ev_info['ev_down']:.3f} edge_up={ml_ev_info['edge_up']:.3f} "
+                f"edge_down={ml_ev_info['edge_down']:.3f} side={ml_ev_info['side']} result={result.success}"
+            )
 
         if result.success:
             # Calculate new average price
@@ -1716,7 +2274,8 @@ class TradingBot:
             exit_price: Price to sell at
             exit_reason: "take_profit" or "stop_loss"
         """
-        if self.config.dry_run:
+        # In dry run mode (but NOT paper trading), just log and process tracking
+        if self.config.dry_run and not self.config.paper_trading.enabled:
             logger.info(f"[DRY RUN] Would sell {position.shares:.2f} shares at {exit_price:.4f}")
             # Still process the exit for tracking
             pnl = (exit_price - position.entry_price) * position.shares
@@ -1789,6 +2348,7 @@ class TradingBot:
             exit_price=exit_price,
             pnl=pnl,
         )
+        self.metrics.record_trade(market.asset, pnl)
 
         # Record with trade history (mark as early exit)
         trade_history = get_trade_history()
@@ -2041,6 +2601,19 @@ class TradingBot:
                     logger.error(
                         f"SETTLEMENT TIMEOUT: {market.asset} - no resolution after 5 minutes"
                     )
+                    # Force-close any open position as a loss to avoid orphaning
+                    if position:
+                        logger.warning(
+                            f"Force-closing position in {market.asset} as LOSS (timeout)"
+                        )
+                        # Full loss: proceeds = cost_basis + (-cost_basis) = 0
+                        if self.config.paper_trading.enabled and hasattr(self.executor, 'credit_settlement'):
+                            self.executor.credit_settlement(0.0, market.condition_id)
+                        self.risk_manager.record_position_close(
+                            market_key=market.condition_id,
+                            exit_price=0.0,
+                            pnl=-position.cost_basis,
+                        )
                     return True  # Force remove to prevent infinite retry
                 return False  # Retry later
 
@@ -2052,7 +2625,14 @@ class TradingBot:
                 winning_outcome=winning_outcome,
             )
         elif position:
-            logger.warning(f"Have position in {market.asset} but no winning outcome!")
+            logger.warning(f"Have position in {market.asset} but no winning outcome - force-closing as LOSS")
+            if self.config.paper_trading.enabled and hasattr(self.executor, 'credit_settlement'):
+                self.executor.credit_settlement(0.0, market.condition_id)
+            self.risk_manager.record_position_close(
+                market_key=market.condition_id,
+                exit_price=0.0,
+                pnl=-position.cost_basis,
+            )
         else:
             logger.debug(f"No position in {market.asset}, nothing to settle")
 
@@ -2070,33 +2650,53 @@ class TradingBot:
 
     def _determine_outcome_locally(self, market: MarketState) -> tuple[Optional[str], Optional[float]]:
         """
-        Determine market outcome locally using Chainlink price.
+        Determine market outcome locally using Chainlink price snapshot.
+
+        Uses the expiry_chainlink_price (captured when market moved to expiring
+        queue) to avoid using stale/moved live prices after market ends.
 
         For 15-minute crypto markets:
-        - If current price >= target price: UP wins
-        - If current price < target price: DOWN wins
+        - If ref_price >= target price: UP wins
+        - If ref_price < target price: DOWN wins
 
         Args:
             market: Market to determine outcome for
 
         Returns:
-            Tuple of (winning_outcome, current_price) or (None, None) if can't determine
+            Tuple of (winning_outcome, ref_price) or (None, None) if can't determine
         """
-        # Get current Chainlink price for this asset
-        current_price = self.signal_generator.get_price(market.asset)
+        # Prefer snapshot price captured at expiry; fall back to live with warning
+        ref_price = market.expiry_chainlink_price
+        source = "snapshot"
 
-        if current_price is None or current_price <= 0:
+        if ref_price is None or ref_price <= 0:
+            ref_price = self.signal_generator.get_price(market.asset)
+            source = "live_fallback"
+            if ref_price is not None and ref_price > 0:
+                logger.warning(
+                    "LOCAL_RESOLVE_FALLBACK market=%s asset=%s using live price %.2f "
+                    "(no expiry snapshot available)",
+                    market.condition_id[:8], market.asset, ref_price,
+                )
+
+        if ref_price is None or ref_price <= 0:
             return (None, None)
 
         target_price = market.target_price
         if target_price is None or target_price <= 0:
             return (None, None)
 
-        # Determine winner based on price vs target
-        if current_price >= target_price:
-            return ("UP", current_price)
-        else:
-            return ("DOWN", current_price)
+        # Determine winner based on ref price vs target
+        winner = "UP" if ref_price >= target_price else "DOWN"
+
+        logger.info(
+            "LOCAL_RESOLVE market=%s asset=%s ref_price=%.2f target=%.2f "
+            "winner=%s source=%s",
+            market.condition_id[:8], market.asset, ref_price,
+            target_price, winner, source,
+        )
+
+        return (winner, ref_price)
 
     def _record_ml_observation_from_expired_market(
         self,
@@ -2220,26 +2820,52 @@ class TradingBot:
         winning_outcome: str,
     ):
         """
-        Close a position based on market settlement.
+        Close a position based on market settlement using token-ID payout.
+
+        Payout logic (binary market):
+          winning_token = yes_token if winner==UP else no_token
+          payout_per_share = 1.0 if held_token == winning_token else 0.0
+          realized = (payout_per_share - entry_price) * shares
 
         Args:
             market: Settled market
             position: Our position in the market
             winning_outcome: "UP" or "DOWN"
         """
-        # Determine if we won
         position_side = position.side.value  # "UP" or "DOWN"
-        won = position_side == winning_outcome
+
+        # --- Token-ID based payout (authoritative) ---
+        winning_token_id = (
+            market.up_token_id if winning_outcome == "UP"
+            else market.down_token_id
+        )
+
+        # Use explicit held_token_id if available, fall back to token_id
+        held_token = position.held_token_id or position.token_id
+        payout_per_share = 1.0 if held_token == winning_token_id else 0.0
+        won = payout_per_share == 1.0
+
+        # Cross-check: token-ID result should match side-string comparison
+        side_match = (position_side == winning_outcome)
+        if won != side_match:
+            logger.error(
+                "SETTLE_MISMATCH token-based won=%s but side-match=%s | "
+                "side=%s winner=%s held=%s winning_token=%s",
+                won, side_match, position_side, winning_outcome,
+                held_token[:16], winning_token_id[:16],
+            )
 
         # Calculate P&L
-        if won:
-            # Winner pays out $1 per share
-            payout = position.shares * 1.0
-            pnl = payout - position.cost_basis
-        else:
-            # Loser gets nothing
-            payout = 0.0
-            pnl = -position.cost_basis
+        pnl = (payout_per_share - position.entry_price) * position.shares
+
+        # Audit log
+        logger.info(
+            "SETTLE_APPLY market_id=%s asset=%s side=%s held_token=%s "
+            "winning_token=%s payout=%.1f entry=%.4f shares=%.2f realized=%+.2f",
+            market.condition_id[:8], market.asset, position_side,
+            held_token[:16], winning_token_id[:16],
+            payout_per_share, position.entry_price, position.shares, pnl,
+        )
 
         # Color and format the result
         result_color = Colors.BRIGHT_GREEN if won else Colors.BRIGHT_RED
@@ -2258,12 +2884,23 @@ class TradingBot:
         logger.info(f"{result_color}║{Colors.RESET}  P&L: {result_color}${pnl:>+10.2f}{Colors.RESET}  │  ROI: {result_color}{roi:>+7.1f}%{Colors.RESET}  │  Cost: ${position.cost_basis:.2f}     {result_color}║{Colors.RESET}")
         logger.info(f"{result_color}╚══════════════════════════════════════════════════════════════════╝{Colors.RESET}")
 
+        # Credit paper executor BEFORE updating risk manager so that
+        # _sync_existing_orders() will read the correct balance.
+        # proceeds = cost_basis + pnl  (e.g. WIN: $50 cost + $49 pnl = $99)
+        settlement_proceeds = position.cost_basis + pnl
+        if self.config.paper_trading.enabled and hasattr(self.executor, 'credit_settlement'):
+            self.executor.credit_settlement(
+                proceeds=settlement_proceeds,
+                market_id=market.condition_id,
+            )
+
         # Record with risk manager
         self.risk_manager.record_position_close(
             market_key=market.condition_id,
-            exit_price=1.0 if won else 0.0,
+            exit_price=payout_per_share,
             pnl=pnl,
         )
+        self.metrics.record_trade(market.asset, pnl)
 
         # Record with trade history
         trade_history = get_trade_history()
@@ -2271,7 +2908,7 @@ class TradingBot:
             market_id=market.condition_id,
             won=won,
             pnl=pnl,
-            exit_price=1.0 if won else 0.0,
+            exit_price=payout_per_share,
         )
 
         # Track for auto-retraining
@@ -3243,6 +3880,18 @@ class TradingBot:
         if market.time_remaining < self.config.trading.min_time_remaining:
             return
 
+        # === SHORT-CIRCUIT: Skip if we already have position for this asset ===
+        # This avoids generating signals and all downstream processing
+        for pos in self.risk_manager.positions.values():
+            if hasattr(pos, 'market') and pos.market.asset == market.asset:
+                # Already have position - skip all processing (no log, very common)
+                return
+
+        # === SHORT-CIRCUIT: Skip if max positions reached ===
+        if len(self.risk_manager.positions) >= self.config.trading.max_concurrent_positions:
+            # Max positions reached - skip (logged via throttled block later if signal generated)
+            return
+
         # Track when we first saw this market
         market_id = market.condition_id
         now = datetime.now(timezone.utc)
@@ -3310,24 +3959,177 @@ class TradingBot:
         # Update market state from order book
         self._update_market_from_orderbook(market)
 
-        # Generate trading signal
-        signal = self.signal_generator.generate_signal(market)
+        # Generate trading signal (multi-strategy meta-layer or default signal generator)
+        signal = None
+        if self.meta_strategy:
+            price_history = self.signal_generator.price_histories.get(market.asset, [])
+            mid_price = (market.best_bid + market.best_ask) / 2 if market.best_bid and market.best_ask else 0.0
+            orderbook_imbalance = 0.0
+            if market.bid_depth + market.ask_depth > 0:
+                orderbook_imbalance = (market.bid_depth - market.ask_depth) / (market.bid_depth + market.ask_depth)
+
+            price_velocity = 0.0
+            if len(price_history) >= 2 and price_history[-2] > 0:
+                price_velocity = (price_history[-1] - price_history[-2]) / price_history[-2]
+
+            volatility = self.signal_generator.get_volatility(market.asset)
+            ctx = StrategyContext(
+                asset=market.asset,
+                mid_price=mid_price,
+                reference_price=chainlink_price,
+                orderbook_imbalance=orderbook_imbalance,
+                price_velocity=price_velocity,
+                volatility=volatility,
+                time_remaining=market.time_remaining,
+            )
+            meta_signal = self.meta_strategy.generate(ctx)
+            if not meta_signal:
+                logger.debug("ORDER_BLOCK asset=%s reason=meta_strategy_no_signal", market.asset)
+                return
+            self.metrics.record_strategy_performance("meta", meta_signal.edge, meta_signal.confidence)
+            signal = self._signal_from_meta(market, meta_signal, chainlink_price or 0.0)
+        else:
+            signal = self.signal_generator.generate_signal(market)
         if not signal:
+            logger.debug("ORDER_BLOCK asset=%s reason=no_signal_generated", market.asset)
             return
+
+        # Probabilistic prediction layer
+        # NOTE: Only apply prediction model if it AGREES with signal direction
+        # If prediction model gives negative edge, keep signal generator's values
+        if not self.ml_engine and self.prediction_model and self.config.prediction.enabled:
+            price_history = self.signal_generator.price_histories.get(market.asset, [])
+            features = self.feature_builder.build(market, price_history, chainlink_price)
+            pred = self.prediction_model.predict(features)
+            if pred.confidence < self.config.prediction.min_confidence:
+                logger.info(
+                    "ORDER_BLOCK asset=%s reason=prediction_low_confidence conf=%.4f min=%.4f",
+                    market.asset, pred.confidence, self.config.prediction.min_confidence
+                )
+                return
+            market_prob = market.implied_prob_up
+            prob_yes = pred.prob_yes
+            original_edge = signal.edge
+            original_true_prob = signal.true_prob
+            original_side = signal.side.value
+
+            # Calculate what edge would be with prediction model
+            if signal.side == Side.UP:
+                pred_true_prob = prob_yes
+                pred_edge = prob_yes - market_prob
+            else:
+                pred_true_prob = 1 - prob_yes
+                pred_edge = market_prob - prob_yes
+
+            # Only apply prediction if edge stays positive (model agrees with direction)
+            if pred_edge > 0:
+                signal.true_prob = pred_true_prob
+                signal.edge = pred_edge
+                logger.debug(
+                    "PREDICTION_APPLIED asset=%s side=%s edge=%.4f->%.4f prob=%.4f->%.4f",
+                    market.asset, original_side, original_edge, pred_edge,
+                    original_true_prob, pred_true_prob
+                )
+            else:
+                # Keep original signal generator values - prediction model disagrees
+                logger.debug(
+                    "PREDICTION_SKIPPED asset=%s side=%s reason=negative_edge "
+                    "signal_edge=%.4f pred_edge=%.4f prob_yes=%.4f market_prob=%.4f",
+                    market.asset, original_side, original_edge, pred_edge,
+                    prob_yes, market_prob
+                )
+
+        # Dynamic risk sizing
+        if self.config.risk_sizing.enabled:
+            volatility = self.signal_generator.get_volatility(market.asset)
+            market_price = max(0.01, signal.recommended_price)
+            # Debug log to trace edge/prob/price values entering sizing
+            logger.debug(
+                "SIZING_INPUT asset=%s side=%s edge=%.4f true_prob=%.4f market_price=%.4f "
+                "recommended_price=%.4f best_bid=%.4f best_ask=%.4f vol=%.4f bankroll=%.2f",
+                market.asset, signal.side.value, signal.edge, signal.true_prob, market_price,
+                signal.recommended_price, market.best_bid, market.best_ask, volatility,
+                self.risk_manager.current_bankroll
+            )
+            desired_size = self.risk_sizer.size_position(
+                bankroll=self.risk_manager.current_bankroll,
+                edge=signal.edge,
+                prob=signal.true_prob,
+                market_price=market_price,
+                volatility=volatility,
+                base_size=signal.size_usd,
+            )
+            if desired_size <= 0:
+                # Throttle this log to once per 30s per asset to avoid spam
+                block_key = f"{market.asset}:risk_sizing_zero"
+                now_ts = time.time()
+                last_log = getattr(self, '_risk_sizing_log_ts', {}).get(block_key, 0.0)
+                if now_ts - last_log >= 30.0:
+                    if not hasattr(self, '_risk_sizing_log_ts'):
+                        self._risk_sizing_log_ts = {}
+                    self._risk_sizing_log_ts[block_key] = now_ts
+                    logger.info(
+                        "ORDER_BLOCK asset=%s side=%s reason=risk_sizing_zero edge=%.4f vol=%.4f "
+                        "bankroll=%.2f prob=%.4f price=%.4f",
+                        market.asset, signal.side.value, signal.edge, volatility,
+                        self.risk_manager.current_bankroll, signal.true_prob, market_price
+                    )
+                return
+            signal.size_usd = desired_size
+            signal.size_shares = desired_size / market_price
+
+        # Log current Polymarket best prices and computed edge (throttled per asset)
+        now_ts = time.time()
+        last_price_log = self._price_log_ts.get(market.asset, 0.0)
+        if now_ts - last_price_log >= 5.0:
+            yes_bid = market.best_bid or 0.0
+            yes_ask = market.best_ask or 0.0
+            if yes_bid > 0 and yes_ask > 0:
+                no_bid = 1.0 - yes_ask
+                no_ask = 1.0 - yes_bid
+                spread_yes = yes_ask - yes_bid
+                edge_val = float(getattr(signal, "edge", 0.0) or 0.0)
+                logger.info(
+                    "PMKT_PRICES asset=%s yes_bid=%.4f yes_ask=%.4f no_bid=%.4f no_ask=%.4f "
+                    "spread_yes=%.4f edge=%.4f",
+                    market.asset,
+                    yes_bid,
+                    yes_ask,
+                    no_bid,
+                    no_ask,
+                    spread_yes,
+                    edge_val,
+                )
+                self._price_log_ts[market.asset] = now_ts
 
         # Skip signals without action
         if signal.recommended_action == OrderAction.SKIP:
+            logger.info(
+                "ORDER_DECISION asset=%s decision=SKIP edge_used=%.4f min_edge_used=%.4f "
+                "time_remaining=%.0f simple_mode=%s aggressive_mode=%s order_type=%s",
+                market.asset,
+                float(getattr(signal, "edge", 0.0) or 0.0),
+                float(self.config.trading.edge_for_post_only),
+                float(getattr(signal, "time_remaining", 0.0) or 0.0),
+                str(self.config.trading.simple_mode).lower(),
+                str(self.config.trading.aggressive_mode).lower(),
+                str(signal.recommended_action),
+            )
             logger.debug(f"SKIP {market.asset}: {signal.reasoning}")
             return
+
+        # NOTE: ORDER_DECISION=PLACE_ORDER is logged AFTER all gating checks pass,
+        # right before _execute_signal() is called. See line ~4000.
 
         # Validate signal against risk limits (no verbose logging - only log final decision)
         is_valid, reason = self.risk_manager.validate_signal(signal)
         if not is_valid:
-            # Only log blocking reason once per market (cleared every 30s)
-            rejection_key = f"{market.condition_id}:{reason}"
-            if rejection_key not in self._logged_rejections:
-                self._logged_rejections.add(rejection_key)
-                logger.debug(f"[{market.asset}] BLOCKED: {reason}")
+            # Throttle common blocks (max_positions, already_have_position)
+            block_reason = f"risk_manager:{reason.replace(' ', '_')[:30]}"
+            self._log_order_block(
+                market.asset, block_reason,
+                market=market.condition_id[:8], side=signal.side.value
+            )
             return
 
         # Trade history filter - check past performance for this asset/side
@@ -3341,10 +4143,11 @@ class TradingBot:
             min_prediction_accuracy=self.config.trading.history_min_prediction_accuracy,
         )
         if not should_proceed:
-            rejection_key = f"{market.condition_id}:history:{signal.side.value}"
-            if rejection_key not in self._logged_rejections:
-                self._logged_rejections.add(rejection_key)
-                logger.debug(f"[{market.asset}] HISTORY BLOCK: {history_reason}")
+            block_reason = f"trade_history:{history_reason.replace(' ', '_')[:30]}"
+            self._log_order_block(
+                market.asset, block_reason,
+                market=market.condition_id[:8], side=signal.side.value
+            )
             return
 
         # === CHART-BASED FILTER ===
@@ -3371,22 +4174,170 @@ class TradingBot:
 
                     # Block trades that go AGAINST strong chart signals
                     # EXCEPTION: Allow REVERSAL trades (these intentionally go against the trend!)
+                    # Can be disabled with CHART_FILTER_ENABLED=false for testing
                     is_reversal_trade = "REVERSAL" in signal.reasoning.upper()
+                    chart_filter_enabled = getattr(self.config.trading, 'chart_filter_enabled', True)
 
-                    if chart_signal_strength >= 0.7 and not is_reversal_trade:
+                    if chart_filter_enabled and chart_signal_strength >= 0.7 and not is_reversal_trade:
+                        # Throttle chart filter logs to once per 30s per asset+side
+                        block_key = f"{market.asset}:{signal.side.value}:chart_filter"
+                        now_ts = time.time()
+                        if not hasattr(self, '_chart_block_log_ts'):
+                            self._chart_block_log_ts = {}
+                        last_log = self._chart_block_log_ts.get(block_key, 0.0)
+
                         if chart_says_down and signal.side == Side.UP:
-                            logger.debug(f"[{market.asset}] CHART BLOCK: UP vs BEARISH")
+                            if now_ts - last_log >= 30.0:
+                                self._chart_block_log_ts[block_key] = now_ts
+                                logger.info(
+                                    "ORDER_BLOCK asset=%s market=%s side=%s reason=chart_bearish_vs_up "
+                                    "strength=%.2f edge=%.4f",
+                                    market.asset, market.condition_id[:8], signal.side.value,
+                                    chart_signal_strength, signal.edge
+                                )
                             return
                         elif chart_says_up and signal.side == Side.DOWN:
-                            logger.debug(f"[{market.asset}] CHART BLOCK: DOWN vs BULLISH")
+                            if now_ts - last_log >= 30.0:
+                                self._chart_block_log_ts[block_key] = now_ts
+                                logger.info(
+                                    "ORDER_BLOCK asset=%s market=%s side=%s reason=chart_bullish_vs_down "
+                                    "strength=%.2f edge=%.4f",
+                                    market.asset, market.condition_id[:8], signal.side.value,
+                                    chart_signal_strength, signal.edge
+                                )
                             return
 
             except Exception as e:
                 logger.debug(f"Chart analysis failed: {e}")
 
-        # ML filter - check predicted win probability (do this BEFORE sizing for Kelly)
+        # EV-based ML engine
         ml_confidence = None
-        if self.ml_predictor:
+        if self.ml_engine and self.ml_policy:
+            try:
+                snapshot = self._build_ml_snapshot(market, chainlink_price or 0.0)
+                if not snapshot:
+                    # Log why snapshot failed and CONTINUE with signal generator values (fallback)
+                    orderbook = self.clob_feed.get_orderbook(market.up_token_id)
+                    depth_levels = self.ml_engine.bundle.builder.depth_levels if self.ml_engine else 0
+                    ob_bids = len(orderbook.bids) if orderbook else 0
+                    ob_asks = len(orderbook.asks) if orderbook else 0
+                    asset_key = f"{market.asset.lower()}/usd"
+                    history_len = len(self.signal_generator.price_histories.get(asset_key, []))
+                    logger.debug(
+                        "ML_SNAPSHOT_SKIP asset=%s reason=insufficient_data orderbook=%s "
+                        "bids=%d asks=%d depth_needed=%d history=%d -> using signal generator fallback",
+                        market.asset, "yes" if orderbook else "no",
+                        ob_bids, ob_asks, depth_levels, history_len
+                    )
+                    # Don't block - continue with signal generator's edge/prob values
+                    pass
+                else:
+                    # ML snapshot built successfully - use ML engine
+                    inference = self.ml_engine.evaluate(
+                        snapshot,
+                        fees_bps=self.config.ml_engine.fees_bps,
+                        slippage_bps=self.config.ml_engine.slippage_bps,
+                    )
+                    volatility = self.signal_generator.get_volatility(market.asset)
+                    decision = self.ml_policy.decide(
+                        snapshot=snapshot,
+                        inference=inference,
+                        bankroll=self.risk_manager.current_bankroll,
+                        volatility=volatility,
+                    )
+                    if self.config.trading.ml_enabled and os.getenv("ML_MODE", "EV").upper() == "EV":
+                        now = time.time()
+                        last_log = self._ml_decision_log_ts.get(market.asset, 0.0)
+                        if now - last_log >= 1.0:
+                            self._ml_decision_log_ts[market.asset] = now
+                            yes_ask = float(snapshot.get("yes_ask", 0.0))
+                            no_ask = float(snapshot.get("no_ask", 0.0))
+                            edge_up = inference.edge_up
+                            edge_down = inference.edge_down
+                            if decision.should_trade:
+                                chosen_side = "UP" if decision.side == "YES" else "DOWN"
+                            else:
+                                chosen_side = "NONE"
+                            min_edge = float(os.getenv("ML_MIN_EDGE", str(self.config.ml_engine.min_ev)))
+                            logger.info(
+                                "ML_EV_DECISION asset=%s p_up=%.4f yes_ask=%.4f no_ask=%.4f "
+                                "edge_up=%.4f edge_down=%.4f side=%s min_edge=%.4f decision=%s",
+                                market.asset,
+                                inference.p_up,
+                                yes_ask,
+                                no_ask,
+                                edge_up,
+                                edge_down,
+                                chosen_side,
+                                min_edge,
+                                "TRADE" if decision.should_trade else "SKIP",
+                            )
+                    if not decision.should_trade:
+                        logger.info(
+                            "ORDER_BLOCK asset=%s market=%s side=%s reason=ml_ev:%s",
+                            market.asset, market.condition_id[:8], signal.side.value,
+                            decision.reason.replace(" ", "_")[:30]
+                        )
+                        return
+
+                    # Override signal based on EV decision
+                    if decision.side == "YES":
+                        signal.side = Side.UP
+                        signal.recommended_price = market.best_ask
+                        signal.market_prob = market.implied_prob_up
+                        signal.true_prob = inference.p_up
+                        signal.edge = inference.edge_up
+                    else:
+                        signal.side = Side.DOWN
+                        signal.recommended_price = 1.0 - market.best_bid
+                        signal.market_prob = market.implied_prob_down
+                        signal.true_prob = 1.0 - inference.p_up
+                        signal.edge = inference.edge_down
+
+                    time_remaining = market.time_remaining
+                    if signal.edge >= self.config.trading.edge_for_market or time_remaining < self.config.trading.time_for_market:
+                        signal.recommended_action = OrderAction.MARKET
+                    elif signal.edge >= self.config.trading.edge_for_limit or time_remaining < self.config.trading.time_for_limit:
+                        signal.recommended_action = OrderAction.LIMIT
+                    elif signal.edge >= self.config.trading.edge_for_post_only:
+                        signal.recommended_action = OrderAction.POST_ONLY
+                    else:
+                        signal.recommended_action = OrderAction.SKIP
+
+                    signal.size_usd = decision.size_usd
+                    if signal.recommended_price > 0:
+                        signal.size_shares = signal.size_usd / signal.recommended_price
+
+                    signal.reasoning = (
+                        f"ML_EV side={decision.side} p_up={inference.p_up:.3f} "
+                        f"ev_up={inference.ev_up:.3f} ev_down={inference.ev_down:.3f} "
+                        f"edge_up={inference.edge_up:.3f} edge_down={inference.edge_down:.3f}"
+                    )
+
+                    try:
+                        features = self.ml_engine.bundle.builder.build(snapshot)
+                        logger.info(f"[{market.asset}] ML_FEATURES {features}")
+                    except Exception:
+                        pass
+
+                    signal._ml_ev_info = {
+                        "p_up": inference.p_up,
+                        "uncertainty": inference.uncertainty,
+                        "edge_up": inference.edge_up,
+                        "edge_down": inference.edge_down,
+                        "ev_up": inference.ev_up,
+                        "ev_down": inference.ev_down,
+                        "side": decision.side,
+                    }
+            except Exception as e:
+                # Log full exception but DON'T block - fallback to signal generator values
+                logger.exception(
+                    "ML_ENGINE_ERROR asset=%s market=%s side=%s -> using signal generator fallback",
+                    market.asset, market.condition_id[:8], signal.side.value
+                )
+
+        # Legacy ML filter - check predicted win probability (do this BEFORE sizing for Kelly)
+        if not (self.ml_engine and self.ml_policy) and self.ml_predictor:
 
             # Extract all ML features using the helper function
             ml_features = extract_ml_features_from_market(
@@ -3401,10 +4352,11 @@ class TradingBot:
                 **ml_features,
             )
             if not should_trade:
-                rejection_key = f"{market.condition_id}:ml"
-                if rejection_key not in self._logged_rejections:
-                    self._logged_rejections.add(rejection_key)
-                    logger.debug(f"[{market.asset}] ML BLOCK: {ml_reason}")
+                logger.info(
+                    "ORDER_BLOCK asset=%s market=%s side=%s reason=ml_predictor:%s",
+                    market.asset, market.condition_id[:8], signal.side.value,
+                    ml_reason.replace(" ", "_")[:30]
+                )
                 return
 
             # Store ML confidence for Kelly sizing
@@ -3467,21 +4419,39 @@ class TradingBot:
 
         # Check if signal was rejected due to size
         if signal.size_usd <= 0 or signal.size_shares <= 0:
-            size_key = f"{market.condition_id}:size_too_small"
-            if size_key not in self._logged_rejections:
-                self._logged_rejections.add(size_key)
-                logger.debug(f"[{market.asset}] SIZE TOO SMALL")
+            # Throttle to once per 30s per asset
+            block_key = f"{market.asset}:size_too_small"
+            now_ts = time.time()
+            last_log = getattr(self, '_size_block_log_ts', {}).get(block_key, 0.0)
+            if now_ts - last_log >= 30.0:
+                if not hasattr(self, '_size_block_log_ts'):
+                    self._size_block_log_ts = {}
+                self._size_block_log_ts[block_key] = now_ts
+                logger.info(
+                    "ORDER_BLOCK asset=%s market=%s side=%s reason=size_too_small usd=%.2f shares=%.4f",
+                    market.asset, market.condition_id[:8], signal.side.value,
+                    signal.size_usd, signal.size_shares
+                )
             return
 
-        # === CONSOLIDATED SIGNAL LOG (single line, only for executable trades) ===
+        # === CONSOLIDATED SIGNAL LOG (single line, for signals passing initial checks) ===
+        # NOTE: ORDER_DECISION is logged in _execute_signal after ALL blocking checks pass
+        # Throttle to once per 30s per market to avoid spam
         arb_type = getattr(signal, '_arb_type', 'probability')
         distance_pct = getattr(signal, '_ml_distance_from_target', 0) * 100
         rsi = getattr(signal, '_ml_chart_rsi', 50)
-        logger.info(
+        signal_msg = (
             f"🎯 {market.asset} {signal.side.value} ${signal.size_usd:.0f} | "
             f"edge={signal.edge:.0%} dist={distance_pct:+.1f}% RSI={rsi:.0f} | "
             f"{signal.reasoning[:40]}"
         )
+        now_ts = time.time()
+        last_signal_log = self._signal_log_ts.get(market.asset, 0.0)
+        if now_ts - last_signal_log >= 30.0:
+            self._signal_log_ts[market.asset] = now_ts
+            logger.info(signal_msg)
+        else:
+            logger.debug(signal_msg)
 
         # Execute the signal
         await self._execute_signal(signal)
@@ -3515,6 +4485,115 @@ class TradingBot:
                 # Keep previous depth values on error
 
         market.last_updated = datetime.now(timezone.utc)
+
+    def _build_ml_snapshot(self, market: MarketState, chainlink_price: float):
+        if not self.ml_engine:
+            return None
+
+        orderbook = self.clob_feed.get_orderbook(market.up_token_id)
+        if not orderbook:
+            return None
+
+        depth_levels = self.ml_engine.bundle.builder.depth_levels
+        bids = [(lvl.price, lvl.size) for lvl in orderbook.bids[:depth_levels]]
+        asks = [(lvl.price, lvl.size) for lvl in orderbook.asks[:depth_levels]]
+
+        if len(bids) < depth_levels or len(asks) < depth_levels:
+            return None
+
+        yes_bid = market.best_bid
+        yes_ask = market.best_ask
+        no_bid = 1.0 - yes_ask
+        no_ask = 1.0 - yes_bid
+
+        asset_key = f"{market.asset.lower()}/usd"
+        raw_history = self.signal_generator.price_histories.get(asset_key, [])
+        history = []
+        now_ts = datetime.now(timezone.utc)
+        for item in raw_history:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                history.append((item[0], item[1]))
+            elif isinstance(item, (int, float)):
+                history.append((now_ts, float(item)))
+
+        if not history:
+            return None
+
+        snapshot = {
+            "timestamp": now_ts,
+            "market_open_ts": market.start_time,
+            "market_end_ts": market.end_time,
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "no_bid": no_bid,
+            "no_ask": no_ask,
+            "orderbook_bids": bids,
+            "orderbook_asks": asks,
+            "reference_price": chainlink_price,
+            "reference_price_open": market.target_price,
+            "reference_price_history": history,
+        }
+
+        bid_depth = sum(s for _, s in bids)
+        ask_depth = sum(s for _, s in asks)
+        snapshot["orderbook_bid_depth"] = bid_depth
+        snapshot["orderbook_ask_depth"] = ask_depth
+        return snapshot
+
+    def _signal_from_meta(self, market: MarketState, meta_signal, chainlink_price: float) -> Optional[Signal]:
+        market_prob = market.implied_prob_up
+        side = Side.UP if meta_signal.side == "YES" else Side.DOWN
+
+        if side == Side.UP:
+            true_prob = min(0.99, max(0.01, market_prob + meta_signal.edge))
+        else:
+            true_prob = min(0.99, max(0.01, market_prob - meta_signal.edge))
+
+        edge = abs(true_prob - market_prob)
+        time_remaining = market.time_remaining
+
+        action = OrderAction.SKIP
+        if edge >= self.config.trading.edge_for_market or time_remaining < self.config.trading.time_for_market:
+            action = OrderAction.MARKET
+        elif edge >= self.config.trading.edge_for_limit or time_remaining < self.config.trading.time_for_limit:
+            action = OrderAction.LIMIT
+        elif edge >= self.config.trading.edge_for_post_only:
+            action = OrderAction.POST_ONLY
+
+        if side == Side.UP:
+            price = market.best_ask
+        else:
+            price = 1.0 - market.best_bid if market.best_bid else 0.5
+
+        size_usd = self.config.trading.base_position_size
+        volatility = self.signal_generator.get_volatility(market.asset)
+        size_usd = self.risk_sizer.size_position(
+            bankroll=self.risk_manager.current_bankroll,
+            edge=edge,
+            prob=true_prob if side == Side.UP else 1 - true_prob,
+            market_price=price if price > 0 else 0.5,
+            volatility=volatility,
+            base_size=size_usd,
+        )
+        if size_usd <= 0:
+            return None
+
+        size_shares = size_usd / price if price > 0 else 0.0
+
+        return Signal(
+            market=market,
+            side=side,
+            edge=edge,
+            true_prob=true_prob,
+            market_prob=market_prob,
+            recommended_action=action,
+            recommended_price=price,
+            size_usd=size_usd,
+            size_shares=size_shares,
+            chainlink_price=chainlink_price or 0.0,
+            time_remaining=time_remaining,
+            reasoning=f"META {meta_signal.side} edge={edge:.3f} conf={meta_signal.confidence:.2f}",
+        )
 
     def _log_status_line(self):
         """Log a clean status line with key info."""
@@ -3559,43 +4638,231 @@ class TradingBot:
 
         logger.info(status)
 
-    def _calculate_equity(self) -> float:
+    def _log_order_block(self, asset: str, reason: str, **kwargs) -> bool:
         """
-        Calculate current equity: cash + unrealized position value.
+        Log ORDER_BLOCK with throttling to prevent spam.
 
-        For each open position, estimate its current value based on
-        order book prices. This gives a more accurate picture of
-        actual account value than just looking at cash.
+        Args:
+            asset: Asset symbol
+            reason: Block reason
+            **kwargs: Additional log fields
 
         Returns:
-            Total equity (cash + unrealized position value)
+            True if logged, False if throttled
+        """
+        block_key = f"{asset}:{reason}"
+        now_ts = time.time()
+        last_log = self._order_block_log_ts.get(block_key, 0.0)
+
+        if now_ts - last_log < self._order_block_log_interval:
+            return False  # Throttled
+
+        self._order_block_log_ts[block_key] = now_ts
+
+        # Build log message with extra fields
+        extra_parts = " ".join(f"{k}={v}" for k, v in kwargs.items() if v is not None)
+        if extra_parts:
+            logger.info(f"ORDER_BLOCK asset={asset} reason={reason} {extra_parts}")
+        else:
+            logger.info(f"ORDER_BLOCK asset={asset} reason={reason}")
+        return True
+
+    def _derive_position_state(
+        self, position, market, resolved_outcome: str = None
+    ) -> PositionState:
+        """
+        Derive the current state of a position.
+
+        Args:
+            position: The position object
+            market: The market state (may be None)
+            resolved_outcome: If known, "WIN" or "LOSS" from settlement verification
+
+        Returns:
+            PositionState enum value
+
+        State machine:
+        - OPEN: market.time_remaining > 0
+        - ENDED_UNRESOLVED: time_remaining <= 0 and no resolved_outcome
+        - RESOLVED_WIN: resolved_outcome == "WIN"
+        - RESOLVED_LOSS: resolved_outcome == "LOSS"
+        - SETTLING: (future use - redemption in progress)
+        - CLOSED: (future use - finalized)
+        """
+        if resolved_outcome == "WIN":
+            return PositionState.RESOLVED_WIN
+        if resolved_outcome == "LOSS":
+            return PositionState.RESOLVED_LOSS
+
+        if not market:
+            return PositionState.ENDED_UNRESOLVED
+
+        time_remaining = market.time_remaining if hasattr(market, 'time_remaining') else 0
+
+        if time_remaining > 0:
+            return PositionState.OPEN
+        else:
+            return PositionState.ENDED_UNRESOLVED
+
+    def _get_position_mark_price(
+        self, position, market, state: PositionState = None
+    ) -> tuple[float, str, dict]:
+        """
+        Get mark price for a position based on its state.
+
+        Marking rules by state:
+        - RESOLVED_WIN: mark_price = 1.0
+        - RESOLVED_LOSS: mark_price = 0.0
+        - OPEN / ENDED_UNRESOLVED: mark-to-market using best available quote
+
+        For long positions, mark = bid of the SAME outcome token:
+          UP position  -> YES token bid
+          DOWN position -> NO token bid
+
+        Quote fallback chain:
+        1. CLOB orderbook bid for this token
+        2. Paper executor quote cache bid for this token (keyed by token_id)
+        3. MarketState prices (derived from UP token)
+        4. None (unmarked)
+
+        Returns:
+            Tuple of (mark_price, source_description, debug_info)
+            mark_price is None if no valid price available
+            debug_info contains token_id_used, bid, ask, mid for logging
+        """
+        debug_info = {
+            "token_id_used": position.token_id if position else "",
+            "bid": None, "ask": None, "mid": None,
+        }
+
+        # Derive state if not provided
+        if state is None:
+            state = self._derive_position_state(position, market)
+
+        # RESOLVED_WIN: mark = 1.0
+        if state == PositionState.RESOLVED_WIN:
+            return 1.0, "resolved_win", debug_info
+
+        # RESOLVED_LOSS: mark = 0.0
+        if state == PositionState.RESOLVED_LOSS:
+            return 0.0, "resolved_loss", debug_info
+
+        # OPEN or ENDED_UNRESOLVED: use best available quote
+        if not market:
+            return None, "no_market", debug_info
+
+        # Determine the correct token_id for this position's side
+        if position.side == Side.UP:
+            token_id = market.up_token_id
+        else:
+            token_id = market.down_token_id
+        debug_info["token_id_used"] = token_id
+
+        # Verify position.token_id matches expected token for side
+        if position.token_id and position.token_id != token_id:
+            logger.warning(
+                "TOKEN_MISMATCH position.token_id=%s expected_%s_token=%s market=%s asset=%s",
+                position.token_id[:16], position.side.value.lower(),
+                token_id[:16], market.condition_id[:8], market.asset,
+            )
+
+        # 1) CLOB orderbook — mark at bid (what we could sell at)
+        orderbook = self.clob_feed.get_orderbook(token_id) if self.clob_feed else None
+        if orderbook and orderbook.best_bid is not None and orderbook.best_bid > 0:
+            debug_info["bid"] = orderbook.best_bid
+            debug_info["ask"] = orderbook.best_ask
+            debug_info["mid"] = orderbook.mid_price
+            return orderbook.best_bid, "clob_bid", debug_info
+
+        # 2) Paper executor quote cache (fed from MarketState each tick)
+        if self.executor and hasattr(self.executor, 'get_cached_quote'):
+            cached = self.executor.get_cached_quote(token_id)
+            if cached and cached.bid > 0:
+                debug_info["bid"] = cached.bid
+                debug_info["ask"] = cached.ask
+                debug_info["mid"] = cached.mid
+                return cached.bid, "cache_bid", debug_info
+
+        # 3) MarketState prices (derived from UP token orderbook)
+        if position.side == Side.UP:
+            if market.best_bid and market.best_bid > 0:
+                debug_info["bid"] = market.best_bid
+                debug_info["ask"] = market.best_ask
+                debug_info["mid"] = (market.best_bid + market.best_ask) / 2
+                return market.best_bid, "market_yes_bid", debug_info
+        else:
+            if market.best_ask and market.best_ask < 1.0:
+                no_bid = 1.0 - market.best_ask
+                no_ask = 1.0 - market.best_bid if market.best_bid else None
+                debug_info["bid"] = no_bid
+                debug_info["ask"] = no_ask
+                debug_info["mid"] = (no_bid + no_ask) / 2 if no_ask else no_bid
+                return no_bid, "market_no_bid", debug_info
+
+        return None, "no_price", debug_info
+
+    def _calculate_equity(self, debug_log: bool = False) -> float:
+        """
+        Calculate current equity: cash + sum(mark_value or cost_basis).
+
+        Uses state-aware marking:
+        - RESOLVED_WIN: mark = 1.0
+        - RESOLVED_LOSS: mark = 0.0
+        - OPEN/ENDED_UNRESOLVED: mark = best available quote
+        - No price: fallback to cost basis (equity neutral, 0 unrealized)
+
+        Returns:
+            Total equity (cash + position value)
         """
         cash = self.risk_manager.current_bankroll
-        unrealized_value = 0.0
+        sum_mark_value = 0.0
+        sum_cost_basis = 0.0
+        unrealized_pnl = 0.0
 
         for market_key, position in self.risk_manager.positions.items():
-            # Find the market
             market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
-            if not market:
-                # If we can't find market, use cost basis as conservative estimate
-                unrealized_value += position.cost_basis
-                continue
 
-            # Get current market price for our side
-            if position.side == Side.UP:
-                current_price = market.best_bid  # What we could sell for
+            state = self._derive_position_state(position, market)
+            mark_price, source, _dbg = self._get_position_mark_price(position, market, state)
+
+            cost = position.cost_basis
+            sum_cost_basis += cost
+
+            if mark_price is not None and mark_price >= 0:
+                mark_val = position.shares * mark_price
+                sum_mark_value += mark_val
+                unrealized_pnl += mark_val - cost
             else:
-                # For DOWN, value is 1 - UP_ask
-                current_price = 1.0 - market.best_ask if market.best_ask else None
+                # Unmarked: use cost_basis for equity, contribute 0 to unrealized
+                sum_mark_value += cost
 
-            if current_price and current_price > 0:
-                # Current value = shares * current price
-                unrealized_value += position.shares * current_price
-            else:
-                # Fallback to cost basis
-                unrealized_value += position.cost_basis
+        # Realized P&L from daily stats
+        daily = self.risk_manager.get_daily_stats()
+        realized_pnl = daily.total_pnl if daily else 0.0
 
-        return cash + unrealized_value
+        equity = cash + sum_mark_value
+        total_pnl = realized_pnl + unrealized_pnl
+
+        if debug_log:
+            logger.debug(
+                "EQUITY_CALC cash=%.2f sum_cost_basis=%.2f sum_mark_value=%.2f "
+                "realized=%.2f unrealized=%.2f equity=%.2f pnl=%.2f",
+                cash, sum_cost_basis, sum_mark_value,
+                realized_pnl, unrealized_pnl, equity, total_pnl,
+            )
+
+        # Stash for header use (avoids recomputing)
+        self._last_equity_detail = {
+            "cash": cash,
+            "sum_cost_basis": sum_cost_basis,
+            "sum_mark_value": sum_mark_value,
+            "realized_pnl": realized_pnl,
+            "unrealized_pnl": unrealized_pnl,
+            "equity": equity,
+            "total_pnl": total_pnl,
+        }
+
+        return equity
 
     def _log_position_status(self):
         """
@@ -3620,16 +4887,22 @@ class TradingBot:
         api_positions = getattr(self, '_api_positions', {})
         pending_orders = getattr(self, '_pending_orders', {})
 
-        # Calculate equity
-        equity = self._calculate_equity()
-        cash = self.risk_manager.current_bankroll
-        unrealized_total = equity - cash
+        # Calculate equity with debug logging
+        equity = self._calculate_equity(debug_log=True)
+        detail = getattr(self, '_last_equity_detail', {})
+        cash = detail.get("cash", self.risk_manager.current_bankroll)
+        total_pnl = detail.get("total_pnl", 0.0)
+        self.metrics.record_position(
+            positions=len(self.risk_manager.positions),
+            exposure=self.risk_manager.get_total_exposure(),
+            equity=equity,
+        )
 
-        # Format P&L
-        if unrealized_total > 0:
+        # Format P&L (realized + unrealized)
+        if total_pnl > 0:
             pnl_color = Colors.BRIGHT_GREEN
             pnl_icon = "📈"
-        elif unrealized_total < 0:
+        elif total_pnl < 0:
             pnl_color = Colors.BRIGHT_RED
             pnl_icon = "📉"
         else:
@@ -3646,7 +4919,7 @@ class TradingBot:
         logger.info(
             f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  💰 Cash: {Colors.BRIGHT_WHITE}${cash:>10.2f}{Colors.RESET}  │  "
             f"💎 Equity: {Colors.BRIGHT_WHITE}${equity:>10.2f}{Colors.RESET}  │  "
-            f"{pnl_icon} P&L: {pnl_color}${unrealized_total:>+9.2f}{Colors.RESET}  {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+            f"{pnl_icon} P&L: {pnl_color}${total_pnl:>+9.2f}{Colors.RESET}  {Colors.BRIGHT_CYAN}│{Colors.RESET}"
         )
 
         # Counts summary
@@ -3666,25 +4939,43 @@ class TradingBot:
                 market = self.markets.get(market_key) or self.expiring_markets.get(market_key)
                 asset = position.market.asset if hasattr(position, 'market') else "???"
                 side = position.side.value
+                time_remaining = market.time_remaining if market else 0
 
-                # Get Chainlink price and calculate win probability
+                # === DERIVE POSITION STATE ===
+                # Check if we have a resolved outcome from settlement verification
+                resolved_outcome = None  # TODO: Get from settlement_verifier when available
+                state = self._derive_position_state(position, market, resolved_outcome)
+
+                # === GET MARK PRICE BASED ON STATE ===
+                mark_price, mark_source, mark_debug = self._get_position_mark_price(position, market, state)
+
+                # === COMPUTE UNREALIZED PNL ===
+                unrealized_pnl = None
+                pnl_pct = None
+                if mark_price is not None and mark_price >= 0:
+                    unrealized_pnl = (mark_price - position.entry_price) * position.shares
+                    if position.entry_price > 0:
+                        pnl_pct = ((mark_price - position.entry_price) / position.entry_price * 100)
+
+                # === CALCULATE WIN PROBABILITY ===
                 chainlink_price = self.signal_generator.get_price(asset) if hasattr(self, 'signal_generator') else None
                 target_price = market.target_price if market else None
-                time_remaining = market.time_remaining if market else 0
                 our_win_prob = 0.5  # Default
 
-                if chainlink_price and target_price and market:
-                    # Calculate real-time win probability
+                if chainlink_price and target_price and market and time_remaining > 0:
                     from .probability import calculate_true_probability
                     volatility = self.signal_generator.get_volatility(asset)
                     true_prob_up = calculate_true_probability(
                         current_price=chainlink_price,
                         target_price=target_price,
-                        time_remaining_sec=market.time_remaining,
+                        time_remaining_sec=time_remaining,
                         volatility_15min=volatility,
                     )
-                    # Our win probability depends on our side
                     our_win_prob = true_prob_up if side == "UP" else (1 - true_prob_up)
+                elif state == PositionState.RESOLVED_WIN:
+                    our_win_prob = 1.0
+                elif state == PositionState.RESOLVED_LOSS:
+                    our_win_prob = 0.0
 
                 # Color and icon based on probability
                 if our_win_prob >= 0.7:
@@ -3697,51 +4988,78 @@ class TradingBot:
                     prob_color = Colors.BRIGHT_RED
                     prob_icon = "🔴"
 
-                # Calculate P&L - use settlement price for expired markets
-                current_market_price = None
-                if market:
-                    if time_remaining <= 0 and our_win_prob >= 0.99:
-                        current_market_price = 1.0
-                    elif time_remaining <= 0 and our_win_prob <= 0.01:
-                        current_market_price = 0.0
-                    else:
-                        if position.side == Side.UP:
-                            current_market_price = market.best_bid
-                        else:
-                            current_market_price = 1.0 - market.best_ask if market.best_ask else None
+                # === STATUS STRING BASED ON STATE ===
+                if state == PositionState.RESOLVED_WIN:
+                    status_str = "✅ WON"
+                elif state == PositionState.RESOLVED_LOSS:
+                    status_str = "❌ LOST"
+                elif state == PositionState.ENDED_UNRESOLVED:
+                    status_str = "⏰ PENDING"
+                elif time_remaining > 60:
+                    status_str = f"⏱️  {int(time_remaining // 60)}m {int(time_remaining % 60)}s"
+                else:
+                    status_str = f"⏱️  {int(time_remaining)}s"
 
-                if current_market_price is not None and current_market_price >= 0:
-                    unrealized_pnl = (current_market_price - position.entry_price) * position.shares
-                    pnl_pct = ((current_market_price - position.entry_price) / position.entry_price * 100) if position.entry_price > 0 else 0
+                # === EXPLICIT DEBUG LOG FOR EACH POSITION ROW ===
+                token_id_used = mark_debug.get("token_id_used", "")
+                dbg_bid = mark_debug.get("bid")
+                dbg_ask = mark_debug.get("ask")
+                dbg_mid = mark_debug.get("mid")
+                is_pending = state in (
+                    PositionState.ENDED_UNRESOLVED,
+                    PositionState.RESOLVED_WIN,
+                    PositionState.RESOLVED_LOSS,
+                )
+                logger.info(
+                    "POSITION_VALUATION market=%s asset=%s side=%s "
+                    "token_id_used=%s bid=%s ask=%s mid=%s "
+                    "mark_price=%s mark_source=%s "
+                    "entry=%.4f shares=%.2f unrealized_pnl=%s realized_pnl=0.00 "
+                    "state=%s pending_settlement=%s",
+                    market_key[:8] if market_key else "????????",
+                    asset,
+                    side,
+                    token_id_used[:16] if token_id_used else "None",
+                    f"{dbg_bid:.4f}" if dbg_bid is not None else "None",
+                    f"{dbg_ask:.4f}" if dbg_ask is not None else "None",
+                    f"{dbg_mid:.4f}" if dbg_mid is not None else "None",
+                    f"{mark_price:.4f}" if mark_price is not None else "None",
+                    mark_source,
+                    position.entry_price,
+                    position.shares,
+                    f"{unrealized_pnl:+.2f}" if unrealized_pnl is not None else "pending",
+                    state.value,
+                    "true" if is_pending else "false",
+                )
+
+                # Side arrow
+                side_arrow = "▲" if side == "UP" else "▼"
+                side_color = Colors.BRIGHT_GREEN if side == "UP" else Colors.BRIGHT_RED
+
+                if mark_price is not None and unrealized_pnl is not None:
                     pnl_color = Colors.BRIGHT_GREEN if unrealized_pnl > 0 else Colors.BRIGHT_RED
 
-                    # Format time remaining
-                    if time_remaining > 60:
-                        time_str = f"{int(time_remaining // 60)}m {int(time_remaining % 60)}s"
+                    # Format mark price display
+                    if state == PositionState.RESOLVED_WIN:
+                        mark_display = "1.000"
+                    elif state == PositionState.RESOLVED_LOSS:
+                        mark_display = "0.000"
                     else:
-                        time_str = f"{int(time_remaining)}s"
-
-                    # Settlement indicator
-                    status_str = "⏰ SETTLING" if time_remaining <= 0 else f"⏱️  {time_str}"
-
-                    # Side arrow
-                    side_arrow = "▲" if side == "UP" else "▼"
-                    side_color = Colors.BRIGHT_GREEN if side == "UP" else Colors.BRIGHT_RED
+                        mark_display = f"{mark_price:.3f}"
 
                     logger.info(
                         f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {side_color}{side_arrow} {asset:4}{Colors.RESET} │ "
-                        f"{position.shares:>6.1f} @ {position.entry_price:.3f} → {current_market_price:.3f} │ "
+                        f"{position.shares:>6.1f} @ {position.entry_price:.3f} → {mark_display} │ "
                         f"{pnl_color}{unrealized_pnl:>+7.2f} ({pnl_pct:>+5.0f}%){Colors.RESET} │ "
                         f"{prob_color}{prob_icon} {our_win_prob:>3.0%}{Colors.RESET} │ {status_str}  {Colors.BRIGHT_CYAN}│{Colors.RESET}"
                     )
                 else:
-                    side_arrow = "▲" if side == "UP" else "▼"
-                    side_color = Colors.BRIGHT_GREEN if side == "UP" else Colors.BRIGHT_RED
+                    # No valid mark - show pending
                     logger.info(
                         f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {side_color}{side_arrow} {asset:4}{Colors.RESET} │ "
-                        f"{position.shares:>6.1f} @ {position.entry_price:.3f}        │ "
-                        f"{'(no price)':^16} │ "
-                        f"{prob_color}{prob_icon} {our_win_prob:>3.0%}{Colors.RESET} │ ...      {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+                        f"{position.shares:>6.1f} @ {position.entry_price:.3f} → {'--':>5} │ "
+                        f"{'(pending)':^16} │ "
+                        f"{prob_color}{prob_icon} {our_win_prob:>3.0%}{Colors.RESET} │ {status_str}  {Colors.BRIGHT_CYAN}│{Colors.RESET}"
                     )
         else:
             logger.info(f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {Colors.DIM}No active positions{Colors.RESET}                                            {Colors.BRIGHT_CYAN}│{Colors.RESET}")
@@ -3766,9 +5084,23 @@ class TradingBot:
                 asset = order_data.get("asset", "???")
                 side = order_data.get("side", "???")
                 size = order_data.get("size", 0)
+                limit_price = order_data.get("price", 0)
+                placed_time = order_data.get("placed_time")
+                age_s = int((now - placed_time).total_seconds()) if placed_time else 0
+
+                # Try to get live status from executor
+                order_status = "OPEN"
+                filled = 0.0
+                if self.executor and hasattr(self.executor, 'get_order_status'):
+                    oi = self.executor.get_order_status(order_id)
+                    if oi:
+                        order_status = oi.status.value
+                        filled = oi.filled_size
+
                 logger.info(
-                    f"{Colors.BRIGHT_CYAN}│{Colors.RESET}     {asset} {side}: {size:.1f} shares │ "
-                    f"Order: {order_id[:12]}...                   {Colors.BRIGHT_CYAN}│{Colors.RESET}"
+                    f"{Colors.BRIGHT_CYAN}│{Colors.RESET}     {asset} {side}: {size:.1f} @ {limit_price:.3f} │ "
+                    f"{order_status} │ filled={filled:.2f} │ age={age_s}s │ "
+                    f"id={order_id[:12]}  {Colors.BRIGHT_CYAN}│{Colors.RESET}"
                 )
 
         # Log active cooldowns
@@ -3952,7 +5284,7 @@ class TradingBot:
             config=config,
         )
 
-    def _execute_averaging_order(self, position, signal, averaging_decision):
+    async def _execute_averaging_order(self, position, signal, averaging_decision):
         """
         Execute an averaging down order.
 
@@ -3987,7 +5319,15 @@ class TradingBot:
         )
 
         # Execute the order
-        result = self.executor.execute_signal(averaging_signal)
+        try:
+            result = await self.executor.execute_signal_async(averaging_signal)
+        except Exception as e:
+            logger.error(
+                "ORDER_RESULT asset=%s side=%s status=exception error=%s mode=averaging",
+                asset, position.side.value, str(e)[:200]
+            )
+            logger.debug("Averaging execution exception traceback:", exc_info=True)
+            return  # Exit gracefully
 
         if result.success:
             # Update position with new average
@@ -4031,40 +5371,62 @@ class TradingBot:
                 cooldown_key = f"{signal.market.condition_id}:cooldown"
                 if cooldown_key not in self._logged_rejections:
                     self._logged_rejections.add(cooldown_key)
-                    logger.info(f"[{asset}] ❌ COOLDOWN: {remaining:.0f}s remaining (last order {elapsed:.0f}s ago)")
+                    logger.info(
+                        "ORDER_SKIP_DUP asset=%s reason=cooldown secs_since_last=%.0f",
+                        asset,
+                        elapsed,
+                    )
+                return
+
+        # Check for existing FILLED positions for this market+side (prevents duplicate positions)
+        market_id = signal.market.condition_id
+        for pos_key, pos in self.risk_manager.positions.items():
+            pos_market_id = getattr(pos.market, 'condition_id', None) if hasattr(pos, 'market') else None
+            pos_side = pos.side.value if hasattr(pos.side, 'value') else str(pos.side)
+            if pos_market_id == market_id and pos_side == signal.side.value:
+                # Throttled - this can spam when position is open
+                self._log_order_block(
+                    asset, "position_exists",
+                    market=market_id[:8], side=signal.side.value
+                )
                 return
 
         # Check for existing PENDING orders for this asset (prevents duplicate unfilled orders)
-        for order_id, order_data in self._pending_orders.items():
+        async with self._pending_orders_lock:
+            pending_items = list(self._pending_orders.items())
+            pending_count = len(self._pending_orders)
+        for order_id, order_data in pending_items:
             if order_data.get("asset") == asset:
-                pending_key = f"{signal.market.condition_id}:pending_order"
-                if pending_key not in self._logged_rejections:
-                    self._logged_rejections.add(pending_key)
-                    placed_time = order_data.get("placed_time")
-                    if placed_time:
-                        age = (now - placed_time).total_seconds()
-                        logger.info(
-                            f"[{asset}] ❌ PENDING ORDER EXISTS: Order {order_id[:8]}... "
-                            f"placed {age:.0f}s ago @ {order_data.get('price', 0):.3f} - waiting for fill"
+                placed_time = order_data.get("placed_time")
+                if placed_time:
+                    in_window = signal.market.start_time <= placed_time <= signal.market.end_time
+                    same_side = order_data.get("side") == signal.side.value
+                    if in_window and same_side:
+                        # Throttled
+                        self._log_order_block(
+                            asset, "pending_order_exists",
+                            market=market_id[:8], side=signal.side.value
                         )
-                    else:
-                        logger.info(f"[{asset}] ❌ PENDING ORDER EXISTS: Order {order_id[:8]}... - waiting for fill")
+                        return
+                # Already have any pending order for this asset
+                self._log_order_block(
+                    asset, "pending_order_any",
+                    market=market_id[:8], order_id=order_id[:8]
+                )
                 return
 
         # Check total positions (filled + pending) against max concurrent limit
         filled_positions = len(self.risk_manager.positions)
-        pending_orders = len(self._pending_orders)
+        pending_orders = pending_count
         total_positions = filled_positions + pending_orders
         max_positions = self.config.trading.max_concurrent_positions
 
         if total_positions >= max_positions:
-            limit_key = f"global:position_limit"
-            if limit_key not in self._logged_rejections:
-                self._logged_rejections.add(limit_key)
-                logger.info(
-                    f"[{asset}] ❌ POSITION LIMIT: {total_positions} positions "
-                    f"({filled_positions} filled + {pending_orders} pending) >= {max_positions} max"
-                )
+            self._log_order_block(
+                asset, "position_limit",
+                total=total_positions, filled=filled_positions,
+                pending=pending_orders, max=max_positions,
+            )
             return
 
         # Check total capital at risk (filled positions + pending orders + new order)
@@ -4073,7 +5435,7 @@ class TradingBot:
         for pos in self.risk_manager.positions.values():
             current_exposure += pos.shares * pos.entry_price
         # Add value of pending orders
-        for order_data in self._pending_orders.values():
+        for _, order_data in pending_items:
             order_size = order_data.get("size", 0) * order_data.get("price", 0)
             current_exposure += order_size
         # Add proposed new order
@@ -4086,14 +5448,13 @@ class TradingBot:
         max_exposure = bankroll * max_exposure_pct
 
         if total_exposure > max_exposure:
-            exposure_key = f"global:exposure_limit"
-            if exposure_key not in self._logged_rejections:
-                self._logged_rejections.add(exposure_key)
-                logger.info(
-                    f"[{asset}] ❌ EXPOSURE LIMIT: ${total_exposure:.2f} "
-                    f"(current ${current_exposure:.2f} + new ${new_order_value:.2f}) > "
-                    f"${max_exposure:.2f} max ({max_exposure_pct:.0%} of ${bankroll:.2f})"
-                )
+            self._log_order_block(
+                asset, "exposure_limit",
+                total_exposure=f"{total_exposure:.2f}",
+                current=f"{current_exposure:.2f}",
+                new=f"{new_order_value:.2f}",
+                max_exposure=f"{max_exposure:.2f}",
+            )
             return
 
         # CRITICAL: Check API positions FIRST (prevents duplicate trades after restart)
@@ -4126,7 +5487,7 @@ class TradingBot:
                     f"[{asset}] 📈 AVERAGING DOWN: {averaging_decision.reason} | "
                     f"Adding ${averaging_decision.suggested_size_usd:.2f} ({averaging_decision.suggested_shares:.1f} shares)"
                 )
-                self._execute_averaging_order(existing_position, signal, averaging_decision)
+                await self._execute_averaging_order(existing_position, signal, averaging_decision)
                 return
 
             # Not averaging - skip as usual
@@ -4148,8 +5509,8 @@ class TradingBot:
                     f"[{asset}] ❌ INSUFFICIENT BALANCE: Need ${signal.size_usd:.2f}, "
                     f"have ${available:.2f} (bankroll ${self.risk_manager.current_bankroll:.2f})"
                 )
-            # Set a short cooldown to prevent spam
-            self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
+            # Set cooldown to prevent spam (never move timestamps into the future)
+            self._last_order_time[asset] = now
             return
 
         # Get current price for logging
@@ -4187,15 +5548,108 @@ class TradingBot:
                     )
                     return
 
-        # Log positions BEFORE trade
+        # Log positions BEFORE trade (debug level - detailed analysis moved to after safety checks)
         api_pos_count = len(self._api_positions) if hasattr(self, '_api_positions') else 0
         risk_pos_count = len(self.risk_manager.positions)
-        logger.info(
-            f"📋 PRE-TRADE CHECK [{asset}]: API positions={api_pos_count} | "
+        logger.debug(
+            f"PRE-TRADE CHECK [{asset}]: API positions={api_pos_count} | "
             f"Tracked positions={risk_pos_count} | Bankroll=${self.risk_manager.current_bankroll:.2f}"
         )
 
-        # === DETAILED TRADE ANALYSIS LOG ===
+        # === MINIMUM ORDER SIZE CHECK ===
+        # Polymarket minimums:
+        # - LIMIT orders: 5 shares minimum
+        # - MARKET orders: $1 minimum (no share minimum)
+        if signal.recommended_action == OrderAction.LIMIT:
+            MIN_SHARES = 5.0
+            if signal.size_shares < MIN_SHARES:
+                logger.warning(
+                    f"[{asset}] ❌ ORDER TOO SMALL: {signal.size_shares:.2f} shares < {MIN_SHARES} minimum for LIMIT | "
+                    f"Skipping trade"
+                )
+                return
+        else:  # MARKET order
+            MIN_USD = 1.0
+            if signal.size_usd < MIN_USD:
+                logger.warning(
+                    f"[{asset}] ❌ ORDER TOO SMALL: ${signal.size_usd:.2f} < ${MIN_USD} minimum for MARKET | "
+                    f"Skipping trade"
+                )
+                return
+
+        # Hard safety brakes: dedup, cooldown, rate limit, exposure caps
+        market_id = signal.market.condition_id
+        for _, order_data in pending_items:
+            if (
+                order_data.get("market_id") == market_id
+                and order_data.get("asset") == asset
+                and order_data.get("side") == signal.side.value
+            ):
+                self._log_order_block(asset, "duplicate_open_order")
+                return
+
+        now_ts = time.time()
+        key = (market_id, asset)
+        last_ts = self._last_order_time_by_market.get(key)
+        if last_ts is not None:
+            elapsed = now_ts - last_ts
+            if elapsed < self._order_cooldown_seconds:
+                remaining = self._order_cooldown_seconds - elapsed
+                self._log_order_block(asset, "cooldown", secs_remaining=f"{remaining:.0f}")
+                return
+
+        # Global order rate limit (rolling 60s)
+        while self._order_submit_ts and now_ts - self._order_submit_ts[0] > 60.0:
+            self._order_submit_ts.popleft()
+        if len(self._order_submit_ts) >= self.config.trading.max_orders_per_min:
+            self._log_order_block(asset, "global_rate_limit")
+            return
+
+        # Exposure caps (positions + open orders + new order)
+        total_exposure = 0.0
+        per_asset_exposure: dict[str, float] = {}
+        for pos in self.risk_manager.positions.values():
+            pos_asset = pos.market.asset if hasattr(pos, "market") else asset
+            pos_val = pos.shares * pos.entry_price
+            total_exposure += pos_val
+            per_asset_exposure[pos_asset] = per_asset_exposure.get(pos_asset, 0.0) + pos_val
+        for _, order_data in pending_items:
+            order_asset = order_data.get("asset")
+            if not order_asset:
+                continue
+            order_val = float(order_data.get("size", 0)) * float(order_data.get("price", 0))
+            total_exposure += order_val
+            per_asset_exposure[order_asset] = per_asset_exposure.get(order_asset, 0.0) + order_val
+
+        total_exposure_after = total_exposure + signal.size_usd
+        per_asset_after = per_asset_exposure.get(asset, 0.0) + signal.size_usd
+        if total_exposure_after > self.config.trading.max_total_exposure_usd:
+            self._log_order_block(asset, "exposure_cap_total")
+            return
+        if per_asset_after > self.config.trading.max_exposure_per_asset_usd:
+            self._log_order_block(asset, "exposure_cap_per_asset")
+            return
+
+        self._last_order_time_by_market[key] = now_ts
+        self._order_submit_ts.append(now_ts)
+
+        # === ALL SAFETY CHECKS PASSED ===
+        # ORDER_DECISION is logged here AFTER all blocking gates (cooldown/dup/rate-limit/exposure)
+        logger.info(
+            "ORDER_DECISION asset=%s decision=PLACE_ORDER side=%s edge=%.4f min_edge=%.4f "
+            "true_prob=%.4f price=%.4f size_usd=%.2f time_remaining=%.0f order_type=%s",
+            asset,
+            signal.side.value,
+            float(signal.edge or 0.0),
+            float(self.config.trading.min_edge),
+            float(signal.true_prob or 0.0),
+            float(signal.recommended_price or 0.0),
+            float(signal.size_usd or 0.0),
+            float(signal.time_remaining or 0.0),
+            str(signal.recommended_action),
+        )
+
+        # Log detailed trade analysis
         arb_type = getattr(signal, '_arb_type', 'unknown')
         ml_confidence = getattr(signal, '_ml_confidence', None)
         binance_conf = getattr(signal, '_ml_binance_confirmation', 'NONE')
@@ -4241,30 +5695,33 @@ class TradingBot:
 
         logger.info(f"{Colors.BRIGHT_CYAN}╚══════════════════════════════════════════════════════════════╝{Colors.RESET}")
 
-        # === MINIMUM ORDER SIZE CHECK ===
-        # Polymarket minimums:
-        # - LIMIT orders: 5 shares minimum
-        # - MARKET orders: $1 minimum (no share minimum)
-        if signal.recommended_action == OrderAction.LIMIT:
-            MIN_SHARES = 5.0
-            if signal.size_shares < MIN_SHARES:
-                logger.warning(
-                    f"[{asset}] ❌ ORDER TOO SMALL: {signal.size_shares:.2f} shares < {MIN_SHARES} minimum for LIMIT | "
-                    f"Skipping trade"
-                )
-                return
-        else:  # MARKET order
-            MIN_USD = 1.0
-            if signal.size_usd < MIN_USD:
-                logger.warning(
-                    f"[{asset}] ❌ ORDER TOO SMALL: ${signal.size_usd:.2f} < ${MIN_USD} minimum for MARKET | "
-                    f"Skipping trade"
-                )
-                return
-
         # Log the trade attempt with colors
         direction = "▲" if signal.side == Side.UP else "▼"
         side_color = Colors.BRIGHT_GREEN if signal.side == Side.UP else Colors.BRIGHT_RED
+        mode = "paper" if self.config.paper_trading.enabled else ("dry" if self.config.dry_run else "live")
+
+        # Log ORDER_SUBMIT BEFORE execution attempt
+        logger.info(
+            "ORDER_SUBMIT asset=%s market=%s side=%s price=%.4f size_usd=%.2f size_shares=%.4f type=%s mode=%s",
+            asset,
+            market_id[:8],
+            signal.side.value,
+            float(signal.recommended_price or 0.0),
+            float(signal.size_usd or 0.0),
+            float(signal.size_shares or 0.0),
+            str(signal.recommended_action),
+            mode,
+        )
+        # Record to metrics file
+        self.metrics.record_order_event(
+            event_type="ORDER_SUBMIT",
+            asset=asset,
+            side=signal.side.value,
+            price=float(signal.recommended_price or 0.0),
+            size_usd=float(signal.size_usd or 0.0),
+            mode=mode,
+        )
+
         logger.info(
             f"{side_color}>>> EXECUTING: {asset} {signal.side.value} {direction}{Colors.RESET} │ "
             f"Edge: {Colors.BRIGHT_YELLOW}{signal.edge:.0%}{Colors.RESET} │ "
@@ -4273,7 +5730,79 @@ class TradingBot:
         )
 
         # Execute through order executor
-        result = self.executor.execute_signal(signal)
+        try:
+            result = await self.executor.execute_signal_async(signal)
+        except Exception as e:
+            # Log but DO NOT re-raise - keep market loop alive
+            logger.error(
+                "ORDER_RESULT asset=%s market=%s side=%s status=exception error=%s mode=%s",
+                asset,
+                market_id[:8],
+                signal.side.value,
+                str(e)[:200],
+                mode,
+            )
+            logger.debug("Executor exception traceback:", exc_info=True)
+            # Record failed order to metrics
+            self.metrics.record_order_event(
+                event_type="ORDER_RESULT",
+                asset=asset,
+                side=signal.side.value,
+                reason=f"exception: {str(e)[:50]}",
+                mode=mode,
+            )
+            return  # Exit gracefully, don't kill the market loop
+
+        # Log ORDER_RESULT AFTER execution
+        if result.success:
+            logger.info(
+                "ORDER_RESULT asset=%s market=%s side=%s status=success order_id=%s "
+                "filled_size=%.4f filled_price=%.4f mode=%s",
+                asset,
+                market_id[:8],
+                signal.side.value,
+                result.order_id[:16] if result.order_id else "none",
+                result.filled_size,
+                result.filled_price,
+                mode,
+            )
+            # Record ORDER_FILL to metrics
+            self.metrics.record_order_event(
+                event_type="ORDER_FILL",
+                asset=asset,
+                side=signal.side.value,
+                price=result.filled_price,
+                size_usd=result.filled_size * result.filled_price,
+                order_id=result.order_id,
+                mode=mode,
+            )
+        else:
+            logger.info(
+                "ORDER_RESULT asset=%s market=%s side=%s status=failed error=%s mode=%s",
+                asset,
+                market_id[:8],
+                signal.side.value,
+                result.error_message[:50] if result.error_message else "unknown",
+                mode,
+            )
+            # Record failed order to metrics
+            self.metrics.record_order_event(
+                event_type="ORDER_RESULT",
+                asset=asset,
+                side=signal.side.value,
+                price=float(signal.recommended_price or 0.0),
+                size_usd=float(signal.size_usd or 0.0),
+                reason=result.error_message[:50] if result.error_message else "unknown",
+                mode=mode,
+            )
+
+        ml_ev_info = getattr(signal, "_ml_ev_info", None)
+        if ml_ev_info:
+            logger.info(
+                f"[{asset}] ML_EV p_up={ml_ev_info['p_up']:.3f} ev_up={ml_ev_info['ev_up']:.3f} "
+                f"ev_down={ml_ev_info['ev_down']:.3f} edge_up={ml_ev_info['edge_up']:.3f} "
+                f"edge_down={ml_ev_info['edge_down']:.3f} side={ml_ev_info['side']} result={result.success}"
+            )
 
         if result.success:
             # Set full cooldown for successful orders
@@ -4415,53 +5944,69 @@ class TradingBot:
                 )
 
                 # Store order details for later fill checking
-                self._pending_orders[result.order_id] = {
-                    "signal": signal,
-                    "asset": asset,
-                    "side": signal.side.value,  # "UP" or "DOWN"
-                    "placed_time": now,
-                    "price": signal.recommended_price,
-                    "size": signal.size_shares,  # For display in status logs
-                    "ml_volatility": ml_volatility,
-                    "ml_momentum": ml_momentum,
-                    "ml_confidence": ml_confidence,
-                    "ml_arb_type": ml_arb_type,
-                    "ml_spread": ml_spread,
-                    "ml_bid_depth": ml_bid_depth,
-                    "ml_ask_depth": ml_ask_depth,
-                    "ml_price_trend": ml_price_trend,
-                    "ml_distance_from_target": ml_distance_from_target,
-                    "ml_binance_lead_pct": ml_binance_lead_pct,
-                    "ml_binance_confirmation": ml_binance_confirmation,
-                    "ml_trend_1h": ml_trend_1h,
-                    "ml_trend_4h": ml_trend_4h,
-                    "ml_trend_1d": ml_trend_1d,
-                    # NEW INDICATOR FEATURES
-                    "ml_macd_histogram": ml_macd_histogram,
-                    "ml_macd_crossover": ml_macd_crossover,
-                    "ml_bb_bandwidth": ml_bb_bandwidth,
-                    "ml_bb_position": ml_bb_position,
-                    "ml_stoch_k": ml_stoch_k,
-                    "ml_stoch_d": ml_stoch_d,
-                    "ml_stoch_signal": ml_stoch_signal,
-                    "ml_rsi_divergence": ml_rsi_divergence,
-                    "ml_rsi_divergence_strength": ml_rsi_divergence_strength,
-                    "ml_volume_ratio": ml_volume_ratio,
-                    "ml_is_high_volume": ml_is_high_volume,
-                    "ml_obv_trend": ml_obv_trend,
-                    "ml_ha_trend": ml_ha_trend,
-                    "ml_ha_consecutive": ml_ha_consecutive,
-                    "ml_ha_strength": ml_ha_strength,
-                    "ml_vwap_distance_pct": ml_vwap_distance_pct,
-                    "ml_vwap_position": ml_vwap_position,
-                }
+                async with self._pending_orders_lock:
+                    self._pending_orders[result.order_id] = {
+                        "signal": signal,
+                        "asset": asset,
+                        "side": signal.side.value,  # "UP" or "DOWN"
+                        "market_id": signal.market.condition_id,
+                        "placed_time": now,
+                        "price": signal.recommended_price,
+                        "size": signal.size_shares,  # For display in status logs
+                        "ml_volatility": ml_volatility,
+                        "ml_momentum": ml_momentum,
+                        "ml_confidence": ml_confidence,
+                        "ml_arb_type": ml_arb_type,
+                        "ml_spread": ml_spread,
+                        "ml_bid_depth": ml_bid_depth,
+                        "ml_ask_depth": ml_ask_depth,
+                        "ml_price_trend": ml_price_trend,
+                        "ml_distance_from_target": ml_distance_from_target,
+                        "ml_binance_lead_pct": ml_binance_lead_pct,
+                        "ml_binance_confirmation": ml_binance_confirmation,
+                        "ml_trend_1h": ml_trend_1h,
+                        "ml_trend_4h": ml_trend_4h,
+                        "ml_trend_1d": ml_trend_1d,
+                        # NEW INDICATOR FEATURES
+                        "ml_macd_histogram": ml_macd_histogram,
+                        "ml_macd_crossover": ml_macd_crossover,
+                        "ml_bb_bandwidth": ml_bb_bandwidth,
+                        "ml_bb_position": ml_bb_position,
+                        "ml_stoch_k": ml_stoch_k,
+                        "ml_stoch_d": ml_stoch_d,
+                        "ml_stoch_signal": ml_stoch_signal,
+                        "ml_rsi_divergence": ml_rsi_divergence,
+                        "ml_rsi_divergence_strength": ml_rsi_divergence_strength,
+                        "ml_volume_ratio": ml_volume_ratio,
+                        "ml_is_high_volume": ml_is_high_volume,
+                        "ml_obv_trend": ml_obv_trend,
+                        "ml_ha_trend": ml_ha_trend,
+                        "ml_ha_consecutive": ml_ha_consecutive,
+                        "ml_ha_strength": ml_ha_strength,
+                        "ml_vwap_distance_pct": ml_vwap_distance_pct,
+                        "ml_vwap_position": ml_vwap_position,
+                    }
 
+                async with self._pending_orders_lock:
+                    pending_count = len(self._pending_orders)
                 logger.info(
-                    f"📋 PENDING ORDER [{asset}]: {len(self._pending_orders)} orders waiting for fill"
+                    "PENDING_ORDER_ADDED id=%s asset=%s market=%s side=%s "
+                    "limit=%.4f shares=%.4f usd=%.2f pending_total=%d",
+                    result.order_id[:16], asset,
+                    signal.market.condition_id[:8], signal.side.value,
+                    float(signal.recommended_price or 0),
+                    float(signal.size_shares or 0),
+                    float(signal.size_usd or 0),
+                    pending_count,
                 )
         else:
             # Set shorter cooldown (30s) on failures to prevent spam
             self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
+            logger.info(
+                "ORDER_REJECT asset=%s reason=execution_error error=%s",
+                asset,
+                result.error_message,
+            )
             logger.warning(f"    {Colors.BRIGHT_RED}✗ {result.error_message}{Colors.RESET}")
 
     def _on_chainlink_price(self, price: ChainlinkPrice):
@@ -4512,3 +6057,11 @@ class TradingBot:
             "risk_status": self.risk_manager.get_status_summary(),
             "config": self.config.to_dict(),
         }
+
+
+async def main(argv=None) -> None:
+    if argv is not None:
+        import sys
+        sys.argv = [sys.argv[0], *argv]
+    from src.bot.run import main as run_main
+    await run_main()

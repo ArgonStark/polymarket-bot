@@ -18,6 +18,21 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class PauseState:
+    """Single pause reason with optional expiry."""
+
+    reason: str
+    paused_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    expires_at: Optional[datetime] = None
+
+    @property
+    def is_expired(self) -> bool:
+        if self.expires_at is None:
+            return False
+        return datetime.now(timezone.utc) >= self.expires_at
+
+
+@dataclass
 class RiskManager:
     """
     Manages risk parameters and enforces trading limits.
@@ -50,6 +65,10 @@ class RiskManager:
     cooloff_until: Optional[datetime] = None  # When cooloff ends
     trade_history: list = field(default_factory=list)  # Recent trade results
 
+    # Consolidated pause tracking
+    _active_pauses: dict[str, PauseState] = field(default_factory=dict)
+    _last_daily_date: str = ""  # Track last date for daily reset
+
     def initialize(self, bankroll: float):
         """
         Initialize risk manager with starting bankroll.
@@ -63,8 +82,10 @@ class RiskManager:
         self.consecutive_losses = 0
         self.trade_history = []
         self.cooloff_until = None
+        self._active_pauses = {}
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._last_daily_date = today
         self.daily_stats = DailyStats(
             date=today,
             starting_bankroll=bankroll,
@@ -72,6 +93,38 @@ class RiskManager:
         )
 
         logger.info(f"Risk manager initialized with ${bankroll:.2f} bankroll")
+
+    def _add_pause(self, key: str, reason: str, expires_at: Optional[datetime] = None):
+        """Add or update a pause reason."""
+        was_paused = bool(self._active_pauses)
+        self._active_pauses[key] = PauseState(
+            reason=reason,
+            paused_at=datetime.now(timezone.utc),
+            expires_at=expires_at,
+        )
+        if not was_paused:
+            logger.warning("TRADING_PAUSED reason=%s", reason)
+        else:
+            logger.info("TRADING_PAUSE_ADDED reason=%s (total pauses: %d)", reason, len(self._active_pauses))
+
+    def _remove_pause(self, key: str):
+        """Remove a pause reason. Logs TRADING_RESUMED when last pause is cleared."""
+        if key in self._active_pauses:
+            removed = self._active_pauses.pop(key)
+            logger.info("TRADING_PAUSE_CLEARED reason=%s", removed.reason)
+            if not self._active_pauses:
+                logger.info("TRADING_RESUMED all_pauses_cleared=true")
+
+    def _expire_pauses(self):
+        """Remove any pauses that have expired."""
+        expired = [k for k, v in self._active_pauses.items() if v.is_expired]
+        for k in expired:
+            self._remove_pause(k)
+
+    def get_pause_reasons(self) -> list[str]:
+        """Return list of active pause reasons."""
+        self._expire_pauses()
+        return [p.reason for p in self._active_pauses.values()]
 
     def can_trade(self, equity: Optional[float] = None) -> tuple[bool, str]:
         """
@@ -84,6 +137,12 @@ class RiskManager:
         Returns:
             Tuple of (can_trade, reason_if_not)
         """
+        # Check for daily reset first
+        self._maybe_daily_reset()
+
+        # Expire any timed pauses
+        self._expire_pauses()
+
         if not self.is_trading_enabled:
             return (False, self.halt_reason or "Trading halted")
 
@@ -96,9 +155,18 @@ class RiskManager:
             else:
                 # Cooloff expired, reset
                 self.cooloff_until = None
+                self._remove_pause("cooloff")
                 self._reset_after_cooloff()
 
-        if self.daily_stats and self.daily_stats.hit_loss_limit:
+        # Check consolidated pauses
+        if self._active_pauses:
+            first_reason = next(iter(self._active_pauses.values())).reason
+            return (False, first_reason)
+
+        # Check daily loss limit using config threshold
+        loss_limit = self.config.trading.daily_loss_limit
+        if self.daily_stats and self.daily_stats.hit_loss_limit_at(loss_limit):
+            self._add_pause("daily_loss", f"Daily loss limit hit ({loss_limit:.0%})")
             return (False, "Daily loss limit hit")
 
         # Check consecutive losses
@@ -113,19 +181,7 @@ class RiskManager:
         if self.peak_bankroll > 0:
             drawdown = (self.peak_bankroll - current_equity) / self.peak_bankroll
             if drawdown >= trading.max_drawdown_pct:
-                # AUTO-RESET: If no positions, losses are realized - reset peak to continue trading
-                # This prevents the bot from being stuck forever after a losing streak
-                if len(self.positions) == 0:
-                    old_peak = self.peak_bankroll
-                    self.peak_bankroll = current_equity
-                    self.consecutive_losses = 0
-                    logger.warning(
-                        f"🔄 AUTO-RESET DRAWDOWN: No positions, acknowledging realized losses. "
-                        f"Peak ${old_peak:.2f} → ${current_equity:.2f}"
-                    )
-                    # Don't return False - allow trading to continue
-                else:
-                    return (False, f"Drawdown {drawdown:.1%} exceeds {trading.max_drawdown_pct:.0%} limit")
+                return (False, f"Drawdown {drawdown:.1%} exceeds {trading.max_drawdown_pct:.0%} limit")
 
         # Check win rate (only after minimum trades)
         if len(self.trade_history) >= trading.min_trades_for_winrate:
@@ -333,17 +389,33 @@ class RiskManager:
         """
         market_key = signal.market.condition_id
 
+        # Determine held token based on side
+        held_token = (
+            signal.market.up_token_id
+            if signal.side == Side.UP
+            else signal.market.down_token_id
+        )
+
+        # Sanity check token mapping
+        expected = signal.market.up_token_id if signal.side == Side.UP else signal.market.down_token_id
+        if held_token != expected:
+            logger.error(
+                "TOKEN_MAPPING_ERROR: side=%s held=%s expected=%s market=%s",
+                signal.side.value, held_token[:16], expected[:16], market_key[:8],
+            )
+
         position = Position(
             market=signal.market,
             side=signal.side,
-            token_id=(
-                signal.market.up_token_id
-                if signal.side == Side.UP
-                else signal.market.down_token_id
-            ),
+            token_id=held_token,
             entry_price=entry_price,
             shares=shares,
             entry_time=datetime.now(timezone.utc),
+            # Explicit token mapping (immutable for settlement)
+            market_id=market_key,
+            yes_token_id=signal.market.up_token_id,
+            no_token_id=signal.market.down_token_id,
+            held_token_id=held_token,
             ml_volatility=ml_volatility,
             ml_momentum=ml_momentum,
             ml_confidence=ml_confidence,
@@ -486,15 +558,15 @@ class RiskManager:
         if not self.daily_stats:
             return
 
-        daily_return = self.daily_stats.daily_return
-        loss_limit = -self.config.trading.daily_loss_limit
-
-        if daily_return <= loss_limit:
+        loss_limit = self.config.trading.daily_loss_limit
+        if self.daily_stats.hit_loss_limit_at(loss_limit):
+            daily_return = self.daily_stats.daily_return
             self.is_trading_enabled = False
             self.halt_reason = (
                 f"Daily loss limit hit: {daily_return:.1%} "
-                f"(limit: {loss_limit:.1%})"
+                f"(limit: {-loss_limit:.1%})"
             )
+            self._add_pause("daily_loss", self.halt_reason)
             logger.warning(self.halt_reason)
 
     def _check_all_limits(self):
@@ -530,9 +602,10 @@ class RiskManager:
         from datetime import timedelta
         cooloff_minutes = self.config.trading.cooloff_period_minutes
         self.cooloff_until = datetime.now(timezone.utc) + timedelta(minutes=cooloff_minutes)
+        self._add_pause("cooloff", f"Cooloff: {reason} ({cooloff_minutes}m)", expires_at=self.cooloff_until)
         logger.warning(
-            f"🛑 COOLOFF STARTED: {reason} | "
-            f"Trading paused for {cooloff_minutes} minutes until {self.cooloff_until.strftime('%H:%M:%S')} UTC"
+            "COOLOFF_STARTED reason=%s duration=%dm until=%s",
+            reason, cooloff_minutes, self.cooloff_until.strftime('%H:%M:%S'),
         )
 
     def _reset_after_cooloff(self):
@@ -594,6 +667,13 @@ class RiskManager:
         """Get current daily statistics."""
         return self.daily_stats
 
+    def _maybe_daily_reset(self):
+        """Check if we've crossed UTC midnight and perform daily reset."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._last_daily_date and self._last_daily_date != today:
+            self.reset_daily_stats()
+        self._last_daily_date = today
+
     def reset_daily_stats(self):
         """Reset daily stats for new trading day."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -602,18 +682,47 @@ class RiskManager:
             logger.debug("Daily stats already current")
             return
 
+        old_pnl = self.daily_stats.total_pnl if self.daily_stats else 0.0
+        old_trades = self.daily_stats.trades_count if self.daily_stats else 0
+
         self.daily_stats = DailyStats(
             date=today,
             starting_bankroll=self.current_bankroll,
             current_bankroll=self.current_bankroll,
         )
 
+        # Clear day-specific pauses
+        day_pauses = [k for k in self._active_pauses if k in ("daily_loss",)]
+        for k in day_pauses:
+            self._remove_pause(k)
+
         # Reset trading state for new day
         if not self.is_trading_enabled and "loss limit" in (self.halt_reason or ""):
             self.is_trading_enabled = True
             self.halt_reason = None
 
-        logger.info(f"Daily stats reset for {today}")
+        # Reset consecutive losses for fresh start
+        self.consecutive_losses = 0
+
+        logger.info(
+            "DAILY_RESET date=%s bankroll=%.2f prev_pnl=%+.2f prev_trades=%d",
+            today, self.current_bankroll, old_pnl, old_trades,
+        )
+
+    def update_peak_equity(self, equity: float):
+        """
+        Update peak if equity exceeds current peak. Peak only ever increases.
+
+        Called every tick with equity = cash + sum(mark_to_market(positions)).
+        Logs PEAK_UPDATED only when a new high is reached.
+        """
+        if equity > self.peak_bankroll:
+            old_peak = self.peak_bankroll
+            self.peak_bankroll = equity
+            logger.info(
+                "PEAK_UPDATED old=%.2f new=%.2f",
+                old_peak, equity,
+            )
 
     def sync_bankroll(self, actual_balance: float):
         """

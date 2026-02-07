@@ -103,6 +103,19 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("MAX_CONCURRENT_POSITIONS", "4"))
     )
 
+    # Maximum order submits per rolling 60 seconds
+    max_orders_per_min: int = field(
+        default_factory=lambda: int(os.getenv("MAX_ORDERS_PER_MIN", "10"))
+    )
+
+    # Absolute exposure caps in USD
+    max_total_exposure_usd: float = field(
+        default_factory=lambda: float(os.getenv("MAX_TOTAL_EXPOSURE_USD", "200"))
+    )
+    max_exposure_per_asset_usd: float = field(
+        default_factory=lambda: float(os.getenv("MAX_EXPOSURE_PER_ASSET_USD", "75"))
+    )
+
     # Maximum total capital at risk (as % of bankroll)
     # Prevents over-exposure even if individual position limits are met
     max_total_exposure_pct: float = field(
@@ -196,6 +209,12 @@ class TradingConfig:
         default_factory=lambda: float(os.getenv("HISTORY_MIN_PREDICTION_ACCURACY", "0.45"))
     )
 
+    # === Chart Filter Settings ===
+    # Block trades that go against strong chart signals (bearish chart + UP trade = blocked)
+    chart_filter_enabled: bool = field(
+        default_factory=lambda: os.getenv("CHART_FILTER_ENABLED", "true").lower() == "true"
+    )
+
     # === Early Exit Settings (Take-Profit / Stop-Loss) ===
     # Close positions early to lock in profits or limit losses
 
@@ -223,6 +242,18 @@ class TradingConfig:
     # Check positions for early exit every N seconds
     early_exit_check_interval: float = field(
         default_factory=lambda: float(os.getenv("EARLY_EXIT_INTERVAL", "5"))
+    )
+
+    # === Time-Based Exit ===
+    # Close positions before resolution if edge decays
+    time_exit_enabled: bool = field(
+        default_factory=lambda: os.getenv("TIME_EXIT_ENABLED", "true").lower() == "true"
+    )
+    time_exit_seconds: float = field(
+        default_factory=lambda: float(os.getenv("TIME_EXIT_SECONDS", "90"))
+    )
+    exit_edge_threshold: float = field(
+        default_factory=lambda: float(os.getenv("EXIT_EDGE_THRESHOLD", "0.01"))
     )
 
     # === Arbitrage Strategy Settings ===
@@ -288,6 +319,168 @@ class TradingConfig:
     # Order timeout for maker orders (seconds)
     maker_order_timeout: float = field(
         default_factory=lambda: float(os.getenv("MAKER_ORDER_TIMEOUT", "30.0"))
+    )
+
+
+@dataclass
+class PredictionConfig:
+    """Probabilistic prediction model settings."""
+
+    enabled: bool = field(
+        default_factory=lambda: os.getenv("PREDICTION_ENABLED", "false").lower() == "true"
+    )
+    model_path: str = field(
+        default_factory=lambda: os.getenv("PREDICTION_MODEL_PATH", "models/gbm_model.pkl")
+    )
+    min_confidence: float = field(
+        default_factory=lambda: float(os.getenv("PREDICTION_MIN_CONFIDENCE", "0.55"))
+    )
+    velocity_window: int = field(
+        default_factory=lambda: int(os.getenv("PREDICTION_VELOCITY_WINDOW", "20"))
+    )
+    vol_window: int = field(
+        default_factory=lambda: int(os.getenv("PREDICTION_VOL_WINDOW", "60"))
+    )
+
+
+@dataclass
+class StrategyConfig:
+    """Multi-strategy framework settings."""
+
+    multi_strategy_enabled: bool = field(
+        default_factory=lambda: os.getenv("MULTI_STRATEGY_ENABLED", "false").lower() == "true"
+    )
+    trend_weight: float = field(
+        default_factory=lambda: float(os.getenv("STRATEGY_WEIGHT_TREND", "0.4"))
+    )
+    mean_reversion_weight: float = field(
+        default_factory=lambda: float(os.getenv("STRATEGY_WEIGHT_MEAN_REVERSION", "0.3"))
+    )
+    momentum_weight: float = field(
+        default_factory=lambda: float(os.getenv("STRATEGY_WEIGHT_MOMENTUM", "0.3"))
+    )
+
+
+@dataclass
+class RiskSizingConfig:
+    """Dynamic risk sizing parameters."""
+
+    enabled: bool = field(
+        default_factory=lambda: os.getenv("DYNAMIC_SIZING_ENABLED", "true").lower() == "true"
+    )
+    target_volatility: float = field(
+        default_factory=lambda: float(os.getenv("TARGET_VOLATILITY", "0.006"))
+    )
+    kelly_cap: float = field(
+        default_factory=lambda: float(os.getenv("KELLY_CAP", "0.20"))
+    )
+    max_exposure_pct: float = field(
+        default_factory=lambda: float(os.getenv("MAX_EXPOSURE_PCT", "0.10"))
+    )
+    min_trade_usd: float = field(
+        default_factory=lambda: float(os.getenv("MIN_TRADE_USD", "5.0"))
+    )
+
+
+@dataclass
+class ExecutionConfig:
+    """Low-latency execution settings."""
+
+    smart_router_enabled: bool = field(
+        default_factory=lambda: os.getenv("SMART_ROUTER_ENABLED", "true").lower() == "true"
+    )
+    maker_edge_threshold: float = field(
+        default_factory=lambda: float(os.getenv("MAKER_EDGE_THRESHOLD", "0.02"))
+    )
+    taker_edge_threshold: float = field(
+        default_factory=lambda: float(os.getenv("TAKER_EDGE_THRESHOLD", "0.06"))
+    )
+    max_spread: float = field(
+        default_factory=lambda: float(os.getenv("MAX_SPREAD", "0.05"))
+    )
+    stale_order_seconds: float = field(
+        default_factory=lambda: float(os.getenv("STALE_ORDER_SECONDS", "30"))
+    )
+
+
+@dataclass
+class PaperTradingConfig:
+    """Paper trading settings."""
+
+    enabled: bool = field(
+        default_factory=lambda: os.getenv("PAPER_TRADING_ENABLED", "false").lower() == "true"
+    )
+    initial_balance: float = field(
+        default_factory=lambda: float(os.getenv("PAPER_INITIAL_BALANCE", "1000"))
+    )
+    maker_fee_bps: float = field(
+        default_factory=lambda: float(os.getenv("PAPER_MAKER_FEE_BPS", "1.0"))
+    )
+    taker_fee_bps: float = field(
+        default_factory=lambda: float(os.getenv("PAPER_TAKER_FEE_BPS", "2.5"))
+    )
+    slippage_bps: float = field(
+        default_factory=lambda: float(os.getenv("PAPER_SLIPPAGE_BPS", "2.0"))
+    )
+    state_file: str = field(
+        default_factory=lambda: os.getenv("BOT_STATE_FILE", "bot_state.json")
+    )
+
+
+@dataclass
+class MonitoringConfig:
+    """Monitoring output settings."""
+
+    enabled: bool = field(
+        default_factory=lambda: os.getenv("MONITORING_ENABLED", "true").lower() == "true"
+    )
+    output_path: str = field(
+        default_factory=lambda: os.getenv("MONITORING_OUTPUT_PATH", "data/metrics.jsonl")
+    )
+    rolling_window: int = field(
+        default_factory=lambda: int(os.getenv("MONITORING_ROLLING_WINDOW", "50"))
+    )
+
+
+@dataclass
+class MLEngineConfig:
+    """EV-based ML engine configuration."""
+
+    enabled: bool = field(
+        default_factory=lambda: os.getenv("ML_ENGINE_ENABLED", "false").lower() == "true"
+    )
+    bundle_path: str = field(
+        default_factory=lambda: os.getenv(
+            "ML_BUNDLE",
+            os.getenv("ML_BUNDLE_PATH", "models/bundle_v1"),
+        )
+    )
+    fees_bps: float = field(
+        default_factory=lambda: float(os.getenv("ML_FEES_BPS", "2.5"))
+    )
+    slippage_bps: float = field(
+        default_factory=lambda: float(os.getenv("ML_SLIPPAGE_BPS", "2.0"))
+    )
+    min_ev: float = field(
+        default_factory=lambda: float(os.getenv("ML_MIN_EV", "0.01"))
+    )
+    max_uncertainty: float = field(
+        default_factory=lambda: float(os.getenv("ML_MAX_UNCERTAINTY", "0.10"))
+    )
+    max_spread: float = field(
+        default_factory=lambda: float(os.getenv("ML_MAX_SPREAD", "0.06"))
+    )
+    min_depth: float = field(
+        default_factory=lambda: float(os.getenv("ML_MIN_DEPTH", "50"))
+    )
+    max_exposure_pct: float = field(
+        default_factory=lambda: float(os.getenv("ML_MAX_EXPOSURE_PCT", "0.10"))
+    )
+    ev_sizing_scale: float = field(
+        default_factory=lambda: float(os.getenv("ML_EV_SIZING_SCALE", "0.10"))
+    )
+    target_volatility: float = field(
+        default_factory=lambda: float(os.getenv("ML_TARGET_VOLATILITY", "0.006"))
     )
 
 
@@ -503,6 +696,13 @@ class BotConfig:
     trend_protection: TrendProtectionConfig = field(default_factory=TrendProtectionConfig)
     endpoints: EndpointsConfig = field(default_factory=EndpointsConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
+    prediction: PredictionConfig = field(default_factory=PredictionConfig)
+    strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    risk_sizing: RiskSizingConfig = field(default_factory=RiskSizingConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    paper_trading: PaperTradingConfig = field(default_factory=PaperTradingConfig)
+    monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
+    ml_engine: MLEngineConfig = field(default_factory=MLEngineConfig)
 
     # Supported assets for 15-minute markets
     supported_assets: list = field(
@@ -534,7 +734,7 @@ class BotConfig:
         """
         errors = []
 
-        if not self.wallet.validate():
+        if not self.wallet.validate() and not self.dry_run and not self.paper_trading.enabled:
             errors.append("Wallet not configured: PK and FUNDER required")
 
         if self.trading.min_edge < 0 or self.trading.min_edge >= 1:

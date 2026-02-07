@@ -35,6 +35,29 @@ class OrderStatus(Enum):
     REJECTED = "REJECTED"
 
 
+class PositionState(Enum):
+    """
+    State machine for position lifecycle.
+
+    States:
+    - OPEN: Market is active, position can be traded
+    - ENDED_UNRESOLVED: Market ended but outcome not yet determined
+    - RESOLVED_WIN: Outcome known, position wins (mark = 1.0)
+    - RESOLVED_LOSS: Outcome known, position loses (mark = 0.0)
+    - SETTLING: Redemption/cash settlement in progress
+    - CLOSED: Finalized, realized PnL booked, position archived
+
+    Important: SETTLING does NOT imply mark=1.0. Only RESOLVED_WIN does.
+    """
+
+    OPEN = "OPEN"
+    ENDED_UNRESOLVED = "ENDED_UNRESOLVED"
+    RESOLVED_WIN = "RESOLVED_WIN"
+    RESOLVED_LOSS = "RESOLVED_LOSS"
+    SETTLING = "SETTLING"
+    CLOSED = "CLOSED"
+
+
 @dataclass
 class ChainlinkPrice:
     """Real-time price from Chainlink oracle."""
@@ -128,12 +151,14 @@ class MarketState:
     # Metadata
     last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
+    # Settlement snapshot: Chainlink price captured when market moves to expiring queue
+    expiry_chainlink_price: Optional[float] = None
+
     @property
     def time_remaining(self) -> float:
-        """Get seconds remaining until settlement."""
+        """Get seconds remaining until settlement (negative = seconds past expiry)."""
         now = datetime.now(timezone.utc)
-        remaining = (self.end_time - now).total_seconds()
-        return max(0, remaining)
+        return (self.end_time - now).total_seconds()
 
     @property
     def is_active(self) -> bool:
@@ -249,6 +274,12 @@ class Position:
     ml_ha_strength: Optional[float] = None
     ml_vwap_distance_pct: Optional[float] = None
     ml_vwap_position: Optional[str] = None
+
+    # Explicit token mapping (set at open time, immutable for settlement)
+    market_id: str = ""          # condition_id of market this position was opened in
+    yes_token_id: str = ""       # UP token id at open time
+    no_token_id: str = ""        # DOWN token id at open time
+    held_token_id: str = ""      # the token actually purchased
 
     # Averaging down tracking
     times_averaged: int = 0  # How many times we've added to this position
@@ -373,9 +404,18 @@ class DailyStats:
             return 0.0
         return self.net_pnl / self.starting_bankroll
 
-    @property
-    def hit_loss_limit(self) -> bool:
-        """Check if daily loss limit has been hit."""
+    def hit_loss_limit_at(self, threshold: float = 0.20) -> bool:
+        """
+        Check if daily loss limit has been hit.
+
+        Args:
+            threshold: Loss limit as a fraction (e.g. 0.25 = 25%).
+        """
         if self.starting_bankroll == 0:
             return False
-        return self.daily_return < -0.20  # 20% loss limit
+        return self.daily_return < -threshold
+
+    @property
+    def hit_loss_limit(self) -> bool:
+        """Check if daily loss limit has been hit (default 20% fallback)."""
+        return self.hit_loss_limit_at(0.20)
