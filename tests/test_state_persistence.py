@@ -433,6 +433,106 @@ def test_position_serialization_roundtrip():
 
 
 # ---------------------------------------------------------------------------
+# Test: Orphaned positions cleaned up after restart
+# ---------------------------------------------------------------------------
+
+def test_orphaned_positions_cleaned_up():
+    """Positions in expired markets are force-closed as losses on restore."""
+    path = _temp_state_file()
+    try:
+        rm = RiskManager(config=_make_config())
+        rm.initialize(1000.0)
+
+        # Create a position in an expired market (end_time in the past)
+        now = datetime.now(timezone.utc)
+        expired_market = MarketState(
+            condition_id="cond_expired",
+            question="Will BTC go up?",
+            up_token_id="up_expired",
+            down_token_id="down_expired",
+            asset="BTC",
+            target_price=100_000.0,
+            start_time=now - timedelta(minutes=30),
+            end_time=now - timedelta(minutes=10),  # Expired 10 mins ago
+            best_bid=0.50,
+            best_ask=0.55,
+        )
+        pos = _make_position(expired_market, Side.UP, 0.52, 96.15)
+        rm.positions["cond_expired"] = pos
+        rm.current_bankroll = 950.0  # cash after opening
+
+        mgr = BotStateManager(path)
+        mgr.save(rm, {})
+
+        # Simulate restart
+        rm2 = RiskManager(config=_make_config())
+        rm2.initialize(1000.0)
+        saved = mgr.load()
+        mgr.restore_risk_manager(rm2, saved)
+
+        # Position should be restored
+        assert "cond_expired" in rm2.positions
+        assert rm2.positions["cond_expired"].market.end_time < now
+
+        # Simulate _cleanup_orphaned_positions logic
+        orphaned = [
+            cid for cid, p in rm2.positions.items()
+            if p.market.end_time < now
+        ]
+        assert len(orphaned) == 1
+        assert orphaned[0] == "cond_expired"
+
+        # Force close
+        pos = rm2.positions["cond_expired"]
+        rm2.record_position_close(
+            market_key="cond_expired",
+            exit_price=0.0,
+            pnl=-pos.cost_basis,
+        )
+
+        # Position should be removed
+        assert "cond_expired" not in rm2.positions
+        # Bankroll stays at 950: cost was already deducted at open,
+        # force-close as loss adds back cost_basis + (-cost_basis) = 0
+        assert abs(rm2.current_bankroll - 950.0) < 0.01
+        # PnL should be recorded as a loss
+        assert rm2.daily_stats.losses == 1
+        assert rm2.daily_stats.total_pnl < 0
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_active_positions_not_orphaned():
+    """Positions in still-active markets are NOT cleaned up."""
+    now = datetime.now(timezone.utc)
+    active_market = MarketState(
+        condition_id="cond_active",
+        question="Will ETH go up?",
+        up_token_id="up_active",
+        down_token_id="down_active",
+        asset="ETH",
+        target_price=3_000.0,
+        start_time=now - timedelta(minutes=5),
+        end_time=now + timedelta(minutes=10),  # Still active
+        best_bid=0.50,
+        best_ask=0.55,
+    )
+    pos = _make_position(active_market, Side.UP, 0.52, 50.0)
+
+    rm = RiskManager(config=_make_config())
+    rm.initialize(1000.0)
+    rm.positions["cond_active"] = pos
+
+    # Active market should NOT be flagged as orphaned
+    orphaned = [
+        cid for cid, p in rm.positions.items()
+        if p.market.end_time < now
+    ]
+    assert len(orphaned) == 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -452,6 +552,8 @@ if __name__ == "__main__":
         test_daily_stats_reset_new_day,
         test_atomic_write_no_partial,
         test_position_serialization_roundtrip,
+        test_orphaned_positions_cleaned_up,
+        test_active_positions_not_orphaned,
     ]
 
     for i, test_fn in enumerate(tests, 1):

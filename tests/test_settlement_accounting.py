@@ -463,6 +463,55 @@ def test_paper_executor_credit_settlement():
 
 
 # ---------------------------------------------------------------------------
+# Scenario H: Settlement idempotency — double settlement does not double credit
+# ---------------------------------------------------------------------------
+
+def test_settlement_idempotent_no_double_credit():
+    """Double-settling the same market must not credit proceeds twice."""
+    rm = RiskManager(config=_make_config())
+    rm.initialize(1000.0)
+
+    paper = PaperAccount(1000.0)
+
+    market = _make_market("cond_idem", "BTC")
+    pos = _open_position(rm, market, Side.UP, 0.52, 96.15)
+    cost = 0.52 * 96.15
+    paper.debit(cost)
+
+    class MockExecutor:
+        def __init__(self, account):
+            self.account = account
+        def credit_settlement(self, proceeds, market_id=""):
+            if proceeds > 0:
+                self.account.credit(proceeds)
+
+    executor = MockExecutor(paper)
+
+    # First settlement (WIN)
+    pnl, proceeds = _settle_position(rm, market, pos, "UP", paper_executor=executor)
+    cash_after_first = rm.current_bankroll
+    paper_after_first = paper.balance
+
+    assert pnl > 0
+    assert "cond_idem" not in rm.positions, "Position should be closed after first settle"
+
+    # Second settlement attempt — position already gone from risk manager
+    # record_position_close should be a no-op (guard: market_key not in self.positions)
+    rm.record_position_close(
+        market_key="cond_idem",
+        exit_price=1.0,
+        pnl=pnl,
+    )
+
+    # Bankroll must not change on second call
+    assert abs(rm.current_bankroll - cash_after_first) < 0.01, (
+        f"Double settlement changed bankroll: {cash_after_first:.2f} -> {rm.current_bankroll:.2f}"
+    )
+
+    print(f"  PASS: Settlement idempotent. Cash=${rm.current_bankroll:.2f}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -479,6 +528,7 @@ if __name__ == "__main__":
         test_peak_never_reduced_exact_scenario,
         test_update_peak_equity_only_increases,
         test_paper_executor_credit_settlement,
+        test_settlement_idempotent_no_double_credit,
     ]
 
     for i, test_fn in enumerate(tests, 1):

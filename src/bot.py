@@ -69,6 +69,7 @@ from src.ml.policy import Policy, PolicyConfig
 from src.state import BotStateManager
 from src.strategy.trade_history import get_trade_history
 from src.utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
+from src.utils.logging import resolve_execution_mode, _MODE_LABELS
 
 # Import Binance chart analyzer for ML features
 try:
@@ -209,11 +210,15 @@ class TradingBot:
         # Optional ML interface (bundle-aware)
         self.ml_interface: Optional[MLInterface] = None
         bundle_path = os.getenv("ML_BUNDLE") or os.getenv("ML_BUNDLE_PATH") or None
-        min_edge_env = os.getenv("ML_MIN_EDGE", "0.02")
-        try:
-            min_edge = float(min_edge_env)
-        except ValueError:
-            min_edge = 0.02
+        # ML_MIN_EDGE falls back to config.trading.min_edge (unified source)
+        ml_min_edge_env = os.getenv("ML_MIN_EDGE")
+        if ml_min_edge_env is not None:
+            try:
+                min_edge = float(ml_min_edge_env)
+            except ValueError:
+                min_edge = config.trading.min_edge
+        else:
+            min_edge = config.trading.min_edge
         if bundle_path or config.trading.ml_enabled:
             if bundle_path:
                 logger.info(f"ML bundle path resolved: {bundle_path}")
@@ -309,6 +314,11 @@ class TradingBot:
         self._period_boundary_lock = asyncio.Lock()
         self._last_handled_period_ts: int = 0  # Last period we completed transition for
 
+        # Settlement backoff: per-market next-check time + attempt counter
+        # Prevents log spam when API resolution is slow
+        self._settle_next_check: dict[str, float] = {}  # market_id -> monotonic time
+        self._settle_attempts: dict[str, int] = {}       # market_id -> retry count
+
         # Intervals (seconds)
         self.settlement_check_interval = 5.0  # Check settlements frequently
         self.market_discovery_interval = 15.0  # Discover new markets every 15s
@@ -337,6 +347,11 @@ class TradingBot:
         self._startup_time: Optional[datetime] = None  # When bot started
         self._market_first_seen: dict[str, datetime] = {}  # market_id -> first observation time
         self._warmup_complete = False  # True after warm-up period ends
+
+    @property
+    def _execution_mode(self) -> str:
+        """Derive execution mode — delegates to shared resolve_execution_mode()."""
+        return resolve_execution_mode(self.config)
 
     async def initialize(self) -> bool:
         """
@@ -405,18 +420,14 @@ class TradingBot:
         # Log executor path for debugging
         executor_class = type(self.executor).__name__
         executor_module = type(self.executor).__module__
-        mode = "PAPER" if self.config.paper_trading.enabled else ("DRY" if self.config.dry_run else "LIVE")
         router_status = "enabled" if self.config.execution.smart_router_enabled else "disabled"
         logger.info(
             "EXECUTOR_PATH class=%s module=%s mode=%s smart_router=%s",
-            executor_class, executor_module, mode, router_status
+            executor_class, executor_module, self._execution_mode, router_status
         )
 
         # Initialize safety guard for order submission limits
         self.safety_guard = get_safety_guard()
-
-        # Display startup info (balance, account status, etc.)
-        await self._display_startup_info()
 
         # Initialize risk manager with actual bankroll
         initial_bankroll = await self._get_initial_bankroll()
@@ -426,6 +437,7 @@ class TradingBot:
         self.risk_manager.initialize(initial_bankroll)
 
         # Restore persisted state (overwrites defaults if saved state exists)
+        # Must happen BEFORE _display_startup_info so Account Status shows correct balance
         saved_state = self.state_manager.load()
         if saved_state:
             self.state_manager.restore_risk_manager(self.risk_manager, saved_state)
@@ -437,6 +449,11 @@ class TradingBot:
                 self.risk_manager.peak_bankroll,
                 len(self.risk_manager.positions),
             )
+            # Clean up positions in markets that expired while bot was down
+            self._cleanup_orphaned_positions()
+
+        # Display startup info AFTER state restore so balance/positions are correct
+        await self._display_startup_info()
 
         # Sync existing orders to prevent duplicates
         await self._sync_existing_orders(force=True)
@@ -948,17 +965,15 @@ class TradingBot:
         Shows balance, trading mode, and key configuration parameters
         regardless of whether running in simulation or live mode.
         """
-        if self.config.paper_trading.enabled:
-            mode = "PAPER TRADING"
-        else:
-            mode = "SIMULATION" if self.config.dry_run else "LIVE TRADING"
+        # Derive mode from executor (single source of truth)
+        mode = _MODE_LABELS.get(self._execution_mode, "UNKNOWN")
         trading_mode = self.config.trading.mode.upper()
 
         balance = None
         open_orders_count = 0
-        positions_count = 0
+        positions_count = len(self.risk_manager.positions)  # Reflects restored positions
 
-        if self.config.paper_trading.enabled and isinstance(self.executor, PaperOrderExecutor):
+        if isinstance(self.executor, PaperOrderExecutor):
             balance = self.executor.get_balance()
         # Try to fetch real account info if client is available and configured
         elif self.client is not None:
@@ -972,19 +987,22 @@ class TradingBot:
                 open_orders_count = len(open_orders)
 
                 # Fetch active positions
-                positions = get_active_positions(self.client)
-                positions_count = len(positions)
+                active_positions = get_active_positions(self.client)
+                positions_count = len(active_positions)
 
             except Exception as e:
                 logger.warning(f"Could not fetch account info: {e}")
 
         # If no balance fetched and in dry run, use simulated
-        if balance is None and self.config.dry_run:
+        if balance is None and self._execution_mode == "DRY":
             balance = (
                 self.config.trading.base_position_size
                 * self.config.trading.max_concurrent_positions
                 * 5
             )
+
+        # Daily stats from risk manager (may be restored from state)
+        daily_pnl = self.risk_manager.daily_stats.total_pnl if self.risk_manager.daily_stats else 0.0
 
         # Print colorful status box
         print_status_box(
@@ -992,7 +1010,7 @@ class TradingBot:
             balance=balance,
             open_orders=open_orders_count,
             positions=positions_count,
-            daily_pnl=0.0,
+            daily_pnl=daily_pnl,
             win_rate=0.0,
         )
 
@@ -1089,8 +1107,9 @@ class TradingBot:
         logger.info("║     Made by Argon Stark                                        ║")
         logger.info("╚════════════════════════════════════════════════════════════════╝")
 
-        # LIVE TRADING WARNING
-        if not self.config.dry_run:
+        # Mode-specific banner (derived from executor, not config flags)
+        exec_mode = self._execution_mode
+        if exec_mode == "LIVE":
             logger.warning("╔════════════════════════════════════════════════════════════════╗")
             logger.warning("║  ⚠️  LIVE TRADING MODE - REAL MONEY AT RISK ⚠️                  ║")
             logger.warning("╠════════════════════════════════════════════════════════════════╣")
@@ -1101,6 +1120,12 @@ class TradingBot:
             logger.warning("║                                                                ║")
             logger.warning("║  Use --dry-run to test without real trades                     ║")
             logger.warning("╚════════════════════════════════════════════════════════════════╝")
+        elif exec_mode == "PAPER":
+            logger.info("╔════════════════════════════════════════════════════════════════╗")
+            logger.info("║  📝  PAPER TRADING MODE - No real money at risk               ║")
+            logger.info("╠════════════════════════════════════════════════════════════════╣")
+            logger.info(f"║  Bankroll: ${self.risk_manager.current_bankroll:.2f}                                       ║")
+            logger.info("╚════════════════════════════════════════════════════════════════╝")
         else:
             logger.info("🔸 DRY RUN MODE - No real trades will be placed")
 
@@ -1133,20 +1158,46 @@ class TradingBot:
             await self.shutdown()
 
     async def shutdown(self):
-        """Gracefully shutdown the bot."""
-        logger.info("Shutting down trading bot...")
+        """
+        Gracefully shutdown the bot.
+
+        Ordering is critical:
+        1. Stop trading loop (no new orders)
+        2. Cancel open orders
+        3. Let settlement loop drain
+        4. Persist state (no in-flight writes after this)
+        5. Disconnect feeds
+        """
+        t0 = time.monotonic()
+        logger.info("SHUTDOWN_PHASE phase=begin")
+
+        # Phase 1: Stop all loops — prevents new order placement
         self._running = False
         self._shutdown_event.set()
+        t1 = time.monotonic()
+        logger.info("SHUTDOWN_PHASE phase=loops_stopped elapsed=%.3fs", t1 - t0)
 
-        # Save state before disconnecting
+        # Phase 2: Cancel open orders (before state save so state reflects cancellations)
+        if self.executor and hasattr(self.executor, 'cancel_all_orders'):
+            self.executor.cancel_all_orders()
+        t2 = time.monotonic()
+        logger.info("SHUTDOWN_PHASE phase=orders_cancelled elapsed=%.3fs", t2 - t0)
+
+        # Phase 3: Small drain window — let any in-flight coroutines finish
+        # asyncio.gather in start() uses return_exceptions=True so tasks wind down,
+        # but give a brief window for any pending awaits to complete
+        await asyncio.sleep(0.1)
+        t3 = time.monotonic()
+        logger.info("SHUTDOWN_PHASE phase=drain_complete elapsed=%.3fs", t3 - t0)
+
+        # Phase 4: Persist state (no more writes after this point)
         if self.state_manager:
             self.state_manager.save(self.risk_manager, self.markets)
+            self._check_state_invariants()
+        t4 = time.monotonic()
+        logger.info("SHUTDOWN_PHASE phase=state_saved elapsed=%.3fs", t4 - t0)
 
-        # Cancel any open orders (only for live executor, not paper)
-        if self.executor and not self.config.dry_run and hasattr(self.executor, 'cancel_all_orders'):
-            self.executor.cancel_all_orders()
-
-        # Disconnect data feeds
+        # Phase 5: Disconnect data feeds
         self.chainlink_feed.disconnect()
         self.clob_feed.disconnect()
         if self.config.endpoints.binance_direct_enabled:
@@ -1156,7 +1207,63 @@ class TradingBot:
         # Shutdown notification thread pool
         shutdown_notification_executor()
 
-        logger.info("Trading bot shutdown complete")
+        t5 = time.monotonic()
+        logger.info(
+            "SHUTDOWN_PHASE phase=complete total=%.3fs "
+            "(loops=%.3fs cancel=%.3fs drain=%.3fs save=%.3fs disconnect=%.3fs)",
+            t5 - t0, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4,
+        )
+
+    def _check_state_invariants(self):
+        """
+        Log-level assertions on state consistency after every STATE_SAVED.
+
+        Checks:
+        1. Paper mode: bankroll == paper_executor.balance
+        2. Sum of open position costs <= bankroll + epsilon
+        3. Serialized position count == risk_manager.positions count
+
+        Never crashes — mismatches are logged as ERROR + STATE_DIFF block.
+        """
+        eps = 0.02  # rounding tolerance
+        diffs = []
+
+        # 1. Paper mode: bankroll must match paper executor balance
+        if (
+            self.config.paper_trading.enabled
+            and isinstance(self.executor, PaperOrderExecutor)
+        ):
+            paper_bal = self.executor.get_balance()
+            rm_bal = self.risk_manager.current_bankroll
+            if abs(paper_bal - rm_bal) > eps:
+                diffs.append(
+                    f"bankroll={rm_bal:.2f} != paper_balance={paper_bal:.2f} "
+                    f"(delta={rm_bal - paper_bal:+.2f})"
+                )
+
+        # 2. Sum of open position costs <= bankroll + epsilon
+        total_cost = sum(
+            p.cost_basis for p in self.risk_manager.positions.values()
+        )
+        bankroll = self.risk_manager.current_bankroll
+        if total_cost > bankroll + eps:
+            diffs.append(
+                f"position_costs={total_cost:.2f} > bankroll={bankroll:.2f} "
+                f"(over by {total_cost - bankroll:.2f})"
+            )
+
+        # 3. Position count consistency
+        rm_count = len(self.risk_manager.positions)
+        logger.info(
+            "STATE_CHECK bankroll=%.2f positions=%d total_cost=%.2f ok=%s",
+            bankroll, rm_count, total_cost, len(diffs) == 0,
+        )
+
+        if diffs:
+            logger.error(
+                "STATE_DIFF invariant_violations=%d:\n  %s",
+                len(diffs), "\n  ".join(diffs),
+            )
 
     def _get_binance_prices(self) -> dict[str, float]:
         """
@@ -1277,6 +1384,12 @@ class TradingBot:
         if not self.clob_feed.is_connected:
             reason = "CLOB feed disconnected"
             logger.warning("DATA_HEALTH FAIL: %s", reason)
+            return (False, reason)
+
+        # Check CLOB warmup after reconnect
+        if not self.clob_feed.is_warmed_up:
+            reason = "CLOB feed warming up after reconnect"
+            logger.info("DATA_HEALTH WARMUP: %s", reason)
             return (False, reason)
 
         # Check CLOB orderbook freshness for active markets
@@ -1499,6 +1612,7 @@ class TradingBot:
                     or (now_save - self._last_state_save).total_seconds() >= self._state_save_interval
                 ):
                     self.state_manager.save(self.risk_manager, self.markets)
+                    self._check_state_invariants()
                     self._last_state_save = now_save
 
                 # Wait before next iteration
@@ -2467,20 +2581,73 @@ class TradingBot:
             f"Bankroll: ${self.risk_manager.current_bankroll:.2f}"
         )
 
+    def _cleanup_orphaned_positions(self):
+        """
+        Force-close positions in markets that expired while the bot was down.
+
+        Called after state restore. Positions in expired markets cannot be
+        settled normally (no live feed data), so close them as losses to
+        prevent orphaned entries that block trading.
+        """
+        now = datetime.now(timezone.utc)
+        orphaned = []
+        for cid, position in list(self.risk_manager.positions.items()):
+            market = position.market
+            if market.end_time < now:
+                orphaned.append(cid)
+
+        if not orphaned:
+            return
+
+        for cid in orphaned:
+            position = self.risk_manager.positions.get(cid)
+            if not position:
+                continue
+
+            age_sec = (now - position.market.end_time).total_seconds()
+            logger.warning(
+                "ORPHAN_CLEANUP market=%s asset=%s side=%s cost=%.2f "
+                "expired_ago=%.0fs — force-closing as LOSS",
+                cid[:16], position.market.asset, position.side.value,
+                position.cost_basis, age_sec,
+            )
+
+            # Credit paper executor with zero proceeds (full loss)
+            if self.config.paper_trading.enabled and hasattr(self.executor, 'credit_settlement'):
+                self.executor.credit_settlement(0.0, cid)
+
+            self.risk_manager.record_position_close(
+                market_key=cid,
+                exit_price=0.0,
+                pnl=-position.cost_basis,
+            )
+
+            # Mark as settled so we don't try to settle again
+            self.settled_markets.add(cid)
+
+        logger.info(
+            "ORPHAN_CLEANUP_DONE closed=%d bankroll=%.2f",
+            len(orphaned), self.risk_manager.current_bankroll,
+        )
+
     async def _check_settlements(self):
         """
         Check expiring markets for settlement and close positions.
 
-        For each market that has passed its end_time:
-        1. Fetch resolution from API
-        2. If resolved, calculate P&L and close position
-        3. Move to settled set
+        Uses per-market exponential backoff to avoid log spam when
+        API resolution is slow (5s → 10s → 20s → 40s, capped at 60s).
         """
+        now_mono = time.monotonic()
+
         async with self._markets_lock:
             markets_to_settle = []
             for market_id, market in self.expiring_markets.items():
                 # Check if market has passed end time (with small buffer)
                 if market.time_remaining <= -2.0:  # 2 second buffer after expiry
+                    # Exponential backoff: skip if not yet time for next check
+                    next_at = self._settle_next_check.get(market_id, 0.0)
+                    if now_mono < next_at:
+                        continue
                     markets_to_settle.append(market_id)
 
             for market_id in markets_to_settle:
@@ -2489,6 +2656,10 @@ class TradingBot:
 
                 # Only remove from expiring if actually settled
                 if settled:
+                    # Clean up backoff state
+                    self._settle_next_check.pop(market_id, None)
+                    self._settle_attempts.pop(market_id, None)
+
                     # Move to settled set and cleanup
                     self.expiring_markets.pop(market_id, None)
                     self.settled_markets.add(market_id)
@@ -2520,6 +2691,13 @@ class TradingBot:
                     # Cleanup old settled markets (keep last 100)
                     if len(self.settled_markets) > 100:
                         self.settled_markets = set(list(self.settled_markets)[-100:])
+                else:
+                    # Not yet resolved — apply exponential backoff
+                    # 5s → 10s → 20s → 40s → 60s (capped)
+                    attempts = self._settle_attempts.get(market_id, 0) + 1
+                    self._settle_attempts[market_id] = attempts
+                    delay = min(5.0 * (2 ** (attempts - 1)), 60.0)
+                    self._settle_next_check[market_id] = now_mono + delay
 
     async def _settle_market(self, market: MarketState) -> bool:
         """
@@ -2531,6 +2709,11 @@ class TradingBot:
         Returns:
             True if settlement was successful, False if should retry
         """
+        # Idempotency guard: skip if already settled
+        if market.condition_id in self.settled_markets:
+            logger.debug("SETTLE_SKIP already settled market=%s", market.condition_id[:16])
+            return True
+
         # Check if we have a position in this market
         position = self.risk_manager.positions.get(market.condition_id)
         has_position = position is not None
@@ -2567,7 +2750,20 @@ class TradingBot:
                 if verified:
                     logger.debug(f"  └─ On-chain: {verify_msg}")
                 else:
-                    logger.warning(f"  └─ On-chain verification: {verify_msg}")
+                    # On-chain disagrees with API — prefer on-chain
+                    onchain_result = self.settlement_verifier.verify_settlement(market.condition_id)
+                    if onchain_result and onchain_result.on_chain_resolved and onchain_result.winning_outcome:
+                        old_outcome = winning_outcome
+                        winning_outcome = onchain_result.winning_outcome.upper()
+                        logger.warning(
+                            "SETTLE_OVERRIDE market=%s api=%s onchain=%s — using on-chain",
+                            market.condition_id[:16], old_outcome, winning_outcome,
+                        )
+                    else:
+                        logger.warning(
+                            "SETTLE_MISMATCH_UNRESOLVED market=%s api=%s onchain_msg=%s — using API",
+                            market.condition_id[:16], winning_outcome, verify_msg,
+                        )
         else:
             # API doesn't have resolution yet - try local determination
             # For 15-minute crypto markets: price >= target = UP wins
@@ -2585,16 +2781,23 @@ class TradingBot:
                         f"Price: ${resolution_price:,.2f} vs Target: ${market.target_price:,.2f}"
                     )
                 else:
-                    logger.info(
-                        f"Market {market.asset} waiting for API resolution... "
-                        f"(local: {local_outcome}, waited {time_since_expiry:.0f}s)"
+                    # Log at INFO on first attempt, DEBUG thereafter (backoff reduces frequency)
+                    attempts = self._settle_attempts.get(market.condition_id, 0)
+                    log_fn = logger.info if attempts <= 1 else logger.debug
+                    log_fn(
+                        "SETTLE_WAIT market=%s asset=%s local=%s waited=%.0fs attempt=%d",
+                        market.condition_id[:16], market.asset,
+                        local_outcome, time_since_expiry, attempts,
                     )
                     return False  # Wait for API first
             else:
                 # Couldn't determine locally either
-                logger.warning(
-                    f"Could not determine outcome for {market.asset} "
-                    f"(waiting {time_since_expiry:.0f}s since expiry)"
+                attempts = self._settle_attempts.get(market.condition_id, 0)
+                log_fn = logger.warning if attempts <= 1 else logger.debug
+                log_fn(
+                    "SETTLE_WAIT market=%s asset=%s local=NONE waited=%.0fs attempt=%d",
+                    market.condition_id[:16], market.asset,
+                    time_since_expiry, attempts,
                 )
                 # If we've waited more than 5 minutes, give up
                 if time_since_expiry > 300:
@@ -2832,6 +3035,14 @@ class TradingBot:
             position: Our position in the market
             winning_outcome: "UP" or "DOWN"
         """
+        # Idempotency guard: verify position still exists in risk manager
+        if market.condition_id not in self.risk_manager.positions:
+            logger.warning(
+                "SETTLE_SKIP_CLOSED position already closed market=%s",
+                market.condition_id[:16],
+            )
+            return
+
         position_side = position.side.value  # "UP" or "DOWN"
 
         # --- Token-ID based payout (authoritative) ---
@@ -4109,7 +4320,7 @@ class TradingBot:
                 "time_remaining=%.0f simple_mode=%s aggressive_mode=%s order_type=%s",
                 market.asset,
                 float(getattr(signal, "edge", 0.0) or 0.0),
-                float(self.config.trading.edge_for_post_only),
+                float(self.config.trading.min_edge),
                 float(getattr(signal, "time_remaining", 0.0) or 0.0),
                 str(self.config.trading.simple_mode).lower(),
                 str(self.config.trading.aggressive_mode).lower(),
@@ -4258,7 +4469,7 @@ class TradingBot:
                                 chosen_side = "UP" if decision.side == "YES" else "DOWN"
                             else:
                                 chosen_side = "NONE"
-                            min_edge = float(os.getenv("ML_MIN_EDGE", str(self.config.ml_engine.min_ev)))
+                            min_edge = self.ml_interface.min_edge if self.ml_interface else self.config.trading.min_edge
                             logger.info(
                                 "ML_EV_DECISION asset=%s p_up=%.4f yes_ask=%.4f no_ask=%.4f "
                                 "edge_up=%.4f edge_down=%.4f side=%s min_edge=%.4f decision=%s",
@@ -5359,6 +5570,10 @@ class TradingBot:
 
     async def _execute_signal(self, signal: Signal):
         """Execute a trading signal."""
+        # Guard: reject if shutdown has started (no in-flight orders after state save)
+        if not self._running:
+            return
+
         asset = signal.market.asset
         now = datetime.now(timezone.utc)
 
@@ -5442,10 +5657,11 @@ class TradingBot:
         new_order_value = signal.size_usd
         total_exposure = current_exposure + new_order_value
 
-        # Calculate max allowed exposure
-        bankroll = self.risk_manager.current_bankroll
+        # Calculate max allowed exposure based on equity (cash + positions)
+        # Using equity prevents over-allocation after realized profits
+        equity = self._calculate_equity()
         max_exposure_pct = getattr(self.config.trading, 'max_total_exposure_pct', 0.25)
-        max_exposure = bankroll * max_exposure_pct
+        max_exposure = equity * max_exposure_pct
 
         if total_exposure > max_exposure:
             self._log_order_block(
@@ -5698,7 +5914,7 @@ class TradingBot:
         # Log the trade attempt with colors
         direction = "▲" if signal.side == Side.UP else "▼"
         side_color = Colors.BRIGHT_GREEN if signal.side == Side.UP else Colors.BRIGHT_RED
-        mode = "paper" if self.config.paper_trading.enabled else ("dry" if self.config.dry_run else "live")
+        mode = self._execution_mode.lower()
 
         # Log ORDER_SUBMIT BEFORE execution attempt
         logger.info(

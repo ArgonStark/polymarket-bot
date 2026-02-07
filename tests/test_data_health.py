@@ -39,6 +39,9 @@ def _check_data_health(self) -> tuple[bool, str]:
     if not self.clob_feed.is_connected:
         return (False, "CLOB feed disconnected")
 
+    if not self.clob_feed.is_warmed_up:
+        return (False, "CLOB feed warming up after reconnect")
+
     now = datetime.now(timezone.utc)
     for market in self.markets.values():
         ob = self.clob_feed.get_orderbook(market.up_token_id)
@@ -57,6 +60,7 @@ def _make_bot_stub():
     stub.chainlink_feed.is_connected = True
     stub.clob_feed._circuit_open = False
     stub.clob_feed.is_connected = True
+    stub.clob_feed.is_warmed_up = True
     stub.markets = {}
     stub._check_data_health = lambda: _check_data_health(stub)
     return stub
@@ -183,6 +187,25 @@ def test_fresh_orderbook_allowed():
     assert ok, f"Expected healthy with fresh data, got: {reason}"
 
 
+def test_clob_warming_up():
+    """CLOB warming up after reconnect -> blocked."""
+    bot = _make_bot_stub()
+    bot.clob_feed.is_warmed_up = False
+
+    ok, reason = bot._check_data_health()
+    assert not ok
+    assert "warming up" in reason.lower()
+
+
+def test_clob_warmed_up_allowed():
+    """CLOB warmed up after reconnect -> allowed."""
+    bot = _make_bot_stub()
+    bot.clob_feed.is_warmed_up = True
+
+    ok, reason = bot._check_data_health()
+    assert ok, f"Expected healthy after warmup, got: {reason}"
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Testing Data Health Gating")
@@ -197,6 +220,8 @@ if __name__ == "__main__":
         test_clob_disconnected,
         test_stale_orderbook,
         test_fresh_orderbook_allowed,
+        test_clob_warming_up,
+        test_clob_warmed_up_allowed,
     ]
 
     for i, test_fn in enumerate(tests, 1):

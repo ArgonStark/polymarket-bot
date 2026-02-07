@@ -232,14 +232,36 @@ def _send_discord_notification(entry: dict, config: BotConfig):
         logger.error(f"Failed to send Discord notification: {e}")
 
 
+def resolve_execution_mode(config: BotConfig) -> str:
+    """
+    Derive execution mode from config (single source of truth).
+
+    Used by log_bot_start() and TradingBot._execution_mode so every
+    banner, log line, and status panel agrees on the mode string.
+
+    Returns:
+        "PAPER" | "DRY" | "LIVE"
+    """
+    if config.paper_trading.enabled:
+        return "PAPER"
+    if config.dry_run:
+        return "DRY"
+    return "LIVE"
+
+
+_MODE_LABELS = {"PAPER": "PAPER TRADING", "DRY": "DRY RUN", "LIVE": "LIVE TRADING"}
+
+
 def log_bot_start(config: BotConfig):
     """Log bot startup."""
     logger = logging.getLogger(__name__)
 
+    mode = _MODE_LABELS[resolve_execution_mode(config)]
+
     logger.info("=" * 60)
     logger.info("POLYMARKET 15-MIN CRYPTO ARBITRAGE BOT")
     logger.info("=" * 60)
-    logger.info(f"Mode: {'DRY RUN' if config.dry_run else 'LIVE TRADING'}")
+    logger.info(f"Mode: {mode}")
     logger.info(f"Min Edge: {config.trading.min_edge:.1%}")
     logger.info(f"Base Position Size: ${config.trading.base_position_size:.2f}")
     logger.info(f"Max Positions: {config.trading.max_concurrent_positions}")

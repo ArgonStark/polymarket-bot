@@ -97,6 +97,7 @@ class ColoredFormatter(logging.Formatter):
         # Modes
         "SIMULATION": Colors.BRIGHT_YELLOW,
         "LIVE TRADING": Colors.BRIGHT_RED + Colors.BOLD,
+        "PAPER TRADING": Colors.BRIGHT_YELLOW,
         "DRY RUN": Colors.BRIGHT_YELLOW,
     }
 
@@ -245,7 +246,7 @@ def print_status_box(
         daily_pnl: Daily P&L
         win_rate: Win rate percentage
     """
-    mode_color = Colors.BRIGHT_YELLOW if "SIM" in mode else Colors.BRIGHT_RED
+    mode_color = Colors.BRIGHT_RED if "LIVE" in mode else Colors.BRIGHT_YELLOW
     balance_str = f"${balance:,.2f}" if balance else "N/A"
     pnl_color = Colors.BRIGHT_GREEN if daily_pnl >= 0 else Colors.BRIGHT_RED
     pnl_sign = "+" if daily_pnl >= 0 else ""

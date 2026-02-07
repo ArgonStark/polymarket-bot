@@ -10,16 +10,22 @@ Usage:
 Data Sources:
     - Polymarket closed-positions API: Trade outcomes with P&L
     - Binance historical klines API: OHLCV data for indicators
+
+Performance:
+    With --binance-batch-days (default), Binance klines are fetched once per day
+    per symbol, reducing API calls from ~N_trades to ~N_days * N_symbols.
+    Target: 500+ trades/minute after preloading.
 """
 
-import os
 import json
 import time
+import math
 import logging
 import argparse
+from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
-from dataclasses import dataclass, asdict, field
-from typing import Optional, List, Dict, Any, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any, Tuple, Set
 from pathlib import Path
 
 import requests
@@ -55,6 +61,87 @@ ASSET_TO_SYMBOL = {
 # Rate limiting
 BINANCE_RATE_LIMIT = 0.12  # seconds between requests
 POLYMARKET_RATE_LIMIT = 0.25
+
+# Binance API limits
+BINANCE_MAX_KLINES_PER_REQUEST = 1000  # Max klines per request
+MS_PER_MINUTE = 60_000
+MS_PER_DAY = 86_400_000
+
+
+@dataclass
+class EnrichmentStats:
+    """Track enrichment progress and performance metrics."""
+    processed: int = 0
+    new_count: int = 0
+    skipped_existing: int = 0
+    skipped_reason: int = 0
+    errors: int = 0
+    binance_requests: int = 0
+    start_time: float = field(default_factory=time.time)
+    skip_reasons: Dict[str, int] = field(default_factory=dict)
+
+    def record_skip(self, reason: str) -> None:
+        self.skipped_reason += 1
+        self.skip_reasons[reason] = self.skip_reasons.get(reason, 0) + 1
+
+    def elapsed(self) -> float:
+        return time.time() - self.start_time
+
+    def avg_per_100(self) -> float:
+        if self.processed == 0:
+            return 0.0
+        return (self.elapsed() / self.processed) * 100
+
+    def trades_per_minute(self) -> float:
+        elapsed = self.elapsed()
+        if elapsed == 0:
+            return 0.0
+        return (self.processed / elapsed) * 60
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc)
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def _isoformat(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_ts(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    if isinstance(x, str):
+        try:
+            return datetime.fromisoformat(x.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    if isinstance(x, (int, float)):
+        ts = float(x)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        return ts
+    return None
 
 
 @dataclass
@@ -130,13 +217,64 @@ class EnrichedTrade:
     consolidating: bool = False
 
 
-class BinanceHistoricalData:
-    """Fetches historical OHLCV data from Binance."""
+class KlineCache:
+    """LRU cache for Binance kline windows."""
 
-    def __init__(self):
+    def __init__(self, max_size: int = 5000):
+        self.max_size = max_size
+        self._store: OrderedDict[Tuple[str, str, int, int], List[Dict[str, Any]]] = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def _normalize_key(symbol: str, interval: str, start_ms: int, end_ms: int) -> Tuple[str, str, int, int]:
+        norm_start = int(start_ms // 60000) * 60000
+        norm_end = int(end_ms // 60000) * 60000
+        return symbol, interval, norm_start, norm_end
+
+    def get(self, symbol: str, interval: str, start_ms: int, end_ms: int) -> Optional[List[Dict[str, Any]]]:
+        key = self._normalize_key(symbol, interval, start_ms, end_ms)
+        if key in self._store:
+            self._store.move_to_end(key)
+            self.hits += 1
+            return self._store[key]
+        self.misses += 1
+        return None
+
+    def set(self, symbol: str, interval: str, start_ms: int, end_ms: int, value: List[Dict[str, Any]]) -> None:
+        key = self._normalize_key(symbol, interval, start_ms, end_ms)
+        self._store[key] = value
+        self._store.move_to_end(key)
+        if len(self._store) > self.max_size:
+            self._store.popitem(last=False)
+
+    def stats(self) -> Tuple[int, int, float]:
+        total = self.hits + self.misses
+        rate = (self.hits / total * 100.0) if total > 0 else 0.0
+        return self.hits, self.misses, rate
+
+
+class BinanceHistoricalData:
+    """Fetches historical OHLCV data from Binance with day-level batching."""
+
+    def __init__(
+        self,
+        max_cache_windows: int = 5000,
+        batch_days: bool = True,
+        interval: str = "1m",
+        timeout: int = 15,
+    ):
         self.cache: Dict[str, List[Dict]] = {}
         self.last_request = 0
         self.price_cache: Dict[str, float] = {}
+        self.window_cache = KlineCache(max_cache_windows)
+        self.batch_days = batch_days
+        self.interval = interval
+        self.timeout = timeout
+        # day_cache[symbol][day_start_ms][minute_ms] = close_price
+        self.day_cache: Dict[str, Dict[int, Dict[int, float]]] = {}
+        self.request_count = 0
+        self.prefetch_request_count = 0
 
     def _rate_limit(self):
         elapsed = time.time() - self.last_request
@@ -157,9 +295,14 @@ class BinanceHistoricalData:
         if cache_key in self.cache:
             return self.cache[cache_key]
 
+        cached = self.window_cache.get(symbol, interval, start_time, end_time)
+        if cached is not None:
+            return cached
+
         self._rate_limit()
 
         try:
+            self.request_count += 1
             response = requests.get(
                 f"{BINANCE_API}/klines",
                 params={
@@ -169,7 +312,7 @@ class BinanceHistoricalData:
                     "endTime": end_time,
                     "limit": limit,
                 },
-                timeout=10
+                timeout=self.timeout
             )
             response.raise_for_status()
 
@@ -187,6 +330,7 @@ class BinanceHistoricalData:
                 })
 
             self.cache[cache_key] = klines
+            self.window_cache.set(symbol, interval, start_time, end_time, klines)
             return klines
 
         except Exception as e:
@@ -199,12 +343,18 @@ class BinanceHistoricalData:
         if cache_key in self.price_cache:
             return self.price_cache[cache_key]
 
+        if self.batch_days:
+            price = self._get_price_from_day_cache(symbol, timestamp_ms)
+            if price is not None:
+                self.price_cache[cache_key] = price
+                return price
+
         klines = self.get_klines(
             symbol=symbol,
             interval="1m",
             start_time=timestamp_ms - 60000,
             end_time=timestamp_ms + 60000,
-            limit=3
+            limit=3,
         )
 
         if klines:
@@ -228,6 +378,195 @@ class BinanceHistoricalData:
             end_time=timestamp_ms,
             limit=lookback_hours
         )
+
+    def _get_day_store(self, symbol: str) -> Dict[int, Dict[int, float]]:
+        store = self.day_cache.get(symbol)
+        if store is None:
+            store = {}
+            self.day_cache[symbol] = store
+        return store
+
+    def _get_price_from_day_cache(self, symbol: str, timestamp_ms: int) -> Optional[float]:
+        day_start_ms = (timestamp_ms // MS_PER_DAY) * MS_PER_DAY
+        minute_ms = (timestamp_ms // MS_PER_MINUTE) * MS_PER_MINUTE
+        day_store = self.day_cache.get(symbol, {}).get(day_start_ms, {})
+        return day_store.get(minute_ms)
+
+    def _fetch_day_klines(self, symbol: str, day_start_ms: int) -> Dict[int, float]:
+        """Fetch all 1m klines for a single day. Returns minute_ms -> close price."""
+        day_end_ms = day_start_ms + MS_PER_DAY - 1
+        klines: List[Dict[str, Any]] = []
+
+        # A day has 1440 minutes; need 2 requests of 1000 each (or 720 each)
+        cursor = day_start_ms
+        while cursor <= day_end_ms:
+            chunk_end = min(cursor + BINANCE_MAX_KLINES_PER_REQUEST * MS_PER_MINUTE - 1, day_end_ms)
+
+            self._rate_limit()
+            self.request_count += 1
+            self.prefetch_request_count += 1
+
+            try:
+                response = requests.get(
+                    f"{BINANCE_API}/klines",
+                    params={
+                        "symbol": symbol,
+                        "interval": self.interval,
+                        "startTime": cursor,
+                        "endTime": chunk_end,
+                        "limit": BINANCE_MAX_KLINES_PER_REQUEST,
+                    },
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                raw_klines = response.json()
+
+                for k in raw_klines:
+                    klines.append({
+                        "open_time": k[0],
+                        "close": float(k[4]),
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to fetch klines for {symbol} day {day_start_ms}: {e}")
+
+            cursor = chunk_end + 1
+
+        minute_prices: Dict[int, float] = {}
+        for k in klines:
+            minute_prices[int(k["open_time"])] = k["close"]
+        return minute_prices
+
+    def prefetch_days(
+        self,
+        symbol: str,
+        day_starts_ms: List[int],
+        max_days: Optional[int] = None,
+    ) -> int:
+        """
+        Prefetch all 1m klines for the given days.
+
+        Args:
+            symbol: Binance symbol (e.g., BTCUSDT)
+            day_starts_ms: List of day start timestamps in milliseconds
+            max_days: Optional limit on number of days to prefetch (most recent first)
+
+        Returns:
+            Number of days actually prefetched
+        """
+        if not self.batch_days:
+            return 0
+        if not day_starts_ms:
+            return 0
+
+        day_store = self._get_day_store(symbol)
+
+        # Filter to days not already cached
+        days_to_fetch = [d for d in day_starts_ms if d not in day_store]
+
+        # Sort descending (most recent first) and apply max_days limit
+        days_to_fetch.sort(reverse=True)
+        if max_days is not None and max_days > 0:
+            days_to_fetch = days_to_fetch[:max_days]
+
+        # Re-sort ascending for sequential fetching
+        days_to_fetch.sort()
+
+        prefetched = 0
+        for day_start in days_to_fetch:
+            minute_prices = self._fetch_day_klines(symbol, day_start)
+            day_store[day_start] = minute_prices
+            prefetched += 1
+
+            if prefetched % 10 == 0:
+                day_dt = datetime.fromtimestamp(day_start / 1000, tz=timezone.utc)
+                logger.info(f"  Prefetched {prefetched}/{len(days_to_fetch)} days for {symbol} (current: {day_dt.date()})")
+
+        return prefetched
+
+    def get_price_history(
+        self,
+        symbol: str,
+        end_time_ms: int,
+        points: int,
+        interval: str = "1m",
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """
+        Get a rolling price history ending at the given timestamp.
+
+        Returns:
+            Tuple of (history list, error reason or None)
+            History points must end at or before entry timestamp.
+        """
+        if points <= 0:
+            return [], "invalid points"
+
+        start_time = end_time_ms - (points * MS_PER_MINUTE)
+
+        if interval != "1m" or not self.batch_days:
+            # Fallback to per-request fetching
+            klines = self.get_klines(
+                symbol=symbol,
+                interval=interval if interval != "1m" else self.interval,
+                start_time=start_time,
+                end_time=end_time_ms,
+                limit=min(points * 2, BINANCE_MAX_KLINES_PER_REQUEST),
+            )
+            history = []
+            for k in klines:
+                open_time = k["open_time"]
+                if open_time > end_time_ms:
+                    continue
+                history.append({
+                    "ts": datetime.fromtimestamp(open_time / 1000, tz=timezone.utc).isoformat(),
+                    "price": float(k["close"]),
+                })
+
+            if len(history) < points:
+                return [], f"insufficient data from API ({len(history)}/{points})"
+            return history[-points:], None
+
+        # Batch mode: slice from preloaded day cache
+        klines = []
+        end_minute_ms = (end_time_ms // MS_PER_MINUTE) * MS_PER_MINUTE
+        needed = points
+        current_ms = end_minute_ms
+        days_checked = set()
+
+        while needed > 0 and current_ms > 0:
+            day_start_ms = (current_ms // MS_PER_DAY) * MS_PER_DAY
+            days_checked.add(day_start_ms)
+
+            day_prices = self.day_cache.get(symbol, {}).get(day_start_ms)
+            if day_prices is None:
+                # Day not prefetched - can't continue
+                break
+
+            while current_ms >= day_start_ms and needed > 0:
+                price = day_prices.get(current_ms)
+                if price is not None:
+                    klines.append({"open_time": current_ms, "close": price})
+                    needed -= 1
+                current_ms -= MS_PER_MINUTE
+
+            if current_ms < day_start_ms:
+                current_ms = day_start_ms - MS_PER_MINUTE
+
+        klines = list(reversed(klines))
+
+        history = []
+        for k in klines:
+            open_time = k["open_time"]
+            if open_time > end_time_ms:
+                continue
+            history.append({
+                "ts": datetime.fromtimestamp(open_time / 1000, tz=timezone.utc).isoformat(),
+                "price": float(k["close"]),
+            })
+
+        if len(history) < points:
+            return [], f"insufficient history from cache ({len(history)}/{points}, days checked: {len(days_checked)})"
+
+        return history[-points:], None
 
 
 class TechnicalIndicators:
@@ -472,9 +811,24 @@ class PolymarketTradesFetcher:
 class TradeEnricher:
     """Enriches trades with market context."""
 
-    def __init__(self):
-        self.binance = BinanceHistoricalData()
+    def __init__(
+        self,
+        max_cache_windows: int = 5000,
+        batch_days: bool = True,
+        binance_interval: str = "1m",
+        binance_timeout: int = 15,
+        fetch_market_info: bool = False,
+    ):
+        self.binance = BinanceHistoricalData(
+            max_cache_windows=max_cache_windows,
+            batch_days=batch_days,
+            interval=binance_interval,
+            timeout=binance_timeout,
+        )
         self.indicators = TechnicalIndicators()
+        self._market_cache: Dict[str, Dict[str, Any]] = {}
+        self._market_last_request = 0.0
+        self._fetch_market_info_enabled = fetch_market_info
 
     def _detect_asset(self, title: str) -> Optional[str]:
         """Detect asset from market title."""
@@ -492,6 +846,198 @@ class TradeEnricher:
             return "UP"
         elif "down" in outcome_lower or "no" in outcome_lower or "lower" in outcome_lower:
             return "DOWN"
+        return None
+
+    def _detect_market_direction(self, title: str) -> Optional[str]:
+        title_lower = title.lower()
+        if "up" in title_lower or "higher" in title_lower or "above" in title_lower:
+            return "UP"
+        if "down" in title_lower or "lower" in title_lower or "below" in title_lower:
+            return "DOWN"
+        return None
+
+    def _parse_outcome_token(self, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        v = value.lower()
+        if "yes" in v or v == "y":
+            return "YES"
+        if "no" in v or v == "n":
+            return "NO"
+        if v in ("1", "true"):
+            return "YES"
+        if v in ("0", "false"):
+            return "NO"
+        if "up" in v or "higher" in v or "above" in v:
+            return "UP"
+        if "down" in v or "lower" in v or "below" in v:
+            return "DOWN"
+        return None
+
+    def _opposite_token(self, token: str) -> str:
+        return {
+            "YES": "NO",
+            "NO": "YES",
+            "UP": "DOWN",
+            "DOWN": "UP",
+        }[token]
+
+    def _rate_limit_market(self) -> None:
+        elapsed = time.time() - self._market_last_request
+        if elapsed < POLYMARKET_RATE_LIMIT:
+            time.sleep(POLYMARKET_RATE_LIMIT - elapsed)
+        self._market_last_request = time.time()
+
+    def _fetch_market_info(self, condition_id: str) -> Optional[Dict[str, Any]]:
+        if not condition_id:
+            return None
+        if condition_id in self._market_cache:
+            return self._market_cache[condition_id]
+
+        self._rate_limit_market()
+        try:
+            response = requests.get(
+                f"{POLYMARKET_DATA_API}/markets/{condition_id}",
+                timeout=30,
+            )
+            if response.status_code == 404:
+                response = requests.get(
+                    f"{POLYMARKET_DATA_API}/markets",
+                    params={"conditionId": condition_id},
+                    timeout=30,
+                )
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, list):
+                data = data[0] if data else None
+            if data:
+                self._market_cache[condition_id] = data
+            return data
+        except Exception as e:
+            logger.debug(f"Failed to fetch market info for {condition_id}: {e}")
+            return None
+
+    def _extract_ts_from(self, data: Dict[str, Any], keys: List[str]) -> Optional[datetime]:
+        for key in keys:
+            if key in data and data[key]:
+                parsed = _parse_timestamp(data[key])
+                if parsed:
+                    return parsed
+        return None
+
+    def _resolve_market_times(
+        self,
+        position: Dict[str, Any],
+        market_info: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[datetime], Optional[datetime]]:
+        open_keys = [
+            "marketOpenTimestamp",
+            "openTimestamp",
+            "openTime",
+            "openingTime",
+            "startTime",
+            "startDate",
+            "startTimestamp",
+        ]
+        end_keys = [
+            "marketEndTimestamp",
+            "closeTimestamp",
+            "closeTime",
+            "closingTime",
+            "endTime",
+            "endDate",
+            "resolutionTime",
+            "resolutionDate",
+            "resolvedAt",
+        ]
+
+        open_ts = self._extract_ts_from(position, open_keys)
+        end_ts = self._extract_ts_from(position, end_keys)
+
+        if market_info:
+            open_ts = open_ts or self._extract_ts_from(market_info, open_keys)
+            end_ts = end_ts or self._extract_ts_from(market_info, end_keys)
+
+        if open_ts and not end_ts:
+            end_ts = open_ts + timedelta(minutes=15)
+        if end_ts and not open_ts:
+            open_ts = end_ts - timedelta(minutes=15)
+
+        return open_ts, end_ts
+
+    def _infer_yes_mid(
+        self,
+        entry_price: float,
+        outcome_token: Optional[str],
+    ) -> Optional[float]:
+        if outcome_token in ("YES", "UP"):
+            return entry_price
+        if outcome_token in ("NO", "DOWN"):
+            return 1.0 - entry_price
+        return None
+
+    def _synthetic_orderbook(
+        self,
+        yes_bid: float,
+        yes_ask: float,
+        depth_levels: int,
+        tick: float = 0.001,
+        base_size: float = 100.0,
+        size_step: float = 20.0,
+    ) -> Tuple[List[List[float]], List[List[float]]]:
+        bids: List[List[float]] = []
+        asks: List[List[float]] = []
+        for i in range(depth_levels):
+            bid_price = max(yes_bid - tick * i, 0.0001)
+            ask_price = max(yes_ask + tick * i, 0.0001)
+            size = max(base_size - size_step * i, 1.0)
+            bids.append([round(bid_price, 6), float(size)])
+            asks.append([round(ask_price, 6), float(size)])
+        return bids, asks
+
+    def _resolve_resolution(
+        self,
+        position: Dict[str, Any],
+        market_info: Optional[Dict[str, Any]],
+        market_direction: Optional[str],
+        outcome_token: Optional[str],
+    ) -> Optional[str]:
+        candidates = []
+        for src in (position, market_info or {}):
+            candidates.extend(
+                [
+                    src.get("resolvedOutcome"),
+                    src.get("resolvedOutcomeId"),
+                    src.get("resolution"),
+                    src.get("result"),
+                    src.get("finalOutcome"),
+                ]
+            )
+
+        resolved_token = None
+        for cand in candidates:
+            token = self._parse_outcome_token(str(cand)) if cand is not None else None
+            if token:
+                resolved_token = token
+                break
+
+        if resolved_token is None:
+            cur_price = position.get("curPrice")
+            cur_price = _to_float(cur_price)
+            if cur_price is None or cur_price not in (0.0, 1.0):
+                return None
+            if outcome_token is None:
+                return None
+            resolved_token = outcome_token if cur_price == 1.0 else self._opposite_token(outcome_token)
+
+        if resolved_token in ("UP", "DOWN"):
+            return resolved_token
+
+        if resolved_token in ("YES", "NO") and market_direction:
+            if market_direction == "UP":
+                return "UP" if resolved_token == "YES" else "DOWN"
+            return "DOWN" if resolved_token == "YES" else "UP"
+
         return None
 
     def _get_session_info(self, timestamp: datetime) -> Tuple[bool, bool, bool, bool]:
@@ -660,11 +1206,175 @@ class TradeEnricher:
             logger.debug(f"Error enriching position: {e}")
             return None
 
+    def enrich_position_v2(
+        self,
+        position: Dict[str, Any],
+        depth_levels: int,
+        history_points: int,
+        window_tolerance_seconds: int,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        try:
+            ts_raw = position.get("timestamp") or position.get("ts")
+            entry_dt = _parse_timestamp(ts_raw)
+            if not entry_dt:
+                return None, "missing timestamp"
+
+            entry_ts = normalize_ts(_isoformat(entry_dt))
+            if entry_ts is None:
+                return None, "missing timestamp"
+
+            entry_ms = int(entry_dt.timestamp() * 1000)
+
+            title = position.get("title") or position.get("question") or ""
+            asset = self._detect_asset(title)
+            if not asset:
+                return None, "asset not detected"
+
+            symbol = ASSET_TO_SYMBOL.get(asset)
+            if not symbol:
+                return None, "missing symbol"
+
+            market_direction = self._detect_market_direction(title)
+            if not market_direction:
+                return None, "market direction not detected"
+
+            condition_id = position.get("conditionId") or position.get("marketId") or position.get("id")
+            market_info = None
+            if self._fetch_market_info_enabled and condition_id:
+                market_info = self._fetch_market_info(str(condition_id))
+
+            market_open_ts = math.floor(entry_ts / 900.0) * 900.0
+            market_end_ts = market_open_ts + 900.0
+            market_open_dt = datetime.fromtimestamp(market_open_ts, tz=timezone.utc)
+            market_end_dt = datetime.fromtimestamp(market_end_ts, tz=timezone.utc)
+            tol = float(window_tolerance_seconds)
+            if entry_ts < (market_open_ts - tol) or entry_ts > (market_end_ts + tol):
+                return None, "entry timestamp outside market window"
+
+            entry_price = _to_float(position.get("avgPrice") or position.get("entryPrice") or position.get("price"))
+            if entry_price is None or entry_price <= 0 or entry_price >= 1:
+                return None, "invalid entry price"
+
+            outcome_token = self._parse_outcome_token(
+                position.get("outcome")
+                or position.get("positionOutcome")
+                or position.get("outcomeTitle")
+            )
+
+            yes_bid = _to_float(position.get("yesBid") or position.get("yes_bid") or position.get("bestYesBid"))
+            yes_ask = _to_float(position.get("yesAsk") or position.get("yes_ask") or position.get("bestYesAsk"))
+
+            if yes_bid is None or yes_ask is None:
+                yes_mid = self._infer_yes_mid(entry_price, outcome_token)
+                if yes_mid is None:
+                    return None, "cannot infer yes price"
+                yes_bid = yes_mid if yes_bid is None else yes_bid
+                yes_ask = yes_mid if yes_ask is None else yes_ask
+
+            if yes_bid <= 0 or yes_ask <= 0:
+                return None, "invalid yes bid/ask"
+
+            no_bid = _to_float(position.get("noBid") or position.get("no_bid") or position.get("bestNoBid"))
+            no_ask = _to_float(position.get("noAsk") or position.get("no_ask") or position.get("bestNoAsk"))
+            if no_bid is None:
+                no_bid = 1.0 - yes_ask
+            if no_ask is None:
+                no_ask = 1.0 - yes_bid
+
+            if no_bid <= 0 or no_ask <= 0:
+                return None, "invalid no bid/ask"
+
+            orderbook_bids, orderbook_asks = self._synthetic_orderbook(yes_bid, yes_ask, depth_levels)
+
+            history, history_err = self.binance.get_price_history(symbol, entry_ms, history_points)
+            if history_err:
+                return None, f"insufficient reference price history: {history_err}"
+
+            reference_price = self.binance.get_price_at_time(symbol, entry_ms)
+            if reference_price is None:
+                reference_price = history[-1]["price"]
+            reference_price_open = self.binance.get_price_at_time(
+                symbol, int(market_open_dt.timestamp() * 1000)
+            )
+            if reference_price is None or reference_price_open is None:
+                return None, "missing reference prices"
+
+            resolution = self._resolve_resolution(position, market_info, market_direction, outcome_token)
+            if resolution is None:
+                return None, "missing resolution"
+
+            row = {
+                "timestamp": _isoformat(entry_dt),
+                "market_open_ts": _isoformat(market_open_dt),
+                "market_end_ts": _isoformat(market_end_dt),
+                "polymarket_yes_bid": float(yes_bid),
+                "polymarket_yes_ask": float(yes_ask),
+                "polymarket_no_bid": float(no_bid),
+                "polymarket_no_ask": float(no_ask),
+                "orderbook_bids": orderbook_bids,
+                "orderbook_asks": orderbook_asks,
+                "reference_price": float(reference_price),
+                "reference_price_open": float(reference_price_open),
+                "reference_price_history": history,
+                "resolution": resolution,
+                "trade_id": str(condition_id) if condition_id else "",
+                "asset": asset,
+            }
+
+            return row, None
+        except Exception as e:
+            return None, f"error: {e}"
+
 
 def main():
     parser = argparse.ArgumentParser(description="Enrich historical trades with market data")
     parser.add_argument("--wallet", required=True, help="Wallet address to fetch trades for")
-    parser.add_argument("--output", default="data/enriched_trades.json", help="Output file path")
+    parser.add_argument("--output", default="data/enriched_trades_v2.jsonl", help="Output file path")
+    parser.add_argument("--depth-levels", type=int, default=5, help="Synthetic orderbook depth levels")
+    parser.add_argument("--history-points", type=int, default=20, help="Reference price history points")
+    parser.add_argument(
+        "--window-tolerance-seconds",
+        type=int,
+        default=60,
+        help="Tolerance window in seconds for entry timestamp vs market window",
+    )
+    parser.add_argument(
+        "--binance-batch-days",
+        type=lambda v: str(v).lower() in ("1", "true", "yes"),
+        default=True,
+        help="Batch Binance 1m klines by day (default true)",
+    )
+    parser.add_argument(
+        "--binance-interval",
+        type=str,
+        default="1m",
+        help="Binance kline interval (default 1m)",
+    )
+    parser.add_argument(
+        "--binance-timeout",
+        type=int,
+        default=15,
+        help="Binance API request timeout in seconds (default 15)",
+    )
+    parser.add_argument(
+        "--max-days",
+        type=int,
+        default=None,
+        help="Only preload this many most-recent days for debugging (default: all)",
+    )
+    parser.add_argument(
+        "--max-cache-windows",
+        type=int,
+        default=5000,
+        help="Max cached kline windows (LRU)",
+    )
+    parser.add_argument(
+        "--fetch-market-info",
+        type=lambda v: str(v).lower() in ("1", "true", "yes"),
+        default=False,
+        help="Fetch additional market info from Polymarket API (slow, default false)",
+    )
+    parser.add_argument("--limit", type=int, default=None, help="Stop after N trades")
     parser.add_argument("--max-positions", type=int, default=20000, help="Maximum positions to fetch")
     parser.add_argument("--resume", action="store_true", help="Resume from existing output file")
     args = parser.parse_args()
@@ -675,12 +1385,19 @@ def main():
 
     # Load existing data if resuming
     existing_ids = set()
-    existing_data = []
     if args.resume and output_path.exists():
         with open(output_path) as f:
-            existing_data = json.load(f)
-            existing_ids = {t["trade_id"] for t in existing_data}
-            logger.info(f"Resuming with {len(existing_data)} existing enriched trades")
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    trade_id = row.get("trade_id")
+                    if trade_id:
+                        existing_ids.add(trade_id)
+                except json.JSONDecodeError:
+                    continue
+        logger.info(f"Resuming with {len(existing_ids)} existing enriched trades")
 
     # Fetch closed positions
     logger.info(f"Fetching closed positions for wallet: {args.wallet}")
@@ -688,92 +1405,169 @@ def main():
     positions = fetcher.fetch_all_closed_positions(max_positions=args.max_positions)
     logger.info(f"Found {len(positions)} closed positions")
 
-    # Filter to crypto Up/Down markets only
+    # Filter to crypto markets only
     crypto_positions = []
     for pos in positions:
         title = pos.get("title", "").lower()
         if any(pattern in title for patterns in ASSET_PATTERNS.values() for pattern in patterns):
-            if "up" in title or "down" in title:
-                crypto_positions.append(pos)
+            crypto_positions.append(pos)
 
-    logger.info(f"Filtered to {len(crypto_positions)} crypto Up/Down positions")
+    logger.info(f"Filtered to {len(crypto_positions)} crypto positions")
+    logger.info("Orderbook snapshots unavailable; using synthetic orderbooks")
 
     # Enrich positions
-    enricher = TradeEnricher()
-    enriched_trades = existing_data.copy()
+    enricher = TradeEnricher(
+        max_cache_windows=args.max_cache_windows,
+        batch_days=args.binance_batch_days,
+        binance_interval=args.binance_interval,
+        binance_timeout=args.binance_timeout,
+        fetch_market_info=args.fetch_market_info,
+    )
 
-    new_count = 0
-    skip_count = 0
-    error_count = 0
+    stats = EnrichmentStats()
     total = len(crypto_positions)
+    mode = "a" if args.resume and output_path.exists() else "w"
 
-    for i, position in enumerate(crypto_positions):
-        trade_id = position.get("conditionId", "")
+    # Prefetch Binance data by day if batching enabled
+    if args.binance_batch_days:
+        logger.info("Extracting trade timestamps and computing required days...")
+        symbol_days: Dict[str, Set[int]] = {}
 
-        if trade_id in existing_ids:
-            skip_count += 1
-            continue
+        for pos in crypto_positions:
+            ts_raw = pos.get("timestamp") or pos.get("ts")
+            entry_ts = normalize_ts(ts_raw)
+            if entry_ts is None:
+                continue
+            title = pos.get("title") or pos.get("question") or ""
+            asset = enricher._detect_asset(title)
+            if not asset:
+                continue
+            symbol = ASSET_TO_SYMBOL.get(asset)
+            if not symbol:
+                continue
 
-        if (i + 1) % 100 == 0 or i == 0:
-            logger.info(f"Progress: {i+1}/{total} | New: {new_count} | Skipped: {skip_count} | Errors: {error_count}")
+            # Compute day start in milliseconds
+            day_start_sec = int(entry_ts // 86400) * 86400
+            day_start_ms = day_start_sec * 1000
+            symbol_days.setdefault(symbol, set()).add(day_start_ms)
 
-        enriched = enricher.enrich_position(position)
+            # If trade is near start of day, also need previous day for history
+            minutes_into_day = (entry_ts - day_start_sec) / 60.0
+            if minutes_into_day < args.history_points:
+                prev_day_ms = (day_start_sec - 86400) * 1000
+                symbol_days.setdefault(symbol, set()).add(prev_day_ms)
 
-        if enriched:
-            enriched_trades.append(asdict(enriched))
-            existing_ids.add(enriched.trade_id)
-            new_count += 1
-        else:
-            error_count += 1
+        # Log summary and prefetch
+        total_days = sum(len(days) for days in symbol_days.values())
+        logger.info(f"Need to prefetch {total_days} symbol-days across {len(symbol_days)} symbols")
 
-        # Save periodically
-        if new_count > 0 and new_count % 200 == 0:
-            with open(output_path, "w") as f:
-                json.dump(enriched_trades, f, indent=2)
-            logger.info(f"Checkpoint: Saved {len(enriched_trades)} enriched trades")
+        for symbol, days in sorted(symbol_days.items()):
+            sorted_days = sorted(days)
+            date_range = ""
+            if sorted_days:
+                first_dt = datetime.fromtimestamp(sorted_days[0] / 1000, tz=timezone.utc)
+                last_dt = datetime.fromtimestamp(sorted_days[-1] / 1000, tz=timezone.utc)
+                date_range = f" ({first_dt.date()} to {last_dt.date()})"
 
-    # Final save
-    with open(output_path, "w") as f:
-        json.dump(enriched_trades, f, indent=2)
+            logger.info(f"Prefetching {len(days)} days for {symbol}{date_range}...")
+            prefetched = enricher.binance.prefetch_days(symbol, sorted_days, max_days=args.max_days)
+            logger.info(f"  Completed: {prefetched} days, {enricher.binance.prefetch_request_count} API requests")
 
-    # Summary
+        logger.info(f"Prefetch complete. Total Binance requests: {enricher.binance.request_count}")
+        logger.info("-" * 60)
+
+    def log_progress(stats: EnrichmentStats, idx: int, total: int, enricher: TradeEnricher) -> None:
+        """Log progress stats."""
+        elapsed = stats.elapsed()
+        avg_per_100 = stats.avg_per_100()
+        tpm = stats.trades_per_minute()
+
+        hits, misses, cache_rate = enricher.binance.window_cache.stats()
+
+        logger.info(
+            f"[{idx}/{total}] processed={stats.processed} | new={stats.new_count} | "
+            f"skipped={stats.skipped_existing + stats.skipped_reason} | errors={stats.errors}"
+        )
+        logger.info(
+            f"  Binance requests: {enricher.binance.request_count} | "
+            f"Cache hit rate: {cache_rate:.1f}% ({hits}/{hits + misses})"
+        )
+        logger.info(
+            f"  Elapsed: {elapsed:.1f}s | Avg: {avg_per_100:.2f}s/100 trades | Rate: {tpm:.1f} trades/min"
+        )
+
+    logger.info(f"Starting enrichment of {total} crypto positions...")
+
+    with open(output_path, mode) as f:
+        last_log_time = time.time()
+
+        for i, position in enumerate(crypto_positions):
+            if args.limit is not None and stats.processed >= args.limit:
+                break
+
+            trade_id = position.get("conditionId", "")
+
+            # Skip already processed
+            if trade_id in existing_ids:
+                stats.skipped_existing += 1
+                continue
+
+            stats.processed += 1
+
+            # Log every 500 trades OR every 30 seconds (whichever comes first)
+            now = time.time()
+            if stats.processed % 500 == 0 or (now - last_log_time) >= 30:
+                log_progress(stats, i + 1, total, enricher)
+                last_log_time = now
+
+            row, reason = enricher.enrich_position_v2(
+                position,
+                depth_levels=args.depth_levels,
+                history_points=args.history_points,
+                window_tolerance_seconds=args.window_tolerance_seconds,
+            )
+
+            if row:
+                f.write(json.dumps(row) + "\n")
+                f.flush()
+                if trade_id:
+                    existing_ids.add(trade_id)
+                stats.new_count += 1
+            else:
+                if reason:
+                    stats.record_skip(reason)
+                    logger.debug(f"Skipping {trade_id or 'unknown'}: {reason}")
+                else:
+                    stats.errors += 1
+
+    # Final summary
+    elapsed = stats.elapsed()
     logger.info("=" * 60)
     logger.info("ENRICHMENT COMPLETE")
     logger.info("=" * 60)
-    logger.info(f"Total enriched trades: {len(enriched_trades)}")
-    logger.info(f"New trades enriched: {new_count}")
-    logger.info(f"Skipped (already processed): {skip_count}")
-    logger.info(f"Errors (non-crypto or invalid): {error_count}")
+    logger.info(f"Total processed:        {stats.processed}")
+    logger.info(f"New trades enriched:    {stats.new_count}")
+    logger.info(f"Skipped (existing):     {stats.skipped_existing}")
+    logger.info(f"Skipped (invalid):      {stats.skipped_reason}")
+    logger.info(f"Errors:                 {stats.errors}")
+    logger.info("-" * 40)
+    logger.info(f"Binance API requests:   {enricher.binance.request_count}")
+    logger.info(f"  (prefetch requests):  {enricher.binance.prefetch_request_count}")
+    hits, misses, cache_rate = enricher.binance.window_cache.stats()
+    logger.info(f"Cache hit rate:         {cache_rate:.1f}% ({hits}/{hits + misses})")
+    logger.info("-" * 40)
+    logger.info(f"Elapsed time:           {elapsed:.1f}s")
+    if stats.processed > 0:
+        logger.info(f"Throughput:             {stats.trades_per_minute():.1f} trades/min")
+    logger.info("-" * 40)
+
+    # Log skip reasons breakdown
+    if stats.skip_reasons:
+        logger.info("Skip reasons breakdown:")
+        for reason, count in sorted(stats.skip_reasons.items(), key=lambda x: -x[1]):
+            logger.info(f"  {reason}: {count}")
+
     logger.info(f"Output saved to: {output_path}")
-
-    # Stats
-    if enriched_trades:
-        wins = sum(1 for t in enriched_trades if t["outcome"] == "WIN")
-        losses = sum(1 for t in enriched_trades if t["outcome"] == "LOSS")
-        total_pnl = sum(t.get("realized_pnl", 0) for t in enriched_trades)
-
-        if wins + losses > 0:
-            logger.info(f"Win rate: {wins}/{wins+losses} = {wins/(wins+losses)*100:.1f}%")
-        logger.info(f"Wins: {wins} | Losses: {losses}")
-        logger.info(f"Total P&L: ${total_pnl:,.2f}")
-
-        # Asset breakdown
-        by_asset = {}
-        for t in enriched_trades:
-            asset = t["asset"]
-            if asset not in by_asset:
-                by_asset[asset] = {"wins": 0, "losses": 0, "pnl": 0}
-            if t["outcome"] == "WIN":
-                by_asset[asset]["wins"] += 1
-            else:
-                by_asset[asset]["losses"] += 1
-            by_asset[asset]["pnl"] += t.get("realized_pnl", 0)
-
-        logger.info("\nBy Asset:")
-        for asset, stats in sorted(by_asset.items()):
-            total = stats["wins"] + stats["losses"]
-            wr = stats["wins"] / total * 100 if total > 0 else 0
-            logger.info(f"  {asset}: {stats['wins']}W/{stats['losses']}L ({wr:.1f}%) | P&L: ${stats['pnl']:,.2f}")
 
 
 if __name__ == "__main__":

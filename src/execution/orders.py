@@ -3,13 +3,22 @@ Order execution module for Polymarket CLOB.
 
 Handles order creation, placement, and management with
 support for maker (rebate) and taker orders.
+
+Safety Features:
+- One open order per asset+market+side
+- Per-asset cooldown (default 10s)
+- Global max orders per minute (default 10)
+- Exposure cap enforced BEFORE submission
 """
 
 import logging
 import traceback
 import time
-from dataclasses import dataclass
-from typing import Optional
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Set, Tuple, Deque
+import asyncio
+import threading
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
@@ -20,6 +29,249 @@ from ..config import BotConfig
 
 
 logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# ORDER SAFETY GUARD - Prevents order spam and enforces safety limits
+# ==============================================================================
+
+@dataclass
+class OrderSafetyConfig:
+    """Configuration for order safety limits."""
+    per_asset_cooldown_sec: float = 10.0  # Minimum seconds between orders per asset
+    global_max_orders_per_minute: int = 10  # Maximum orders across all assets per minute
+    max_exposure_pct: float = 0.25  # Maximum exposure as fraction of bankroll
+    enabled: bool = True  # Master switch to enable/disable safety checks
+
+
+class OrderSafetyGuard:
+    """
+    Enforces safety limits on order submission to prevent spam and runaway losses.
+
+    Tracks:
+    - Open orders by (asset, market_id, side) - only one allowed
+    - Per-asset cooldowns
+    - Global order rate (rolling 60-second window)
+    - Total exposure vs bankroll
+    """
+
+    def __init__(self, config: Optional[OrderSafetyConfig] = None):
+        self.config = config or OrderSafetyConfig()
+        self._lock = threading.Lock()
+
+        # Track open orders: key = (asset, market_id, side) -> order_id
+        self._open_orders: Dict[Tuple[str, str, str], str] = {}
+
+        # Track last order time per asset
+        self._last_order_time: Dict[str, float] = {}
+
+        # Rolling window of order timestamps (last 60 seconds)
+        self._order_timestamps: Deque[float] = deque()
+
+        # Pending order count for paper trading
+        self._pending_count: int = 0
+
+        # Active market per asset - for stale market detection
+        # Key: asset (BTC, ETH, etc.), Value: condition_id of active market
+        self._active_market_per_asset: Dict[str, str] = {}
+
+    def check_can_submit(
+        self,
+        signal: Signal,
+        current_exposure: float,
+        bankroll: float,
+    ) -> Tuple[bool, str]:
+        """
+        Check if an order can be submitted based on safety limits.
+
+        Args:
+            signal: The trading signal to check
+            current_exposure: Current total exposure in USD
+            bankroll: Current bankroll in USD
+
+        Returns:
+            Tuple of (can_submit, block_reason)
+        """
+        if not self.config.enabled:
+            return True, ""
+
+        # Defensive extraction with defaults for None values
+        asset = getattr(signal.market, 'asset', 'UNKNOWN') if signal and signal.market else 'UNKNOWN'
+        market_id = getattr(signal.market, 'condition_id', '????????') if signal and signal.market else '????????'
+        side = signal.side.value if signal and signal.side else 'UNKNOWN'
+        signal_size_usd = float(signal.size_usd) if signal and signal.size_usd is not None else 0.0
+
+        order_key = (asset, market_id, side)
+        now = time.time()
+
+        # Ensure current_exposure and bankroll are valid floats
+        current_exposure = float(current_exposure) if current_exposure is not None else 0.0
+        bankroll = float(bankroll) if bankroll is not None else 0.0
+
+        with self._lock:
+            # 0. FIRST: Check for stale market (order for old market_id after transition)
+            active_market = self._active_market_per_asset.get(asset)
+            if active_market and market_id != active_market:
+                return False, f"stale_market:{market_id[:8]}!=active:{active_market[:8]}"
+
+            # 1. Check for existing open order on same asset+market+side
+            if order_key in self._open_orders:
+                existing_order_id = self._open_orders[order_key]
+                return False, f"duplicate_order:{existing_order_id[:8]}"
+
+            # 2. Check per-asset cooldown
+            last_time = self._last_order_time.get(asset, 0.0)
+            if last_time is None:
+                last_time = 0.0
+            elapsed = now - last_time
+            if elapsed < self.config.per_asset_cooldown_sec:
+                remaining = self.config.per_asset_cooldown_sec - elapsed
+                return False, f"cooldown:{remaining:.1f}s_remaining"
+
+            # 3. Check global rate limit (orders per minute)
+            self._prune_old_timestamps(now)
+            if len(self._order_timestamps) >= self.config.global_max_orders_per_minute:
+                return False, f"rate_limit:{len(self._order_timestamps)}/min"
+
+            # 4. Check exposure cap
+            new_exposure = current_exposure + signal_size_usd
+            max_exposure = bankroll * self.config.max_exposure_pct
+            if new_exposure > max_exposure and bankroll > 0:
+                return False, f"exposure_cap:${new_exposure:.2f}>${max_exposure:.2f}"
+
+        return True, ""
+
+    def record_order_submitted(
+        self,
+        signal: Signal,
+        order_id: str,
+    ) -> None:
+        """Record that an order was successfully submitted."""
+        asset = signal.market.asset
+        market_id = signal.market.condition_id
+        side = signal.side.value
+        order_key = (asset, market_id, side)
+        now = time.time()
+
+        with self._lock:
+            self._open_orders[order_key] = order_id
+            self._last_order_time[asset] = now
+            self._order_timestamps.append(now)
+            self._pending_count += 1
+
+    def record_order_filled(
+        self,
+        asset: str,
+        market_id: str,
+        side: str,
+        order_id: str,
+    ) -> None:
+        """Record that an order was filled (remove from open orders)."""
+        order_key = (asset, market_id, side)
+        with self._lock:
+            if order_key in self._open_orders:
+                if self._open_orders[order_key] == order_id:
+                    del self._open_orders[order_key]
+            if self._pending_count > 0:
+                self._pending_count -= 1
+
+    def record_order_cancelled(
+        self,
+        asset: str,
+        market_id: str,
+        side: str,
+        order_id: str,
+    ) -> None:
+        """Record that an order was cancelled (remove from open orders)."""
+        # Same logic as filled
+        self.record_order_filled(asset, market_id, side, order_id)
+
+    def clear_orders_for_asset(self, asset: str) -> None:
+        """Clear all tracked orders for an asset (e.g., on market settlement)."""
+        with self._lock:
+            keys_to_remove = [k for k in self._open_orders if k[0] == asset]
+            for key in keys_to_remove:
+                del self._open_orders[key]
+                if self._pending_count > 0:
+                    self._pending_count -= 1
+
+    def set_active_market(self, asset: str, market_id: str) -> Optional[str]:
+        """
+        Set the active market for an asset.
+
+        Returns the old market_id if there was one (for stale order cancellation).
+
+        Args:
+            asset: Asset symbol (BTC, ETH, SOL, XRP)
+            market_id: condition_id of the new active market
+
+        Returns:
+            Old market_id if there was a transition, None otherwise
+        """
+        with self._lock:
+            old_market_id = self._active_market_per_asset.get(asset)
+            self._active_market_per_asset[asset] = market_id
+            if old_market_id and old_market_id != market_id:
+                return old_market_id
+            return None
+
+    def get_active_market(self, asset: str) -> Optional[str]:
+        """Get the active market_id for an asset."""
+        with self._lock:
+            return self._active_market_per_asset.get(asset)
+
+    def clear_active_market(self, asset: str) -> None:
+        """Clear the active market for an asset (e.g., on settlement)."""
+        with self._lock:
+            self._active_market_per_asset.pop(asset, None)
+
+    def get_pending_count(self) -> int:
+        """Get current pending order count."""
+        with self._lock:
+            return self._pending_count
+
+    def reset_pending_count(self, count: int = 0) -> None:
+        """Reset pending count (for sync with external state)."""
+        with self._lock:
+            self._pending_count = count
+
+    def _prune_old_timestamps(self, now: float) -> None:
+        """Remove timestamps older than 60 seconds."""
+        cutoff = now - 60.0
+        while self._order_timestamps and self._order_timestamps[0] < cutoff:
+            self._order_timestamps.popleft()
+
+    def get_stats(self) -> Dict:
+        """Get current safety guard statistics."""
+        now = time.time()
+        with self._lock:
+            self._prune_old_timestamps(now)
+            return {
+                "open_orders": len(self._open_orders),
+                "pending_count": self._pending_count,
+                "orders_last_minute": len(self._order_timestamps),
+                "assets_on_cooldown": len(self._last_order_time),
+                "active_markets": dict(self._active_market_per_asset),
+            }
+
+
+# Global safety guard instance (can be shared across executors)
+_global_safety_guard: Optional[OrderSafetyGuard] = None
+
+
+def get_safety_guard(config: Optional[OrderSafetyConfig] = None) -> OrderSafetyGuard:
+    """Get or create the global safety guard instance."""
+    global _global_safety_guard
+    if _global_safety_guard is None:
+        _global_safety_guard = OrderSafetyGuard(config)
+    return _global_safety_guard
+
+
+def reset_safety_guard(config: Optional[OrderSafetyConfig] = None) -> OrderSafetyGuard:
+    """Reset the global safety guard (for testing or reconfiguration)."""
+    global _global_safety_guard
+    _global_safety_guard = OrderSafetyGuard(config)
+    return _global_safety_guard
 
 
 def _extract_error_details(e: Exception) -> str:
@@ -396,30 +648,62 @@ class OrderExecutor:
                 error_message=str(e),
             )
 
-    def execute_signal(self, signal: Signal) -> TradeResult:
+    def execute_signal(
+        self,
+        signal: Signal,
+        current_exposure: float = 0.0,
+        bankroll: float = 0.0,
+        safety_guard: Optional[OrderSafetyGuard] = None,
+    ) -> TradeResult:
         """
-        Execute a trading signal.
+        Execute a trading signal with safety checks and structured logging.
 
-        Routes to appropriate order type based on signal's
-        recommended action.
+        Routes to appropriate order type based on signal's recommended action.
+        Enforces safety limits via OrderSafetyGuard.
 
         Args:
             signal: Trading signal to execute
+            current_exposure: Current total exposure in USD (for safety checks)
+            bankroll: Current bankroll in USD (for safety checks)
+            safety_guard: Optional safety guard instance (uses global if not provided)
 
         Returns:
             TradeResult with execution details
         """
+        asset = signal.market.asset
+        market_id = signal.market.condition_id
+        side = signal.side.value
+        order_type = signal.recommended_action.value if signal.recommended_action else "UNKNOWN"
+
+        # Use provided safety guard or get global instance
+        guard = safety_guard or get_safety_guard()
+
         if signal.recommended_action == OrderAction.SKIP:
-            logger.debug(f"SKIP: {signal.reasoning}")
+            logger.info(
+                "ORDER_BLOCK asset=%s market=%s side=%s reason=skip_action reasoning=%s",
+                asset, market_id[:8], side, signal.reasoning[:50] if signal.reasoning else "none"
+            )
             return TradeResult(success=False, error_message="Signal skipped")
 
         # Check for valid size
         if signal.size_shares <= 0 or signal.size_usd <= 0:
-            logger.warning(
-                f"Invalid signal size for {signal.market.asset}: "
-                f"size_usd=${signal.size_usd:.2f}, size_shares={signal.size_shares:.2f}"
+            logger.info(
+                "ORDER_BLOCK asset=%s market=%s side=%s reason=invalid_size "
+                "size_usd=%.2f size_shares=%.4f",
+                asset, market_id[:8], side, signal.size_usd, signal.size_shares
             )
             return TradeResult(success=False, error_message="Invalid signal size")
+
+        # Safety guard checks (exposure, cooldown, rate limit, duplicate)
+        can_submit, block_reason = guard.check_can_submit(signal, current_exposure, bankroll)
+        if not can_submit:
+            logger.info(
+                "ORDER_BLOCK asset=%s market=%s side=%s type=%s reason=%s "
+                "size_usd=%.2f price=%.4f",
+                asset, market_id[:8], side, order_type, block_reason,
+                signal.size_usd, signal.recommended_price
+            )
+            return TradeResult(success=False, error_message=f"Safety block: {block_reason}")
 
         # Determine token to trade
         if signal.side.value == "UP":
@@ -429,10 +713,24 @@ class OrderExecutor:
 
         # Check that client exists for live trading
         if not self.config.dry_run and self.client is None:
+            logger.info(
+                "ORDER_BLOCK asset=%s market=%s side=%s reason=client_not_initialized",
+                asset, market_id[:8], side
+            )
             return TradeResult(success=False, error_message="Client not initialized")
 
+        # Log ORDER_SUBMIT before attempting
+        logger.info(
+            "ORDER_SUBMIT asset=%s market=%s side=%s type=%s price=%.4f "
+            "size_usd=%.2f size_shares=%.4f mode=%s",
+            asset, market_id[:8], side, order_type, signal.recommended_price,
+            signal.size_usd, signal.size_shares, "dry_run" if self.config.dry_run else "live"
+        )
+
+        # Execute the order
+        result: TradeResult
         if signal.recommended_action == OrderAction.POST_ONLY:
-            return self.place_maker_order(
+            result = self.place_maker_order(
                 token_id=token_id,
                 side="BUY",
                 price=signal.recommended_price,
@@ -441,7 +739,7 @@ class OrderExecutor:
             )
 
         elif signal.recommended_action == OrderAction.LIMIT:
-            return self.place_limit_order(
+            result = self.place_limit_order(
                 token_id=token_id,
                 side="BUY",
                 price=signal.recommended_price,
@@ -449,19 +747,54 @@ class OrderExecutor:
             )
 
         elif signal.recommended_action == OrderAction.MARKET:
-            logger.info(f"Placing MARKET order: BUY ${signal.size_usd:.2f}")
-            return self.place_market_order(
+            result = self.place_market_order(
                 token_id=token_id,
                 side="BUY",
                 size_usd=signal.size_usd,
             )
 
         else:
-            logger.warning(f"Unknown action: {signal.recommended_action}")
+            logger.info(
+                "ORDER_BLOCK asset=%s market=%s side=%s reason=unknown_action action=%s",
+                asset, market_id[:8], side, signal.recommended_action
+            )
             return TradeResult(
                 success=False,
                 error_message=f"Unknown action: {signal.recommended_action}",
             )
+
+        # Log ORDER_RESULT after attempt
+        if result.success:
+            logger.info(
+                "ORDER_RESULT asset=%s market=%s side=%s status=success order_id=%s "
+                "filled_size=%.4f filled_price=%.4f",
+                asset, market_id[:8], side, result.order_id[:16] if result.order_id else "none",
+                result.filled_size, result.filled_price
+            )
+            # Record successful submission in safety guard
+            if result.order_id and result.order_id != "dry_run_order":
+                guard.record_order_submitted(signal, result.order_id)
+        else:
+            logger.info(
+                "ORDER_RESULT asset=%s market=%s side=%s status=failed error=%s",
+                asset, market_id[:8], side, result.error_message[:50] if result.error_message else "unknown"
+            )
+
+        return result
+
+    async def execute_signal_async(
+        self,
+        signal: Signal,
+        current_exposure: float = 0.0,
+        bankroll: float = 0.0,
+        safety_guard: Optional[OrderSafetyGuard] = None,
+    ) -> TradeResult:
+        """
+        Async wrapper for execute_signal to avoid blocking the event loop.
+        """
+        return await asyncio.to_thread(
+            self.execute_signal, signal, current_exposure, bankroll, safety_guard
+        )
 
     def sell_position(
         self,

@@ -6,7 +6,8 @@ All feature extraction and model interaction happens here.
 """
 
 import logging
-from typing import Optional, Dict, List
+import os
+from typing import Optional, Dict, List, Any
 from dataclasses import dataclass
 
 from .interface import (
@@ -21,6 +22,9 @@ from .interface import (
     IndicatorContext,
     PriceContext,
 )
+
+# New bundle-based inference engine
+from .infer import ModelBundle, InferenceEngine
 
 # Import existing ML components
 from ..strategy.ml_predictor import (
@@ -45,6 +49,8 @@ class MLPredictor(MLInterface):
         min_samples: int = 30,
         model_path: str = "models/ml_model.json",
         use_hybrid: bool = True,
+        bundle_path: Optional[str] = None,
+        min_edge: float = 0.02,
     ):
         """
         Initialize ML predictor.
@@ -57,18 +63,32 @@ class MLPredictor(MLInterface):
         """
         self.min_confidence = min_confidence
         self.min_samples = min_samples
+        self.bundle_path = bundle_path
+        self.min_edge = min_edge
+        self._inference: Optional[InferenceEngine] = None
+        self._predictor = None
 
-        # Get existing ML predictor instance
-        self._predictor = get_ml_predictor(
-            min_confidence=min_confidence,
-            min_training_samples=min_samples,
-            model_path=model_path,
-            use_hybrid=use_hybrid,
-        )
+        ml_mode = (os.getenv("ML_MODE", "EV") or "EV").upper()
+        if bundle_path or ml_mode == "EV":
+            bundle = ModelBundle(bundle_path)
+            self._inference = InferenceEngine(bundle)
+            logger.info("MLPredictor mode: EV_BUNDLE")
+        else:
+            # Get existing ML predictor instance (legacy)
+            self._predictor = get_ml_predictor()
+            try:
+                self._predictor.min_confidence = min_confidence
+                self._predictor.min_training_samples = min_samples
+                if hasattr(self._predictor, "model_path"):
+                    self._predictor.model_path = model_path
+            except Exception:
+                pass
+            logger.info("MLPredictor mode: LEGACY")
 
         logger.info(
             f"MLPredictor initialized: min_conf={min_confidence:.0%}, "
-            f"min_samples={min_samples}, hybrid={use_hybrid}"
+            f"min_samples={min_samples}, hybrid={use_hybrid}, "
+            f"bundle={'enabled' if bundle_path else 'disabled'}"
         )
 
     def evaluate_trade(self, input: MLInput) -> MLDecision:
@@ -77,6 +97,61 @@ class MLPredictor(MLInterface):
 
         Converts MLInput to feature vector and gets prediction.
         """
+        if self._inference:
+            snapshot = self._get_snapshot(input)
+            if not snapshot:
+                logger.warning("ML bundle inference skipped: missing snapshot")
+                return MLDecision(
+                    should_trade=False,
+                    confidence=0.0,
+                    reason="missing snapshot",
+                    model_type="bundle",
+                )
+
+            p_up, _uncertainty = self._inference.predict_proba(snapshot)
+            try:
+                yes_ask = float(snapshot["yes_ask"])
+                no_ask = float(snapshot["no_ask"])
+            except Exception:
+                logger.warning("ML bundle inference skipped: missing yes_ask/no_ask")
+                return MLDecision(
+                    should_trade=False,
+                    confidence=0.0,
+                    reason="missing prices",
+                    model_type="bundle",
+                )
+
+            edge_up = p_up - yes_ask
+            edge_down = (1 - p_up) - no_ask
+            if edge_up >= edge_down:
+                chosen_side = "UP"
+                chosen_edge = edge_up
+                confidence = p_up
+            else:
+                chosen_side = "DOWN"
+                chosen_edge = edge_down
+                confidence = 1 - p_up
+
+            should_trade = chosen_edge >= self.min_edge
+            logger.info(
+                "ML bundle decision: p_up=%.4f yes_ask=%.4f no_ask=%.4f edge_up=%.4f edge_down=%.4f "
+                "chosen_side=%s decision=%s",
+                p_up,
+                yes_ask,
+                no_ask,
+                edge_up,
+                edge_down,
+                chosen_side,
+                "TRADE" if should_trade else "SKIP",
+            )
+
+            return MLDecision(
+                should_trade=should_trade,
+                confidence=confidence,
+                reason=f"edge={chosen_edge:.4f} min_edge={self.min_edge:.4f}",
+                model_type="bundle",
+            )
+
         # Convert input to TradeFeatures
         features = self._input_to_features(input)
 
@@ -393,6 +468,13 @@ class MLPredictor(MLInterface):
             vwap_position_below=1.0 if input.indicators.vwap_position == "below" else 0.0,
             vwap_position_at=1.0 if input.indicators.vwap_position == "at" else 0.0,
         )
+
+    def _get_snapshot(self, input: MLInput) -> Optional[Dict[str, Any]]:
+        for attr in ("snapshot", "ml_snapshot", "feature_snapshot"):
+            value = getattr(input, attr, None)
+            if isinstance(value, dict):
+                return value
+        return None
 
 
 def create_ml_input_from_signal(
