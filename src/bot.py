@@ -67,6 +67,10 @@ from src.ml import (
 from src.ml.infer import ModelBundle, InferenceEngine
 from src.ml.policy import Policy, PolicyConfig
 from src.state import BotStateManager
+from src.kill_switch import KillSwitch
+from src.attribution import AttributionTracker, determine_source
+from src.capital_scaling import CapitalScaler
+from src.monitoring.dashboard import MetricsDashboard
 from src.strategy.trade_history import get_trade_history
 from src.utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
 from src.utils.logging import resolve_execution_mode, _MODE_LABELS
@@ -268,8 +272,8 @@ class TradingBot:
         self._last_status_log: Optional[datetime] = None
         self._status_log_interval = 30.0  # Log status every 30 seconds
 
-        # Cooldown tracking - prevent duplicate orders per asset
-        self._last_order_time: dict[str, datetime] = {}  # asset -> last order time
+        # Cooldown tracking - prevent duplicate orders per (asset, variant) pair
+        self._last_order_time: dict[str, datetime] = {}  # "ASSET:variant" -> last order time
         self._order_cooldown_seconds = config.trading.order_cooldown_seconds  # Configurable (default 15s)
 
         # Cached API positions (updated by _sync_existing_orders)
@@ -291,14 +295,14 @@ class TradingBot:
         self.last_balance_sync = None
         self.last_orders_sync = None
 
-        # Period tracking for 15-minute market transitions
+        # Period tracking for market transitions
         # When a period boundary is crossed, we need to refresh markets with new target prices
-        self._current_period_ts: int = 0  # Current 15-min period timestamp
+        self._current_period_ts: dict[str, int] = {}  # variant -> current period ts
         self._period_transition_wait_until: Optional[datetime] = None  # Wait for price data
         self._captured_period_prices: dict[str, float] = {}  # asset -> price captured at period boundary
 
-        # Active market tracking per asset - used to detect market transitions and cancel stale orders
-        # Key: asset (BTC, ETH, etc.), Value: condition_id of the currently active market
+        # Active market tracking per (asset, variant) - detect transitions and cancel stale orders
+        # Key: "ASSET:variant" (e.g. "BTC:fifteen"), Value: condition_id
         self._active_market_per_asset: dict[str, str] = {}
 
         # Safety guard for order submission (initialized lazily via get_safety_guard())
@@ -338,6 +342,23 @@ class TradingBot:
         # Key: "asset:reason" -> last log timestamp
         self._order_block_log_ts: dict[str, float] = {}
         self._order_block_log_interval = 15.0  # Only log same block once per 15s
+
+        # Kill switch (hard safety gate)
+        self.kill_switch = KillSwitch()
+
+        # Trade attribution tracker
+        self.attribution = AttributionTracker()
+
+        # Capital scaling (drawdown-based sizing multiplier)
+        self.capital_scaler = CapitalScaler()
+
+        # Metrics dashboard (periodic snapshot)
+        dashboard_path = os.getenv("METRICS_DASHBOARD_FILE", "")
+        dashboard_interval = float(os.getenv("METRICS_DASHBOARD_INTERVAL", "30"))
+        self.dashboard = MetricsDashboard(
+            output_path=dashboard_path,
+            interval=dashboard_interval,
+        )
 
         # Control flags
         self._running = False
@@ -449,6 +470,11 @@ class TradingBot:
                 self.risk_manager.peak_bankroll,
                 len(self.risk_manager.positions),
             )
+            # Restore kill-switch state if it was active at shutdown
+            ks_data = getattr(saved_state, 'kill_switch', None)
+            if ks_data:
+                self.kill_switch = KillSwitch.from_dict(ks_data)
+
             # Clean up positions in markets that expired while bot was down
             self._cleanup_orphaned_positions()
 
@@ -520,7 +546,9 @@ class TradingBot:
                 for key, asset in token_to_asset.items():
                     if key in asset_id or key in market:
                         synced_assets.add(asset)
-                        self._last_order_time[asset] = now
+                        # Set cooldown for all active variants (API doesn't tell us variant)
+                        for _v in self.config.trading.trading_variants:
+                            self._last_order_time[f"{asset}:{_v}"] = now
                         break
 
             # 2. Sync active positions (filled trades in active 15-min markets)
@@ -533,7 +561,8 @@ class TradingBot:
             for asset, pos_info in positions.items():
                 synced_assets.add(asset)
                 # Set cooldown so we don't try to trade this asset again
-                self._last_order_time[asset] = now
+                for _v in self.config.trading.trading_variants:
+                    self._last_order_time[f"{asset}:{_v}"] = now
 
                 # Track this as an external position
                 cost = pos_info.get("cost", 0)
@@ -694,6 +723,8 @@ class TradingBot:
         for order_id, order_data in pending_items:
             try:
                 asset = order_data.get("asset", "???")
+                _variant = order_data.get("variant", "fifteen")
+                _av_key = f"{asset}:{_variant}"
                 placed_time = order_data.get("placed_time")
                 wait_time = (now - placed_time).total_seconds() if placed_time else 0
 
@@ -704,12 +735,12 @@ class TradingBot:
                     # Order not found - might have been filled or cancelled
                     if wait_time > 60:  # 1 minute timeout (reduced from 2)
                         logger.warning(
-                            f"⚠️ Order {order_id[:8]}... ({asset}) not found after {wait_time:.0f}s - removing"
+                            f"Order {order_id[:8]}... ({_av_key}) not found after {wait_time:.0f}s - removing"
                         )
                         orders_to_remove.append(order_id)
                         # Restore cooldown to allow new order
-                        if asset in self._last_order_time:
-                            del self._last_order_time[asset]
+                        if _av_key in self._last_order_time:
+                            del self._last_order_time[_av_key]
                     else:
                         logger.debug(f"Order {order_id[:8]}... ({asset}) status unknown, waiting {wait_time:.0f}s")
                     continue
@@ -791,10 +822,11 @@ class TradingBot:
                             predicted_prob=order_data.get("ml_confidence"),
                             arb_type=order_data.get("ml_arb_type") or "none",
                             edge=signal.edge,
+                            variant=signal.market.variant,
                         )
 
                     else:
-                        logger.warning(f"⚠️ Order filled but signal is None - cannot record position for {asset}")
+                        logger.warning(f"Order filled but signal is None - cannot record position for {asset}")
 
                     orders_to_remove.append(order_id)
 
@@ -865,6 +897,7 @@ class TradingBot:
                                 predicted_prob=order_data.get("ml_confidence"),
                                 arb_type=order_data.get("ml_arb_type") or "none",
                                 edge=signal.edge,
+                                variant=signal.market.variant,
                             )
 
                         orders_to_remove.append(order_id)
@@ -883,8 +916,8 @@ class TradingBot:
                     )
                     orders_to_remove.append(order_id)
                     # Clear cooldown to allow immediate retry
-                    if asset in self._last_order_time:
-                        del self._last_order_time[asset]
+                    if _av_key in self._last_order_time:
+                        del self._last_order_time[_av_key]
 
                 elif order_info.status.value in ["OPEN", "PENDING"]:
                     # Still open/pending - check if we should cancel
@@ -916,36 +949,35 @@ class TradingBot:
 
                     if should_cancel:
                         logger.warning(
-                            f"⚠️ Cancelling unfilled order for {asset} - {cancel_reason}"
+                            f"Cancelling unfilled order for {_av_key} - {cancel_reason}"
                         )
                         try:
                             self.executor.cancel_order(order_id)
                         except Exception as cancel_err:
                             logger.warning(f"Failed to cancel order: {cancel_err}")
                         orders_to_remove.append(order_id)
-                        if asset in self._last_order_time:
-                            del self._last_order_time[asset]
+                        if _av_key in self._last_order_time:
+                            del self._last_order_time[_av_key]
                     else:
-                        logger.debug(f"Order {order_id[:8]}... ({asset}) still {order_info.status.value}, waiting {wait_time:.0f}s")
+                        logger.debug(f"Order {order_id[:8]}... ({_av_key}) still {order_info.status.value}, waiting {wait_time:.0f}s")
 
                 else:
                     # Unknown status - log and apply timeout
-                    logger.warning(f"Unknown order status '{order_info.status.value}' for {asset}")
+                    logger.warning(f"Unknown order status '{order_info.status.value}' for {_av_key}")
                     if wait_time > 90:
-                        logger.warning(f"⚠️ Removing stale order for {asset} with status {order_info.status.value}")
+                        logger.warning(f"Removing stale order for {_av_key} with status {order_info.status.value}")
                         orders_to_remove.append(order_id)
-                        if asset in self._last_order_time:
-                            del self._last_order_time[asset]
+                        if _av_key in self._last_order_time:
+                            del self._last_order_time[_av_key]
 
             except Exception as e:
                 logger.error(f"Error checking order {order_id[:8]}...: {e}")
                 # On error, still remove stale orders
                 if wait_time > 120:
-                    logger.warning(f"⚠️ Removing errored order {order_id[:8]}... after {wait_time:.0f}s")
+                    logger.warning(f"Removing errored order {order_id[:8]}... after {wait_time:.0f}s")
                     orders_to_remove.append(order_id)
-                    asset = order_data.get("asset")
-                    if asset and asset in self._last_order_time:
-                        del self._last_order_time[asset]
+                    if _av_key in self._last_order_time:
+                        del self._last_order_time[_av_key]
 
         # Remove processed orders
         if orders_to_remove:
@@ -1015,6 +1047,7 @@ class TradingBot:
         )
 
         # Print config box
+        variants_str = ", ".join(self.config.trading.trading_variants)
         print_config_box({
             "Min Edge": self.config.trading.min_edge,
             "Min Time Remaining": f"{self.config.trading.min_time_remaining}s",
@@ -1023,6 +1056,7 @@ class TradingBot:
             "Max Concurrent": self.config.trading.max_concurrent_positions,
             "Daily Loss Limit": self.config.trading.daily_loss_limit,
             "Supported Assets": ", ".join(self.config.supported_assets),
+            "Variants": variants_str,
         })
 
         # Display trade history summary
@@ -1192,7 +1226,10 @@ class TradingBot:
 
         # Phase 4: Persist state (no more writes after this point)
         if self.state_manager:
-            self.state_manager.save(self.risk_manager, self.markets)
+            self.state_manager.save(
+                self.risk_manager, self.markets,
+                kill_switch=self.kill_switch,
+            )
             self._check_state_invariants()
         t4 = time.monotonic()
         logger.info("SHUTDOWN_PHASE phase=state_saved elapsed=%.3fs", t4 - t0)
@@ -1555,6 +1592,37 @@ class TradingBot:
                 # Update peak equity (only increases, never decreases)
                 self.risk_manager.update_peak_equity(equity)
 
+                # Kill switch evaluation (hard safety — checked every tick)
+                daily_loss_hit = (
+                    self.risk_manager.daily_stats.hit_loss_limit_at(
+                        self.config.trading.daily_loss_limit
+                    )
+                    if self.risk_manager.daily_stats
+                    else False
+                )
+                self.kill_switch.evaluate(
+                    peak_bankroll=self.risk_manager.peak_bankroll,
+                    current_equity=equity,
+                    daily_loss_hit=daily_loss_hit,
+                    consecutive_losses=self.risk_manager.consecutive_losses,
+                )
+
+                # Metrics dashboard snapshot (every N seconds)
+                realized_today = (
+                    self.risk_manager.daily_stats.total_pnl
+                    if self.risk_manager.daily_stats
+                    else 0.0
+                )
+                unrealized = equity - self.risk_manager.current_bankroll
+                self.dashboard.maybe_emit(
+                    bankroll=self.risk_manager.current_bankroll,
+                    peak_bankroll=self.risk_manager.peak_bankroll,
+                    open_positions=len(self.risk_manager.positions),
+                    total_exposure=self.risk_manager.get_total_exposure(),
+                    realized_pnl_today=realized_today,
+                    unrealized_pnl=unrealized,
+                )
+
                 # Check if trading is allowed (use equity for drawdown check)
                 can_trade, reason = self.risk_manager.can_trade(equity=equity)
                 if not can_trade:
@@ -1611,7 +1679,10 @@ class TradingBot:
                     self._last_state_save is None
                     or (now_save - self._last_state_save).total_seconds() >= self._state_save_interval
                 ):
-                    self.state_manager.save(self.risk_manager, self.markets)
+                    self.state_manager.save(
+                        self.risk_manager, self.markets,
+                        kill_switch=self.kill_switch,
+                    )
                     self._check_state_invariants()
                     self._last_state_save = now_save
 
@@ -1704,79 +1775,80 @@ class TradingBot:
 
         injected = 0
         for asset, price in self._captured_period_prices.items():
-            cache_key = f"{asset}:{period_ts}"
-            self.gamma_api._target_price_cache[cache_key] = price
-            injected += 1
-            logger.debug(f"Injected {asset} target price ${price:,.2f} for period {period_ts}")
+            # Inject for all active variants so both 5m and 15m can use captured price
+            for variant in self.config.trading.trading_variants:
+                cache_key = f"{asset}:{variant}:{period_ts}"
+                self.gamma_api._target_price_cache[cache_key] = price
+                injected += 1
+                logger.debug(f"Injected {asset}/{variant} target price ${price:,.2f} for period {period_ts}")
 
         if injected > 0:
-            logger.info(f"💉 Injected {injected} target prices into cache for instant trading")
+            logger.info(f"Injected {injected} target prices into cache for instant trading")
 
     async def _refresh_markets(self):
-        """Refresh list of active 15-minute markets."""
+        """Refresh list of active markets for all configured variants."""
         now = datetime.now(timezone.utc)
         current_ts = int(now.timestamp())
 
-        # Calculate current 15-minute period (rounds down to :00, :15, :30, :45)
-        current_period_ts = (current_ts // 900) * 900
+        # Detect period boundary crossing for each active variant
+        # 5-min boundaries: every 300s, 15-min boundaries: every 900s
+        _VARIANT_PERIODS = {"five": 300, "fifteen": 900}
+        boundary_crossed = False
 
-        # Detect period boundary crossing with single-flight lock
-        if self._current_period_ts > 0 and current_period_ts != self._current_period_ts:
-            # Use lock to ensure only one transition runs at a time
-            async with self._period_boundary_lock:
-                # Double-check after acquiring lock (another coroutine may have handled it)
-                if self._last_handled_period_ts >= current_period_ts:
-                    # Already handled this transition, skip
-                    self._current_period_ts = current_period_ts
-                    return
+        for variant in self.config.trading.trading_variants:
+            period = _VARIANT_PERIODS.get(variant, 900)
+            current_period_ts = (current_ts // period) * period
+            prev = self._current_period_ts.get(variant, 0)
 
-                # Mark this period as being handled IMMEDIATELY to prevent duplicates
-                # (even if we return early during wait phase)
-                self._last_handled_period_ts = current_period_ts
-
+            if prev > 0 and current_period_ts != prev:
+                boundary_crossed = True
                 logger.info(
-                    f"⏰ PERIOD BOUNDARY: Transitioning from {self._current_period_ts} "
-                    f"to {current_period_ts}"
+                    "PERIOD_BOUNDARY variant=%s from=%d to=%d",
+                    variant, prev, current_period_ts,
                 )
 
-                # REAL-TIME: Capture current Chainlink prices as target prices for new period
-                # This eliminates the need to wait for the API
-                self._capture_period_boundary_prices(current_period_ts)
+            self._current_period_ts[variant] = current_period_ts
 
-                # Brief wait to ensure price capture is stable (reduced from 15s to 2s)
-                if self._period_transition_wait_until is None:
-                    wait_seconds = self.period_transition_delay
-                    self._period_transition_wait_until = now + timedelta(seconds=wait_seconds)
-                    logger.debug(f"Brief {wait_seconds}s stabilization wait...")
+        if boundary_crossed:
+            # Use lock to ensure only one transition runs at a time
+            async with self._period_boundary_lock:
+                # Capture current Chainlink prices as target prices for new period
+                ref_ts = self._current_period_ts.get("fifteen", self._current_period_ts.get("five", current_ts))
+                if self._last_handled_period_ts >= ref_ts:
+                    pass  # already handled
+                else:
+                    self._last_handled_period_ts = ref_ts
+                    self._capture_period_boundary_prices(ref_ts)
 
-                # If still waiting, don't refresh yet (but dedup flag is already set)
-                if now < self._period_transition_wait_until:
-                    return
+                    # Brief wait to ensure price capture is stable
+                    if self._period_transition_wait_until is None:
+                        wait_seconds = self.period_transition_delay
+                        self._period_transition_wait_until = now + timedelta(seconds=wait_seconds)
+                        logger.debug(f"Brief {wait_seconds}s stabilization wait...")
 
-                # Transition complete - clear old data and proceed
-                logger.info("✅ Period transition complete - using captured prices")
-                self._period_transition_wait_until = None
+                    if now < self._period_transition_wait_until:
+                        return
 
-                # Clear stale target price cache
-                self.gamma_api.clear_stale_price_cache(current_period_ts)
+                    logger.info("Period transition complete - using captured prices")
+                    self._period_transition_wait_until = None
 
-                # Inject captured prices into gamma API cache for immediate use
-                self._inject_captured_prices_to_gamma(current_period_ts)
+                    # Clear stale target price cache
+                    self.gamma_api.clear_stale_price_cache(ref_ts)
 
-                # Clear markets from old period (they should be in expiring/settled by now)
-                async with self._markets_lock:
-                    old_markets = list(self.markets.keys())
-                    for market_id in old_markets:
-                        market = self.markets.get(market_id)
-                        if market and market.time_remaining <= 0:
-                            self.markets.pop(market_id, None)
-                            logger.debug(f"Removed expired market: {market.asset}")
+                    # Inject captured prices into gamma API cache for immediate use
+                    self._inject_captured_prices_to_gamma(ref_ts)
 
-                # Force refresh by clearing last_market_refresh
-                self.last_market_refresh = None
+                    # Clear markets from old period (they should be in expiring/settled by now)
+                    async with self._markets_lock:
+                        old_markets = list(self.markets.keys())
+                        for market_id in old_markets:
+                            market = self.markets.get(market_id)
+                            if market and market.time_remaining <= 0:
+                                self.markets.pop(market_id, None)
+                                logger.debug(f"Removed expired market: {market.asset}/{market.variant}")
 
-        # Update current period tracking
-        self._current_period_ts = current_period_ts
+                    # Force refresh by clearing last_market_refresh
+                    self.last_market_refresh = None
 
         # Check if refresh is needed
         if self.last_market_refresh:
@@ -1790,8 +1862,10 @@ class TradingBot:
         stale_cancellations: list[tuple[str, str]] = []  # [(asset, old_market_id), ...]
 
         try:
-            # Fetch active 15-min crypto markets
-            new_markets = self.gamma_api.get_15min_crypto_markets()
+            # Fetch active crypto markets for all configured variants
+            new_markets = self.gamma_api.get_crypto_markets(
+                variants=self.config.trading.trading_variants,
+            )
 
             # Update markets dict with lock
             async with self._markets_lock:
@@ -1821,23 +1895,26 @@ class TradingBot:
 
                         # Check for market transition - collect for cancellation outside lock
                         asset = market.asset
-                        old_market_id = self._active_market_per_asset.get(asset)
+                        av_key = f"{asset}:{market.variant}"
+                        old_market_id = self._active_market_per_asset.get(av_key)
                         if old_market_id and old_market_id != market_id:
                             # Market transition detected - queue for cancellation
                             stale_cancellations.append((asset, old_market_id))
 
                         # Update active market tracking (both local and safety guard)
-                        self._active_market_per_asset[asset] = market_id
+                        self._active_market_per_asset[av_key] = market_id
                         guard = self.safety_guard or get_safety_guard()
                         if guard:
                             guard.set_active_market(asset, market_id)
 
                         # Target price is now fetched from Polymarket API in gamma.py
                         logger.info(
-                            f"NEW MARKET: {market.asset} | "
-                            f"Target: ${market.target_price:,.2f} | "
-                            f"Ends: {market.end_time.strftime('%H:%M:%S')} | "
-                            f"Time: {market.time_remaining:.0f}s"
+                            "NEW_MARKET asset=%s variant=%s target=$%,.2f "
+                            "ends=%s time=%.0fs",
+                            market.asset, market.variant,
+                            market.target_price,
+                            market.end_time.strftime('%H:%M:%S'),
+                            market.time_remaining,
                         )
                     else:
                         # Update existing market state
@@ -1881,13 +1958,16 @@ class TradingBot:
         Markets are moved when time_remaining < min_time_remaining,
         which prevents new trades but keeps them for settlement tracking.
         Also cancels any pending orders for expiring markets.
+        Uses per-variant min_time_remaining (5-min markets have tighter window).
         """
-        min_time = self.config.trading.min_time_remaining
+        min_time_15m = self.config.trading.min_time_remaining
+        min_time_5m = self.config.trading.min_time_remaining_5m
 
         async with self._markets_lock:
             # Find markets that should stop trading
             markets_to_expire = []
             for market_id, market in self.markets.items():
+                min_time = min_time_5m if market.variant == "five" else min_time_15m
                 if market.time_remaining <= min_time:
                     markets_to_expire.append(market_id)
 
@@ -1926,19 +2006,20 @@ class TradingBot:
                 asset = market.asset
                 await self._cancel_pending_orders_for_asset(asset)
 
-                # Clear cooldown so new market can trade
-                if asset in self._last_order_time:
-                    del self._last_order_time[asset]
-                    logger.debug(f"Cleared cooldown for {asset} (market expiring)")
+                # Clear cooldown so new market for this (asset, variant) can trade
+                av_key = f"{asset}:{market.variant}"
+                if av_key in self._last_order_time:
+                    del self._last_order_time[av_key]
+                    logger.debug("Cleared cooldown for %s (market expiring)", av_key)
 
                 # Clear from cached API positions
                 if hasattr(self, '_api_positions') and asset in self._api_positions:
                     del self._api_positions[asset]
 
                 logger.info(
-                    f"EXPIRING: {market.asset} | "
-                    f"Time remaining: {market.time_remaining:.0f}s | "
-                    f"Target: ${market.target_price:,.2f}"
+                    "EXPIRING asset=%s variant=%s time=%.0fs target=$%,.2f",
+                    market.asset, market.variant,
+                    market.time_remaining, market.target_price,
                 )
 
     async def _cancel_pending_orders_for_asset(self, asset: str):
@@ -2362,15 +2443,15 @@ class TradingBot:
 
             # Set cooldown
             now = datetime.now(timezone.utc)
-            self._last_order_time[asset] = now
+            self._last_order_time[f"{asset}:{market.variant}"] = now
 
             logger.info(
-                f"[{asset}] ✅ CHART {decision.action.value}: "
+                f"[{asset}/{market.variant}] CHART {decision.action.value}: "
                 f"Added {shares:.1f} shares @ ${decision.suggested_size:.2f} | "
                 f"New avg: ${new_avg_price:.3f}"
             )
         else:
-            logger.warning(f"[{asset}] ❌ CHART {decision.action.value} FAILED: {result.error_message}")
+            logger.warning(f"[{asset}] CHART {decision.action.value} FAILED: {result.error_message}")
 
     async def _execute_early_exit(
         self,
@@ -2568,10 +2649,11 @@ class TradingBot:
             if self.auto_retrainer:
                 self.auto_retrainer.record_trade(won=won)
 
-        # Clear asset cooldown so we can trade again
+        # Clear (asset, variant) cooldown so we can trade again
         asset = market.asset
-        if asset in self._last_order_time:
-            del self._last_order_time[asset]
+        _av_key = f"{asset}:{market.variant}"
+        if _av_key in self._last_order_time:
+            del self._last_order_time[_av_key]
 
         # Log summary
         result_emoji = "💰" if exit_reason == "take_profit" else "🛑"
@@ -2680,10 +2762,11 @@ class TradingBot:
                         del self._api_positions[asset]
                         logger.info(f"✅ Cleared cached position for {asset} after settlement")
 
-                    # Clear cooldown
-                    if asset in self._last_order_time:
-                        del self._last_order_time[asset]
-                        logger.debug(f"Cleared cooldown for {asset} after settlement")
+                    # Clear cooldown for this (asset, variant)
+                    _av_key = f"{asset}:{market.variant}"
+                    if _av_key in self._last_order_time:
+                        del self._last_order_time[_av_key]
+                        logger.debug("Cleared cooldown for %s after settlement", _av_key)
 
                     # Cancel any pending orders for this asset
                     await self._cancel_pending_orders_for_asset(asset)
@@ -4099,13 +4182,20 @@ class TradingBot:
             market: Market to process
         """
         # Skip if market is about to expire (should be in expiring_markets)
-        if market.time_remaining < self.config.trading.min_time_remaining:
+        min_time = (
+            self.config.trading.min_time_remaining_5m
+            if market.variant == "five"
+            else self.config.trading.min_time_remaining
+        )
+        if market.time_remaining < min_time:
             return
 
-        # === SHORT-CIRCUIT: Skip if we already have position for this asset ===
+        # === SHORT-CIRCUIT: Skip if we already have position for this (asset, variant) ===
         # This avoids generating signals and all downstream processing
         for pos in self.risk_manager.positions.values():
-            if hasattr(pos, 'market') and pos.market.asset == market.asset:
+            if (hasattr(pos, 'market')
+                    and pos.market.asset == market.asset
+                    and pos.market.variant == market.variant):
                 # Already have position - skip all processing (no log, very common)
                 return
 
@@ -4121,9 +4211,13 @@ class TradingBot:
             self._market_first_seen[market_id] = now
             logger.debug(f"[{market.asset}] First observation - collecting data...")
 
-        # Check minimum observation time for this market
+        # Check minimum observation time for this market (per-variant)
         observation_time = (now - self._market_first_seen[market_id]).total_seconds()
-        min_observation = self.config.trading.min_observation_time
+        min_observation = (
+            self.config.trading.min_observation_time_5m
+            if market.variant == "five"
+            else self.config.trading.min_observation_time
+        )
         if observation_time < min_observation:
             logger.debug(
                 f"[{market.asset}] Observing: {observation_time:.0f}s / {min_observation:.0f}s"
@@ -4296,6 +4390,7 @@ class TradingBot:
                         market.asset, signal.side.value, signal.edge, volatility,
                         self.risk_manager.current_bankroll, signal.true_prob, market_price
                     )
+                self.dashboard.record_veto("risk_sizing_zero")
                 return
             signal.size_usd = desired_size
             signal.size_shares = desired_size / market_price
@@ -4417,6 +4512,7 @@ class TradingBot:
                                     market.asset, market.condition_id[:8], signal.side.value,
                                     chart_signal_strength, signal.edge
                                 )
+                            self.dashboard.record_veto("chart_bearish_vs_up")
                             return
                         elif chart_says_up and signal.side == Side.DOWN:
                             if now_ts - last_log >= 30.0:
@@ -4427,6 +4523,7 @@ class TradingBot:
                                     market.asset, market.condition_id[:8], signal.side.value,
                                     chart_signal_strength, signal.edge
                                 )
+                            self.dashboard.record_veto("chart_bullish_vs_down")
                             return
 
             except Exception as e:
@@ -4500,6 +4597,7 @@ class TradingBot:
                             market.asset, market.condition_id[:8], signal.side.value,
                             decision.reason.replace(" ", "_")[:30]
                         )
+                        self.dashboard.record_veto(f"ml_ev:{decision.reason[:20]}")
                         return
 
                     # Override signal based on EV decision
@@ -5327,11 +5425,11 @@ class TradingBot:
 
         # Log active cooldowns
         active_cooldowns = []
-        for asset, last_time in self._last_order_time.items():
+        for av_key, last_time in self._last_order_time.items():
             elapsed = (now - last_time).total_seconds()
             remaining = self._order_cooldown_seconds - elapsed
             if remaining > 0:
-                active_cooldowns.append(f"{asset}:{remaining:.0f}s")
+                active_cooldowns.append(f"{av_key}:{remaining:.0f}s")
 
         if active_cooldowns:
             logger.info(f"{Colors.BRIGHT_CYAN}├{'─' * 64}┤{Colors.RESET}")
@@ -5562,10 +5660,10 @@ class TradingBot:
 
             # Set cooldown
             now = datetime.now(timezone.utc)
-            self._last_order_time[asset] = now
+            self._last_order_time[f"{asset}:{market.variant}"] = now
 
             logger.info(
-                f"[{asset}] ✅ AVERAGED DOWN: "
+                f"[{asset}/{market.variant}] AVERAGED DOWN: "
                 f"Added {averaging_decision.suggested_shares:.1f} shares @ ${averaging_decision.suggested_size_usd:.2f} | "
                 f"New avg price: ${averaging_decision.new_avg_price:.3f} | "
                 f"Total shares: {position.shares:.1f}"
@@ -5585,12 +5683,27 @@ class TradingBot:
         if not self._running:
             return
 
+        # Kill switch gate — blocks all new orders
+        blocked, ks_reason = self.kill_switch.should_block_order()
+        if blocked:
+            self.dashboard.record_veto("kill_switch")
+            self.attribution.record_veto(
+                asset=signal.market.asset,
+                market_id=signal.market.condition_id,
+                side=signal.side.value,
+                source=determine_source(bool(self.ml_engine), getattr(signal, '_ml_confidence', None)),
+                veto_reason=ks_reason,
+            )
+            return
+
         asset = signal.market.asset
+        variant = signal.market.variant
+        av_key = f"{asset}:{variant}"
         now = datetime.now(timezone.utc)
 
-        # Check cooldown - prevent rapid duplicate orders
-        if asset in self._last_order_time:
-            elapsed = (now - self._last_order_time[asset]).total_seconds()
+        # Check cooldown - prevent rapid duplicate orders per (asset, variant)
+        if av_key in self._last_order_time:
+            elapsed = (now - self._last_order_time[av_key]).total_seconds()
             if elapsed < self._order_cooldown_seconds:
                 remaining = self._order_cooldown_seconds - elapsed
                 # Log once per cooldown period at INFO level so user knows why trades aren't executing
@@ -5598,8 +5711,8 @@ class TradingBot:
                 if cooldown_key not in self._logged_rejections:
                     self._logged_rejections.add(cooldown_key)
                     logger.info(
-                        "ORDER_SKIP_DUP asset=%s reason=cooldown secs_since_last=%.0f",
-                        asset,
+                        "ORDER_SKIP_DUP asset=%s variant=%s reason=cooldown secs_since_last=%.0f",
+                        asset, variant,
                         elapsed,
                     )
                 return
@@ -5737,7 +5850,7 @@ class TradingBot:
                     f"have ${available:.2f} (bankroll ${self.risk_manager.current_bankroll:.2f})"
                 )
             # Set cooldown to prevent spam (never move timestamps into the future)
-            self._last_order_time[asset] = now
+            self._last_order_time[av_key] = now
             return
 
         # Get current price for logging
@@ -5861,6 +5974,38 @@ class TradingBot:
         self._order_submit_ts.append(now_ts)
 
         # === ALL SAFETY CHECKS PASSED ===
+
+        # Capital scaling — adjust size based on drawdown tier / recent EV
+        recent_pnls = list(self.risk_manager.trade_history)
+        scaled_size, scale_mult, scale_reason = self.capital_scaler.apply(
+            size_usd=signal.size_usd,
+            peak_bankroll=self.risk_manager.peak_bankroll,
+            current_equity=self._calculate_equity(),
+            recent_pnls=recent_pnls,
+            max_position_pct=self.config.trading.max_position_pct,
+            bankroll=self.risk_manager.current_bankroll,
+        )
+        if scaled_size <= 0:
+            self._log_order_block(asset, "capital_scaling_zero", multiplier=f"{scale_mult:.2f}")
+            self.dashboard.record_veto("capital_scaling_zero")
+            self.attribution.record_veto(
+                asset=asset,
+                market_id=market_id,
+                side=signal.side.value,
+                source=determine_source(bool(self.ml_engine), getattr(signal, '_ml_confidence', None)),
+                veto_reason=f"capital_scaling:{scale_reason}",
+            )
+            return
+        if abs(scale_mult - 1.0) > 0.001:
+            old_size = signal.size_usd
+            signal.size_usd = scaled_size
+            if signal.recommended_price > 0:
+                signal.size_shares = signal.size_usd / signal.recommended_price
+            logger.info(
+                "CAPITAL_SCALING asset=%s multiplier=%.2f reason=%s size=%.2f->%.2f",
+                asset, scale_mult, scale_reason, old_size, signal.size_usd,
+            )
+
         # ORDER_DECISION is logged here AFTER all blocking gates (cooldown/dup/rate-limit/exposure)
         logger.info(
             "ORDER_DECISION asset=%s decision=PLACE_ORDER side=%s edge=%.4f min_edge=%.4f "
@@ -6033,7 +6178,7 @@ class TradingBot:
 
         if result.success:
             # Set full cooldown for successful orders
-            self._last_order_time[asset] = now
+            self._last_order_time[av_key] = now
 
             # Get ML data if available
             ml_volatility = getattr(signal, '_ml_volatility', None)
@@ -6154,6 +6299,28 @@ class TradingBot:
                     predicted_prob=ml_confidence,
                     arb_type=ml_arb_type or "none",
                     edge=signal.edge,
+                    variant=signal.market.variant,
+                )
+
+                # Trade attribution + dashboard
+                trade_source = determine_source(bool(self.ml_engine), ml_confidence)
+                self.attribution.record_execution(
+                    asset=asset,
+                    market_id=signal.market.condition_id,
+                    side=signal.side.value,
+                    source=trade_source,
+                    decision_context={
+                        "min_edge": float(self.config.trading.min_edge),
+                        "edge": float(signal.edge or 0),
+                        "true_prob": float(signal.true_prob or 0),
+                        "price": float(signal.recommended_price or 0),
+                        "time_remaining": float(signal.time_remaining or 0),
+                        "ml_confidence": float(ml_confidence) if ml_confidence else None,
+                    },
+                )
+                self.dashboard.record_open_position(
+                    market_key=signal.market.condition_id,
+                    predicted_edge=float(signal.edge or 0),
                 )
 
                 logger.info(f"    {Colors.BRIGHT_GREEN}✓ FILLED @ {result.filled_price:.2f}{conf_str}{arb_str}{Colors.RESET}")
@@ -6175,6 +6342,7 @@ class TradingBot:
                     self._pending_orders[result.order_id] = {
                         "signal": signal,
                         "asset": asset,
+                        "variant": variant,
                         "side": signal.side.value,  # "UP" or "DOWN"
                         "market_id": signal.market.condition_id,
                         "placed_time": now,
@@ -6228,7 +6396,7 @@ class TradingBot:
                 )
         else:
             # Set shorter cooldown (30s) on failures to prevent spam
-            self._last_order_time[asset] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
+            self._last_order_time[av_key] = now - timedelta(seconds=self._order_cooldown_seconds - 30)
             logger.info(
                 "ORDER_REJECT asset=%s reason=execution_error error=%s",
                 asset,

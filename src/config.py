@@ -172,6 +172,25 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("COOLOFF_PERIOD_MINUTES", "30"))
     )
 
+    # === Market Variant Settings ===
+    # Which market durations to trade: "five", "fifteen", or both
+    # Default: only fifteen (existing behaviour)
+    trading_variants: list = field(
+        default_factory=lambda: [
+            v.strip()
+            for v in os.getenv("TRADING_VARIANTS", "fifteen").split(",")
+            if v.strip() in ("five", "fifteen")
+        ] or ["fifteen"]
+    )
+
+    # Per-variant timing overrides (5-min defaults are tighter)
+    min_time_remaining_5m: float = field(
+        default_factory=lambda: float(os.getenv("MIN_TIME_REMAINING_5M", "15"))
+    )
+    min_observation_time_5m: float = field(
+        default_factory=lambda: float(os.getenv("MIN_OBSERVATION_TIME_5M", "10"))
+    )
+
     # === Machine Learning Settings ===
 
     # Enable ML signal filtering
@@ -704,7 +723,7 @@ class BotConfig:
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
     ml_engine: MLEngineConfig = field(default_factory=MLEngineConfig)
 
-    # Supported assets for 15-minute markets
+    # Supported assets for crypto up/down markets
     supported_assets: list = field(
         default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"]
     )

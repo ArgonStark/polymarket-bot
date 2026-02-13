@@ -124,7 +124,7 @@ class OrderBook:
 
 @dataclass
 class MarketState:
-    """State of a 15-minute prediction market."""
+    """State of a prediction market (5-minute or 15-minute)."""
 
     # Market identifiers
     condition_id: str           # Market condition ID
@@ -148,11 +148,19 @@ class MarketState:
     bid_depth: float = 0.0      # Total bid depth
     ask_depth: float = 0.0      # Total ask depth
 
+    # Variant: "five" (5-min) or "fifteen" (15-min)
+    variant: str = "fifteen"
+
     # Metadata
     last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     # Settlement snapshot: Chainlink price captured when market moves to expiring queue
     expiry_chainlink_price: Optional[float] = None
+
+    @property
+    def duration_seconds(self) -> int:
+        """Nominal duration: 300 for 5-min, 900 for 15-min."""
+        return 300 if self.variant == "five" else 900
 
     @property
     def time_remaining(self) -> float:

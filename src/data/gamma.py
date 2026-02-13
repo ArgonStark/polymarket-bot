@@ -2,7 +2,7 @@
 Gamma API client for market discovery.
 
 Uses Polymarket's Gamma API to discover and fetch information
-about active 15-minute cryptocurrency prediction markets.
+about active 5-minute and 15-minute cryptocurrency prediction markets.
 """
 
 import re
@@ -62,9 +62,14 @@ class GammaAPI:
         if not self._target_price_cache:
             return 0
 
-        # Keep only entries for the current and previous period
+        # Keep entries for current and previous period for BOTH variants
         # (previous period might still have active markets settling)
-        valid_timestamps = {current_period_ts, current_period_ts - 900}
+        # 15-min period boundaries are multiples of 900; 5-min are multiples of 300.
+        current_5m = (current_period_ts // 300) * 300
+        valid_timestamps = {
+            current_period_ts, current_period_ts - 900,  # 15-min
+            current_5m, current_5m - 300,                # 5-min
+        }
 
         stale_keys = []
         for key in list(self._target_price_cache.keys()):
@@ -128,109 +133,113 @@ class GammaAPI:
             logger.error(f"Failed to fetch markets: {e}")
             return []
 
-    def get_15min_crypto_markets(self) -> list[MarketState]:
-        """
-        Fetch currently active 15-minute crypto markets.
+    # ── variant constants ──────────────────────────────────────
 
-        These markets must be fetched by constructing specific slugs:
-        - Format: {asset}-updown-15m-{unix_timestamp}
-        - Timestamp is the market start time (every 15 min: :00, :15, :30, :45)
+    _VARIANT_META = {
+        "five":    {"suffix": "5m",  "period": 300, "api_variant": "five"},
+        "fifteen": {"suffix": "15m", "period": 900, "api_variant": "fifteen"},
+    }
+
+    # ── public discovery API ────────────────────────────────────
+
+    def get_15min_crypto_markets(self) -> list[MarketState]:
+        """Legacy wrapper — fetches only 15-min markets."""
+        return self.get_crypto_markets(variants=["fifteen"])
+
+    def get_crypto_markets(
+        self,
+        variants: Optional[list[str]] = None,
+    ) -> list[MarketState]:
+        """
+        Fetch currently active crypto up/down markets for the given variants.
+
+        Constructs slugs per variant:
+          5-min:  {asset}-updown-5m-{unix_ts}   (period = 300 s)
+          15-min: {asset}-updown-15m-{unix_ts}  (period = 900 s)
+
+        Args:
+            variants: List of variant strings ("five", "fifteen").
+                      Defaults to ["fifteen"] for backward-compatibility.
 
         Returns:
-            List of MarketState objects for active 15-min markets
+            List of MarketState objects for active markets.
         """
-        filtered = []
+        if variants is None:
+            variants = ["fifteen"]
+
+        filtered: list[MarketState] = []
         now = datetime.now(timezone.utc)
         current_ts = int(now.timestamp())
 
-        # Round down to nearest 15 minutes (900 seconds)
-        base_ts = (current_ts // 900) * 900
-
-        # Only check current and previous period - NOT future periods
-        # Previous period may still be active in its final minutes
-        timestamps = [
-            base_ts - 900,   # Previous period (may still be active)
-            base_ts,         # Current period
-        ]
-
-        logger.debug(f"Checking market timestamps: {timestamps} (base: {base_ts})")
-
-        # Supported assets with their slug prefix
-        asset_slugs = {
-            "BTC": "btc-updown-15m-",
-            "ETH": "eth-updown-15m-",
-            "SOL": "sol-updown-15m-",
-            "XRP": "xrp-updown-15m-",
-        }
-
         import time as time_module
+        first_asset = True
 
-        for idx, (asset, slug_prefix) in enumerate(asset_slugs.items()):
-            # Only fetch supported assets
-            if asset not in self.config.supported_assets:
+        for variant in variants:
+            meta = self._VARIANT_META.get(variant)
+            if not meta:
+                logger.warning("Unknown variant %r — skipping", variant)
                 continue
 
-            # Small delay between assets to avoid rate limiting on price API
-            if idx > 0:
-                time_module.sleep(0.2)
+            period = meta["period"]
+            suffix = meta["suffix"]
 
-            for ts in timestamps:
-                slug = f"{slug_prefix}{ts}"
-                market = self._fetch_market_by_slug(slug)
+            # Round down to nearest period boundary
+            base_ts = (current_ts // period) * period
 
-                if not market:
-                    logger.debug(f"No market found for slug: {slug}")
-                    continue
+            # Current and previous period
+            timestamps = [base_ts - period, base_ts]
 
-                # Check if market is active and not closed
-                is_active = market.get("active", False)
-                is_closed = market.get("closed", True)
-                accepting_orders = market.get("acceptingOrders", False)
+            for asset in self.config.supported_assets:
+                # Small delay between assets to avoid rate limiting
+                if not first_asset:
+                    time_module.sleep(0.15)
+                first_asset = False
 
-                logger.debug(
-                    f"Market {slug}: active={is_active}, closed={is_closed}, "
-                    f"accepting={accepting_orders}"
-                )
+                slug_prefix = f"{asset.lower()}-updown-{suffix}-"
 
-                if not is_active or is_closed:
-                    continue
+                for ts in timestamps:
+                    slug = f"{slug_prefix}{ts}"
+                    market = self._fetch_market_by_slug(slug)
 
-                # Check if market is still accepting orders
-                if not accepting_orders:
-                    continue
+                    if not market:
+                        logger.debug("No market for slug: %s", slug)
+                        continue
 
-                # Parse market into MarketState
-                market_state = self._parse_market(market, asset)
-                if not market_state:
-                    logger.debug(f"Failed to parse market: {slug}")
-                    continue
+                    is_active = market.get("active", False)
+                    is_closed = market.get("closed", True)
+                    accepting_orders = market.get("acceptingOrders", False)
 
-                # Only include if not already in list and has time remaining
-                time_remaining = (market_state.end_time - now).total_seconds()
-                time_since_start = (now - market_state.start_time).total_seconds()
+                    if not is_active or is_closed or not accepting_orders:
+                        continue
 
-                # Only trade markets that have STARTED and have time remaining
-                if time_since_start < 0:
-                    logger.debug(f"SKIP {slug}: hasn't started yet (starts in {-time_since_start:.0f}s)")
-                    continue
+                    market_state = self._parse_market(market, asset)
+                    if not market_state:
+                        continue
 
-                if time_remaining <= 0:
-                    logger.debug(f"SKIP {slug}: already expired")
-                    continue
+                    time_remaining = (market_state.end_time - now).total_seconds()
+                    time_since_start = (now - market_state.start_time).total_seconds()
 
-                # Avoid duplicates
-                if any(m.condition_id == market_state.condition_id for m in filtered):
-                    continue
+                    if time_since_start < 0 or time_remaining <= 0:
+                        continue
 
-                filtered.append(market_state)
-                logger.debug(f"[{asset}] Market active | {time_remaining:.0f}s remaining | Target: ${market_state.target_price:,.0f}")
+                    # Avoid duplicates
+                    if any(m.condition_id == market_state.condition_id for m in filtered):
+                        continue
+
+                    filtered.append(market_state)
+                    logger.debug(
+                        "[%s/%s] Market active | %.0fs remaining | Target: $%,.0f",
+                        asset, variant, time_remaining, market_state.target_price,
+                    )
 
         # Sort by end time (soonest first)
         filtered.sort(key=lambda m: m.end_time)
 
-        # Only log if we found markets (avoid spam when no markets)
         if filtered:
-            logger.debug(f"Found {len(filtered)} active 15-minute crypto markets")
+            variant_counts = {}
+            for m in filtered:
+                variant_counts[m.variant] = variant_counts.get(m.variant, 0) + 1
+            logger.debug("Found %d active markets: %s", len(filtered), variant_counts)
         return filtered
 
     def _fetch_market_by_slug(self, slug: str) -> Optional[dict]:
@@ -376,16 +385,25 @@ class GammaAPI:
                 logger.warning(f"Cannot identify UP/DOWN tokens: {condition_id}")
                 return None
 
-            # Parse target price - different logic for 15-min vs other markets
+            # Detect variant from slug
+            slug_lower = slug.lower()
+            if "-updown-5m-" in slug_lower:
+                variant = "five"
+            elif "-updown-15m-" in slug_lower:
+                variant = "fifteen"
+            else:
+                variant = "fifteen"  # default
+
+            # Parse target price - different logic for updown vs other markets
             target_price = None
             start_ts = None
             cache_key = None
 
-            # For 15-min "updown" markets, ALWAYS use the dedicated price API
-            # Don't trust metadata startPrice/targetPrice as it may be stale
-            if "-updown-15m-" in slug.lower():
+            # For "updown" markets (5m or 15m), use the dedicated price API
+            is_updown = "-updown-5m-" in slug_lower or "-updown-15m-" in slug_lower
+            if is_updown:
                 start_ts = self._extract_timestamp_from_slug(slug)
-                cache_key = f"{asset}:{start_ts}" if start_ts else None
+                cache_key = f"{asset}:{variant}:{start_ts}" if start_ts else None
 
                 # Check cache first (from previous API calls only)
                 if cache_key and cache_key in self._target_price_cache:
@@ -395,15 +413,14 @@ class GammaAPI:
                         return None
                     elif cached > 0:
                         target_price = cached
-                        logger.debug(f"Using cached target price for {asset}: ${target_price:,.2f}")
+                        logger.debug(f"Using cached target price for {asset}/{variant}: ${target_price:,.2f}")
 
                 # If not in cache, fetch from Polymarket price API
                 if not target_price and start_ts and cache_key:
-                    target_price = self.fetch_price_to_beat(asset, start_ts)
+                    target_price = self.fetch_price_to_beat(asset, start_ts, variant=variant)
                     if target_price:
-                        # Cache successful price
                         self._target_price_cache[cache_key] = target_price
-                        logger.debug(f"Got target price for {asset} from API: ${target_price:,.2f}")
+                        logger.debug(f"Got target price for {asset}/{variant} from API: ${target_price:,.2f}")
                     else:
                         # Cache failure to avoid repeated API calls (use 0 as marker)
                         self._target_price_cache[cache_key] = 0
@@ -411,12 +428,12 @@ class GammaAPI:
                 # If API fails, skip this market
                 if not target_price or target_price <= 0:
                     logger.debug(
-                        f"Skipping {asset} market (no price data available yet): "
-                        f"slug={slug}, start_ts={start_ts}"
+                        "Skipping %s/%s market (no price data): slug=%s start_ts=%s",
+                        asset, variant, slug, start_ts,
                     )
                     return None
             else:
-                # For non-15-min markets, use question parsing or metadata
+                # For non-updown markets, use question parsing or metadata
                 target_price = self._extract_price_from_question(question)
                 if target_price is None or target_price == 0:
                     target_price = market.get("startPrice") or market.get("targetPrice")
@@ -462,9 +479,10 @@ class GammaAPI:
                 start_time = self._extract_start_time_from_slug(slug)
 
             if not start_time:
-                # Fallback: start time is 15 minutes before end time
+                # Fallback: start time is duration before end time
                 from datetime import timedelta
-                start_time = end_time - timedelta(minutes=15)
+                duration_min = 5 if variant == "five" else 15
+                start_time = end_time - timedelta(minutes=duration_min)
 
             return MarketState(
                 condition_id=condition_id,
@@ -477,6 +495,7 @@ class GammaAPI:
                 end_time=end_time,
                 best_bid=best_bid,
                 best_ask=best_ask,
+                variant=variant,
             )
 
         except Exception as e:
@@ -553,22 +572,24 @@ class GammaAPI:
         asset: str,
         market_start_timestamp: int,
         extended_retry: bool = False,
+        variant: str = "fifteen",
     ) -> Optional[float]:
         """
-        Fetch the "price to beat" for a 15-minute market from Polymarket API.
+        Fetch the "price to beat" for a market from Polymarket API.
 
         The price to beat is the Chainlink price at the market's START time,
-        which equals the closePrice of the PREVIOUS 15-minute interval.
+        which equals the closePrice of the PREVIOUS interval.
 
         API: https://polymarket.com/api/crypto/crypto-price
              ?symbol={BTC|ETH|SOL|XRP}
              &eventStartTime={timestamp_ms}
-             &variant=fifteen
+             &variant=fifteen|five
 
         Args:
             asset: Crypto symbol (BTC, ETH, SOL, XRP)
             market_start_timestamp: Unix timestamp (seconds) of market START
             extended_retry: If True, use longer retry logic for period boundaries
+            variant: "five" or "fifteen" — determines period length and API param
 
         Returns:
             Price to beat (float) or None if unavailable
@@ -576,8 +597,12 @@ class GammaAPI:
         import time
         from datetime import datetime, timezone
 
-        # The previous market's timestamp (15 minutes = 900 seconds earlier)
-        previous_market_timestamp = market_start_timestamp - 900
+        meta = self._VARIANT_META.get(variant, self._VARIANT_META["fifteen"])
+        period = meta["period"]
+        api_variant = meta["api_variant"]
+
+        # The previous market's timestamp
+        previous_market_timestamp = market_start_timestamp - period
 
         # Convert to milliseconds for API
         timestamp_ms = previous_market_timestamp * 1000
@@ -586,13 +611,13 @@ class GammaAPI:
         params = {
             "symbol": asset.upper(),
             "eventStartTime": timestamp_ms,
-            "variant": "fifteen"
+            "variant": api_variant,
         }
 
-        # Check if we're close to a period boundary (within 30 seconds of a new period)
+        # Check if we're close to a period boundary
         now = datetime.now(timezone.utc)
         current_ts = int(now.timestamp())
-        current_period_start = (current_ts // 900) * 900
+        current_period_start = (current_ts // period) * period
         seconds_into_period = current_ts - current_period_start
         is_period_start = seconds_into_period < 30
 

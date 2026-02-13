@@ -40,6 +40,9 @@ class PersistedState:
     # Open positions (minimal dicts for reconstruction)
     open_positions: list = field(default_factory=list)
 
+    # Kill switch state
+    kill_switch: dict = field(default_factory=dict)
+
     # Metadata
     saved_at: str = ""
     version: int = 1
@@ -61,6 +64,7 @@ def _serialize_position(position) -> dict:
         "end_time": market.end_time.isoformat(),
         "best_bid": market.best_bid,
         "best_ask": market.best_ask,
+        "variant": getattr(market, "variant", "fifteen"),
         "side": position.side.value,
         "token_id": position.token_id,
         "entry_price": position.entry_price,
@@ -91,6 +95,7 @@ def _deserialize_position(data: dict):
         end_time=datetime.fromisoformat(data["end_time"]),
         best_bid=data.get("best_bid", 0.0),
         best_ask=data.get("best_ask", 1.0),
+        variant=data.get("variant", "fifteen"),
     )
 
     side = Side(data["side"])
@@ -122,7 +127,7 @@ class BotStateManager:
             state_file = os.path.join(project_root, "bot_state.json")
         self.state_file = state_file
 
-    def save(self, risk_manager, markets: Optional[dict] = None) -> bool:
+    def save(self, risk_manager, markets: Optional[dict] = None, kill_switch=None) -> bool:
         """
         Snapshot risk manager state and write atomically to disk.
 
@@ -139,6 +144,8 @@ class BotStateManager:
 
             # Daily stats
             ds = risk_manager.daily_stats
+            ks_dict = kill_switch.to_dict() if kill_switch else {}
+
             state = PersistedState(
                 current_bankroll=risk_manager.current_bankroll,
                 peak_bankroll=risk_manager.peak_bankroll,
@@ -153,6 +160,7 @@ class BotStateManager:
                 daily_fees=ds.fees_paid if ds else 0.0,
                 daily_rebates=ds.rebates_earned if ds else 0.0,
                 open_positions=positions,
+                kill_switch=ks_dict,
                 saved_at=datetime.now(timezone.utc).isoformat(),
             )
 
@@ -207,6 +215,7 @@ class BotStateManager:
                 daily_fees=data.get("daily_fees", 0.0),
                 daily_rebates=data.get("daily_rebates", 0.0),
                 open_positions=data.get("open_positions", []),
+                kill_switch=data.get("kill_switch", {}),
                 saved_at=data.get("saved_at", ""),
                 version=data.get("version", 1),
             )

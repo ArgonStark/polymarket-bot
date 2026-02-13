@@ -33,6 +33,7 @@ class TradeRecord:
     market_id: str = ""
     arb_type: str = "none"
     edge: float = 0.0
+    variant: str = "fifteen"  # "five" or "fifteen"
 
 
 @dataclass
@@ -65,6 +66,7 @@ class TradeHistory:
         predicted_prob: Optional[float] = None,
         arb_type: str = "none",
         edge: float = 0.0,
+        variant: str = "fifteen",
     ) -> str:
         """
         Record a new trade being opened.
@@ -85,6 +87,7 @@ class TradeHistory:
             market_id=market_id,
             arb_type=arb_type,
             edge=edge,
+            variant=variant,
         )
 
         self.trades.append(asdict(trade))
