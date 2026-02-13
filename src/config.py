@@ -172,6 +172,13 @@ class TradingConfig:
         default_factory=lambda: int(os.getenv("COOLOFF_PERIOD_MINUTES", "30"))
     )
 
+    # Peak decay rate after drawdown cooloff expires (fraction of gap per hour)
+    # E.g. 0.05 = close 5% of (peak - current) gap per hour
+    # Set to 0 to disable (manual reset_drawdown() required)
+    peak_decay_rate_per_hour: float = field(
+        default_factory=lambda: float(os.getenv("PEAK_DECAY_RATE_PER_HOUR", "0.05"))
+    )
+
     # === Market Variant Settings ===
     # Which market durations to trade: "five", "fifteen", or both
     # Default: only fifteen (existing behaviour)
@@ -458,6 +465,9 @@ class MonitoringConfig:
     )
     rolling_window: int = field(
         default_factory=lambda: int(os.getenv("MONITORING_ROLLING_WINDOW", "50"))
+    )
+    ws_port: int = field(
+        default_factory=lambda: int(os.getenv("MONITOR_WS_PORT", "8765"))
     )
 
 

@@ -27,6 +27,7 @@ class PersistedState:
     # Risk tracking
     consecutive_losses: int = 0
     trade_history: list = field(default_factory=list)  # last 20 PnLs
+    peak_decay_started_at: str = ""  # ISO timestamp if peak decay is active, empty if not
 
     # Daily stats snapshot
     daily_date: str = ""
@@ -146,12 +147,18 @@ class BotStateManager:
             ds = risk_manager.daily_stats
             ks_dict = kill_switch.to_dict() if kill_switch else {}
 
+            # Persist peak decay timestamp if active
+            decay_ts = ""
+            if risk_manager._peak_decay_started_at is not None:
+                decay_ts = risk_manager._peak_decay_started_at.isoformat()
+
             state = PersistedState(
                 current_bankroll=risk_manager.current_bankroll,
                 peak_bankroll=risk_manager.peak_bankroll,
                 starting_bankroll=risk_manager.starting_bankroll,
                 consecutive_losses=risk_manager.consecutive_losses,
                 trade_history=list(risk_manager.trade_history),
+                peak_decay_started_at=decay_ts,
                 daily_date=ds.date if ds else "",
                 daily_pnl=ds.total_pnl if ds else 0.0,
                 daily_trades=ds.trades_count if ds else 0,
@@ -207,6 +214,7 @@ class BotStateManager:
                 starting_bankroll=data.get("starting_bankroll", data["current_bankroll"]),
                 consecutive_losses=data.get("consecutive_losses", 0),
                 trade_history=data.get("trade_history", []),
+                peak_decay_started_at=data.get("peak_decay_started_at", ""),
                 daily_date=data.get("daily_date", ""),
                 daily_pnl=data.get("daily_pnl", 0.0),
                 daily_trades=data.get("daily_trades", 0),
@@ -273,6 +281,14 @@ class BotStateManager:
                 current_bankroll=state.current_bankroll,
             )
             rm._last_daily_date = today
+
+        # Restore peak decay state
+        if state.peak_decay_started_at:
+            try:
+                rm._peak_decay_started_at = datetime.fromisoformat(state.peak_decay_started_at)
+                logger.info("STATE_RESTORE peak_decay active since %s", state.peak_decay_started_at)
+            except (ValueError, TypeError):
+                rm._peak_decay_started_at = None
 
         # Restore positions
         for pos_data in state.open_positions:

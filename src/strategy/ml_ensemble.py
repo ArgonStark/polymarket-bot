@@ -80,7 +80,7 @@ class GradientBoostingClassifier:
     """
     n_estimators: int = 100  # Increased for better accuracy
     learning_rate: float = 0.08  # Slightly lower for stability
-    max_features: int = 82  # Updated for 82 features
+    max_features: int = 83  # Updated for 83 features
 
     # Regularization
     l2_lambda: float = 0.1  # L2 regularization strength
@@ -362,7 +362,7 @@ class GradientBoostingClassifier:
         model = cls(
             n_estimators=data.get("n_estimators", 100),
             learning_rate=data.get("learning_rate", 0.08),
-            max_features=data.get("max_features", 82),
+            max_features=data.get("max_features", 83),
             l2_lambda=data.get("l2_lambda", 0.1),
             min_samples_split=data.get("min_samples_split", 5),
             early_stopping=data.get("early_stopping", True),
@@ -392,10 +392,10 @@ class FeatureImportanceTracker:
     - For each feature, track correlation with outcomes
     - Higher correlation = more important feature
 
-    UPDATED: Now supports 82 features including new indicators.
+    UPDATED: Now supports 83 features including new indicators + variant.
     """
 
-    n_features: int = 82
+    n_features: int = 83
     feature_names: List[str] = field(default_factory=list)
 
     # Running statistics for each feature
@@ -417,6 +417,8 @@ class FeatureImportanceTracker:
                 "is_btc", "is_eth", "is_sol", "is_xrp",
                 # Side (1)
                 "is_up",
+                # Market variant (1)
+                "is_five_min",
                 # Arb type one-hot (5)
                 "arb_none", "arb_binary", "arb_asymmetric", "arb_dump", "arb_hedge",
                 # Market features (4)
@@ -531,7 +533,7 @@ class FeatureImportanceTracker:
     @classmethod
     def from_dict(cls, data: dict) -> "FeatureImportanceTracker":
         tracker = cls(
-            n_features=data.get("n_features", 82),
+            n_features=data.get("n_features", 83),
             feature_names=data.get("feature_names", []),
         )
         # Handle migration from smaller feature sets

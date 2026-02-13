@@ -6,6 +6,7 @@ to ensure the bot operates within defined risk parameters.
 """
 
 import logging
+import math
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
@@ -68,6 +69,9 @@ class RiskManager:
     # Consolidated pause tracking
     _active_pauses: dict[str, PauseState] = field(default_factory=dict)
     _last_daily_date: str = ""  # Track last date for daily reset
+
+    # Peak decay state — gradually decays peak_bankroll after drawdown cooloff
+    _peak_decay_started_at: Optional[datetime] = None  # When decay started (None = not decaying)
 
     def initialize(self, bankroll: float):
         """
@@ -613,7 +617,83 @@ class RiskManager:
         logger.info("✅ Cooloff period ended - resetting protection counters")
         self.consecutive_losses = 0
         # Don't reset trade_history - win rate should still be monitored
-        # Don't reset peak_bankroll - drawdown is still relevant
+        # Don't reset peak_bankroll immediately — start gradual decay instead
+        self._maybe_start_peak_decay()
+
+    def _maybe_start_peak_decay(self):
+        """Start peak decay if drawdown is still breached after cooloff."""
+        if self._peak_decay_started_at is not None:
+            return  # Already decaying
+        decay_rate = self.config.trading.peak_decay_rate_per_hour
+        if decay_rate <= 0:
+            return  # Decay disabled
+        if self.peak_bankroll <= 0:
+            return
+        drawdown = (self.peak_bankroll - self.current_bankroll) / self.peak_bankroll
+        if drawdown >= self.config.trading.max_drawdown_pct:
+            self._peak_decay_started_at = datetime.now(timezone.utc)
+            logger.info(
+                "PEAK_DECAY_START peak=%.2f bankroll=%.2f drawdown=%.1f%% rate=%.0f%%/hr",
+                self.peak_bankroll, self.current_bankroll,
+                drawdown * 100, decay_rate * 100,
+            )
+
+    def apply_peak_decay(self):
+        """
+        Apply gradual peak decay toward current bankroll.
+
+        Called every tick. Exponentially closes the gap between peak and
+        current bankroll so drawdown eventually falls below the limit.
+
+        Formula: peak -= decay_rate * (peak - current) * dt_hours
+        At 5%/hr, ~63% of the gap closes in ~20 hours.
+        """
+        if self._peak_decay_started_at is None:
+            return
+        decay_rate = self.config.trading.peak_decay_rate_per_hour
+        if decay_rate <= 0:
+            self._peak_decay_started_at = None
+            return
+
+        now = datetime.now(timezone.utc)
+        dt_seconds = (now - self._peak_decay_started_at).total_seconds()
+        if dt_seconds <= 0:
+            return
+
+        gap = self.peak_bankroll - self.current_bankroll
+        if gap <= 0.01:
+            # Peak already at or below current — stop decaying
+            self._stop_peak_decay("gap_closed")
+            return
+
+        dt_hours = dt_seconds / 3600.0
+        # Exponential decay: new_gap = gap * e^(-rate * dt)
+        decay_factor = math.exp(-decay_rate * dt_hours)
+        new_gap = gap * decay_factor
+        new_peak = self.current_bankroll + new_gap
+
+        if new_peak < self.peak_bankroll:
+            old_peak = self.peak_bankroll
+            self.peak_bankroll = new_peak
+
+            # Check if drawdown is now below the limit
+            drawdown = (self.peak_bankroll - self.current_bankroll) / self.peak_bankroll
+            if drawdown < self.config.trading.max_drawdown_pct:
+                self._stop_peak_decay("below_limit")
+                logger.info(
+                    "PEAK_DECAY_RESOLVED peak=%.2f->%.2f drawdown=%.1f%% (below %.0f%% limit)",
+                    old_peak, self.peak_bankroll, drawdown * 100,
+                    self.config.trading.max_drawdown_pct * 100,
+                )
+                return
+
+        # Update decay start to now for next tick's dt calculation
+        self._peak_decay_started_at = now
+
+    def _stop_peak_decay(self, reason: str):
+        """Stop the peak decay process."""
+        self._peak_decay_started_at = None
+        logger.info("PEAK_DECAY_STOP reason=%s peak=%.2f", reason, self.peak_bankroll)
 
     def halt_trading(self, reason: str):
         """
@@ -646,6 +726,7 @@ class RiskManager:
         old_peak = self.peak_bankroll
         self.peak_bankroll = self.current_bankroll
         self.consecutive_losses = 0
+        self._peak_decay_started_at = None  # Stop any active decay
         logger.info(
             f"🔄 DRAWDOWN RESET: Peak ${old_peak:.2f} → ${self.current_bankroll:.2f} | "
             f"Trading can resume"
@@ -719,6 +800,8 @@ class RiskManager:
         if equity > self.peak_bankroll:
             old_peak = self.peak_bankroll
             self.peak_bankroll = equity
+            if self._peak_decay_started_at is not None:
+                self._stop_peak_decay("new_high")
             logger.info(
                 "PEAK_UPDATED old=%.2f new=%.2f",
                 old_peak, equity,

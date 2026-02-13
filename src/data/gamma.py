@@ -228,7 +228,7 @@ class GammaAPI:
 
                     filtered.append(market_state)
                     logger.debug(
-                        "[%s/%s] Market active | %.0fs remaining | Target: $%,.0f",
+                        "[%s/%s] Market active | %.0fs remaining | Target: $%.0f",
                         asset, variant, time_remaining, market_state.target_price,
                     )
 
@@ -611,7 +611,6 @@ class GammaAPI:
         params = {
             "symbol": asset.upper(),
             "eventStartTime": timestamp_ms,
-            "variant": api_variant,
         }
 
         # Check if we're close to a period boundary

@@ -79,6 +79,9 @@ class TradeFeatures:
     price_trend: float = 0.0  # Short-term price trend (-1 to 1)
     distance_from_target: float = 0.0  # Normalized distance from target price
 
+    # Market variant (5-min vs 15-min — different dynamics)
+    is_five_min: float = 0.0  # 1.0 if 5-min market, 0.0 if 15-min
+
     # Binance confirmation features (leading indicator)
     binance_lead_pct: float = 0.0  # (Binance - Chainlink) / Chainlink
     binance_confirmation: str = "NONE"  # STRONG, MEDIUM, WEAK, NONE
@@ -119,7 +122,7 @@ class TradeFeatures:
     chart_resume_ready: float = 1.0  # 1 if safe to trade, 0 if in pause
     chart_resume_confidence: float = 1.0  # Confidence in resuming (0-1)
 
-    # === NEW INDICATOR FEATURES (adds 29 features, total 82) ===
+    # === NEW INDICATOR FEATURES (adds 29 features, total 83 with variant) ===
 
     # MACD features (4)
     macd_histogram: float = 0.0  # Normalized histogram (-1 to +1)
@@ -165,7 +168,7 @@ class TradeFeatures:
     vwap_position_at: float = 1.0  # 1 if at VWAP
 
     def to_vector(self) -> list[float]:
-        """Convert to feature vector for model (82 features total)."""
+        """Convert to feature vector for model (83 features total)."""
         # Normalize features to roughly 0-1 range
         # NOTE: hour_of_day and day_of_week are set to neutral (0.5) because
         # they don't predict crypto price direction - they're just noise.
@@ -184,6 +187,8 @@ class TradeFeatures:
             1.0 if self.asset == "XRP" else 0.0,
             # Side (1)
             1.0 if self.side == "UP" else 0.0,
+            # Market variant (1) — 5-min markets have different dynamics
+            self.is_five_min,
             # Arb type one-hot (5)
             1.0 if self.arb_type == "none" else 0.0,
             1.0 if self.arb_type == "binary_arb" else 0.0,
@@ -452,12 +457,12 @@ class SimpleLogisticRegression:
     A simple logistic regression model that doesn't require sklearn.
     Uses online learning to update weights incrementally.
 
-    UPDATED: Now supports 82 features including advanced chart analysis + new indicators.
+    UPDATED: Now supports 83 features including advanced chart analysis + new indicators + variant.
     """
     weights: list[float] = field(default_factory=list)
     bias: float = 0.0
     learning_rate: float = 0.1
-    n_features: int = 82  # Number of features in TradeFeatures.to_vector()
+    n_features: int = 83  # Number of features in TradeFeatures.to_vector()
 
     def __post_init__(self):
         if not self.weights:
@@ -528,12 +533,12 @@ class SimpleNeuralNetwork:
     Simple 2-layer neural network for online learning.
     More powerful than logistic regression, adapts to new patterns.
 
-    Architecture: Input(82) -> Hidden(85) -> Output(1)
+    Architecture: Input(83) -> Hidden(85) -> Output(1)
     Uses ReLU activation and online gradient descent.
 
-    UPDATED: Now uses all 82 features including advanced chart analysis + new indicators.
+    UPDATED: Now uses all 83 features including advanced chart analysis + new indicators + variant.
     """
-    input_size: int = 82  # Full feature vector (matching TradeFeatures.to_vector())
+    input_size: int = 83  # Full feature vector (matching TradeFeatures.to_vector())
     hidden_size: int = 85  # Larger hidden layer for more features
     learning_rate: float = 0.03  # Slightly lower for stability
 
@@ -649,18 +654,42 @@ class SimpleNeuralNetwork:
 
     @classmethod
     def from_dict(cls, data: dict) -> "SimpleNeuralNetwork":
-        """Deserialize model."""
-        # Use current architecture defaults (82 features, 85 hidden)
-        # Old models with wrong dimensions will be re-initialized
-        return cls(
-            input_size=data.get("input_size", 82),  # Must match TradeFeatures.to_vector()
-            hidden_size=data.get("hidden_size", 85),  # Current architecture
-            learning_rate=data.get("learning_rate", 0.03),  # Current default
+        """Deserialize model, migrating old feature counts if needed."""
+        CURRENT_INPUT_SIZE = 83  # Must match TradeFeatures.to_vector()
+        saved_input_size = data.get("input_size", 82)
+
+        nn = cls(
+            input_size=CURRENT_INPUT_SIZE,
+            hidden_size=data.get("hidden_size", 85),
+            learning_rate=data.get("learning_rate", 0.03),
             weights_ih=data.get("weights_ih", []),
             weights_ho=data.get("weights_ho", []),
             bias_h=data.get("bias_h", []),
             bias_o=data.get("bias_o", 0.0),
         )
+
+        # Migrate weight rows if loaded from older model with fewer features
+        # Only migrate if weights were actually in the saved data (not freshly initialized)
+        has_saved_weights = bool(data.get("weights_ih"))
+        if saved_input_size < CURRENT_INPUT_SIZE and has_saved_weights and nn.weights_ih:
+            import random
+            random.seed(42)
+            delta = CURRENT_INPUT_SIZE - saved_input_size
+            scale = (2.0 / (CURRENT_INPUT_SIZE + nn.hidden_size)) ** 0.5
+            if saved_input_size == 82 and CURRENT_INPUT_SIZE == 83:
+                # is_five_min inserted at position 11 — splice weight into each row
+                for row in nn.weights_ih:
+                    row.insert(11, random.gauss(0, scale))
+            else:
+                # Generic: append new weights at end
+                for row in nn.weights_ih:
+                    row.extend([random.gauss(0, scale) for _ in range(delta)])
+            logger.info(
+                "NN model migrated: %d -> %d input features (%d new weights per neuron)",
+                saved_input_size, CURRENT_INPUT_SIZE, delta,
+            )
+
+        return nn
 
 
 class TraderModelLoader:
@@ -1081,6 +1110,10 @@ class MLSignalPredictor:
         else:
             price_range_position = 0.5  # Default to middle if no range data
 
+        # Detect 5-min variant from signal's market
+        variant = getattr(signal.market, 'variant', 'fifteen') if hasattr(signal, 'market') else 'fifteen'
+        is_five_min = 1.0 if variant == "five" else 0.0
+
         return TradeFeatures(
             edge=signal.edge,
             time_remaining=signal.market.time_remaining,
@@ -1090,6 +1123,7 @@ class MLSignalPredictor:
             day_of_week=now.weekday(),
             asset=asset,
             side=signal.side.value,
+            is_five_min=is_five_min,
             arb_type=arb_type,
             spread=spread,
             bid_depth=bid_depth,
@@ -1792,17 +1826,31 @@ class MLSignalPredictor:
                     )
                 elif len(old_weights) == 53:
                     logger.info(
-                        f"🤖 Migrating ML model from 53 to 82 features (adding new indicators: MACD, BB, Stoch, RSI Div, Volume, HA, VWAP)..."
+                        f"🤖 Migrating ML model from 53 to 83 features (adding new indicators + variant)..."
                     )
-                    # Extend weights for new indicator features (29 new)
-                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(29)]
+                    # Extend weights for new indicator features (29 new) + variant (1 new) = 30
+                    new_weights = old_weights + [random.uniform(-0.1, 0.1) for _ in range(30)]
                     model_data["weights"] = new_weights
-                    # Keep most training data since features are related to existing patterns
                     self.training_samples = max(0, int(data.get("training_samples", 0) * 0.85))
                     self.predictions_made = int(data.get("predictions_made", 0) * 0.85)
                     self.correct_predictions = int(data.get("correct_predictions", 0) * 0.85)
                     logger.info(
-                        f"🤖 Migration complete - model will retrain with new indicator features"
+                        f"🤖 Migration complete - model will retrain with new indicator + variant features"
+                    )
+                elif len(old_weights) == 82:
+                    logger.info(
+                        f"🤖 Migrating ML model from 82 to 83 features (adding is_five_min variant)..."
+                    )
+                    # Insert weight for is_five_min at position 11 (after side, before arb_type)
+                    # But simpler: just append since the model will retrain quickly
+                    new_weights = old_weights[:11] + [random.uniform(-0.1, 0.1)] + old_weights[11:]
+                    model_data["weights"] = new_weights
+                    # Keep nearly all training data — minor addition
+                    self.training_samples = max(0, int(data.get("training_samples", 0) * 0.95))
+                    self.predictions_made = int(data.get("predictions_made", 0) * 0.95)
+                    self.correct_predictions = int(data.get("correct_predictions", 0) * 0.95)
+                    logger.info(
+                        f"🤖 Migration complete - model will retrain with variant feature"
                     )
                 else:
                     self.training_samples = data.get("training_samples", 0)

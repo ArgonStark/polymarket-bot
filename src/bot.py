@@ -71,6 +71,7 @@ from src.kill_switch import KillSwitch
 from src.attribution import AttributionTracker, determine_source
 from src.capital_scaling import CapitalScaler
 from src.monitoring.dashboard import MetricsDashboard
+from monitoring.monitor_server import MonitorServer
 from src.strategy.trade_history import get_trade_history
 from src.utils import log_trade, shutdown_notification_executor, print_status_box, print_config_box, Colors
 from src.utils.logging import resolve_execution_mode, _MODE_LABELS
@@ -360,6 +361,11 @@ class TradingBot:
             interval=dashboard_interval,
         )
 
+        # Real-time monitoring server (WebSocket + HTTP dashboard)
+        self.monitor: Optional[MonitorServer] = None
+        if config.monitoring.enabled:
+            self.monitor = MonitorServer(port=config.monitoring.ws_port)
+
         # Control flags
         self._running = False
         self._shutdown_event = asyncio.Event()
@@ -480,6 +486,14 @@ class TradingBot:
 
         # Display startup info AFTER state restore so balance/positions are correct
         await self._display_startup_info()
+
+        # Start real-time monitoring server
+        if self.monitor:
+            self.monitor.start()
+            logger.info(
+                "Monitor dashboard available at http://localhost:%d",
+                self.monitor.http_port,
+            )
 
         # Sync existing orders to prevent duplicates
         await self._sync_existing_orders(force=True)
@@ -1241,6 +1255,10 @@ class TradingBot:
             self.binance_feed.disconnect()
         self.gamma_api.close()
 
+        # Stop monitoring server
+        if self.monitor:
+            self.monitor.stop()
+
         # Shutdown notification thread pool
         shutdown_notification_executor()
 
@@ -1592,6 +1610,9 @@ class TradingBot:
                 # Update peak equity (only increases, never decreases)
                 self.risk_manager.update_peak_equity(equity)
 
+                # Apply gradual peak decay if active (after drawdown cooloff)
+                self.risk_manager.apply_peak_decay()
+
                 # Kill switch evaluation (hard safety — checked every tick)
                 daily_loss_hit = (
                     self.risk_manager.daily_stats.hit_loss_limit_at(
@@ -1622,6 +1643,14 @@ class TradingBot:
                     realized_pnl_today=realized_today,
                     unrealized_pnl=unrealized,
                 )
+
+                # Push real-time monitoring snapshot
+                if self.monitor:
+                    self.monitor.push(self._build_monitor_snapshot(
+                        equity=equity,
+                        realized_today=realized_today,
+                        unrealized=unrealized,
+                    ))
 
                 # Check if trading is allowed (use equity for drawdown check)
                 can_trade, reason = self.risk_manager.can_trade(equity=equity)
@@ -1909,7 +1938,7 @@ class TradingBot:
 
                         # Target price is now fetched from Polymarket API in gamma.py
                         logger.info(
-                            "NEW_MARKET asset=%s variant=%s target=$%,.2f "
+                            "NEW_MARKET asset=%s variant=%s target=$%.2f "
                             "ends=%s time=%.0fs",
                             market.asset, market.variant,
                             market.target_price,
@@ -2017,7 +2046,7 @@ class TradingBot:
                     del self._api_positions[asset]
 
                 logger.info(
-                    "EXPIRING asset=%s variant=%s time=%.0fs target=$%,.2f",
+                    "EXPIRING asset=%s variant=%s time=%.0fs target=$%.2f",
                     market.asset, market.variant,
                     market.time_remaining, market.target_price,
                 )
@@ -2409,8 +2438,8 @@ class TradingBot:
                 result = await self.executor.execute_signal_async(signal)
         except Exception as e:
             logger.error(
-                "ORDER_RESULT asset=%s side=%s status=exception error=%s mode=%s",
-                asset, signal.side.value, str(e)[:200],
+                "ORDER_RESULT asset=%s variant=%s side=%s status=exception error=%s mode=%s",
+                asset, signal.market.variant, signal.side.value, str(e)[:200],
                 "paper" if self.config.paper_trading.enabled else "live"
             )
             logger.debug("Chart execution exception traceback:", exc_info=True)
@@ -2688,10 +2717,11 @@ class TradingBot:
 
             age_sec = (now - position.market.end_time).total_seconds()
             logger.warning(
-                "ORPHAN_CLEANUP market=%s asset=%s side=%s cost=%.2f "
+                "ORPHAN_CLEANUP market=%s asset=%s variant=%s side=%s cost=%.2f "
                 "expired_ago=%.0fs — force-closing as LOSS",
-                cid[:16], position.market.asset, position.side.value,
-                position.cost_basis, age_sec,
+                cid[:16], position.market.asset,
+                getattr(position.market, 'variant', 'fifteen'),
+                position.side.value, position.cost_basis, age_sec,
             )
 
             # Credit paper executor with zero proceeds (full loss)
@@ -3090,7 +3120,7 @@ class TradingBot:
                 )
 
             logger.info(
-                f"🤖 ML OBSERVATION: {market.asset} | "
+                f"🤖 ML OBSERVATION: {market.asset}/{market.variant} | "
                 f"Winner: {winning_outcome} | "
                 f"Price: ${resolution_price:,.2f} vs Target: ${target_price:,.2f} | "
                 f"+2 training samples"
@@ -3165,9 +3195,9 @@ class TradingBot:
 
         # Audit log
         logger.info(
-            "SETTLE_APPLY market_id=%s asset=%s side=%s held_token=%s "
+            "SETTLE_APPLY market_id=%s asset=%s variant=%s side=%s held_token=%s "
             "winning_token=%s payout=%.1f entry=%.4f shares=%.2f realized=%+.2f",
-            market.condition_id[:8], market.asset, position_side,
+            market.condition_id[:8], market.asset, market.variant, position_side,
             held_token[:16], winning_token_id[:16],
             payout_per_share, position.entry_price, position.shares, pnl,
         )
@@ -4422,9 +4452,9 @@ class TradingBot:
         # Skip signals without action
         if signal.recommended_action == OrderAction.SKIP:
             logger.info(
-                "ORDER_DECISION asset=%s decision=SKIP edge_used=%.4f min_edge_used=%.4f "
+                "ORDER_DECISION asset=%s variant=%s decision=SKIP edge_used=%.4f min_edge_used=%.4f "
                 "time_remaining=%.0f simple_mode=%s aggressive_mode=%s order_type=%s",
-                market.asset,
+                market.asset, market.variant,
                 float(getattr(signal, "edge", 0.0) or 0.0),
                 float(self.config.trading.min_edge),
                 float(getattr(signal, "time_remaining", 0.0) or 0.0),
@@ -4951,12 +4981,154 @@ class TradingBot:
                         part += f"↓{abs(dist_pct):.1f}%"
                 price_parts.append(part)
 
+        # Count markets by variant
+        five_count = sum(1 for m in self.markets.values() if m.variant == "five")
+        fifteen_count = market_count - five_count
+        if five_count > 0:
+            mkt_str = f"{fifteen_count}×15m+{five_count}×5m"
+        else:
+            mkt_str = f"{market_count} mkts"
+
         # Single clean status line
-        status = f"💰${bankroll:.0f} | {market_count} mkts | {pos_count} pos | {pending_count} pnd"
+        status = f"💰${bankroll:.0f} | {mkt_str} | {pos_count} pos | {pending_count} pnd"
         if price_parts:
             status += f" | {' '.join(price_parts)}"
 
         logger.info(status)
+
+    def _build_monitor_snapshot(
+        self,
+        equity: float,
+        realized_today: float,
+        unrealized: float,
+    ) -> dict:
+        """Build a data dict for the real-time monitoring dashboard."""
+        now = datetime.now(timezone.utc)
+        bankroll = self.risk_manager.current_bankroll
+        peak = self.risk_manager.peak_bankroll
+
+        # Chainlink prices
+        chainlink_prices = self.chainlink_feed.get_all_prices()
+        binance_prices = self._get_binance_prices()
+
+        # Pick the primary asset's price for the header
+        primary_asset = self.config.supported_assets[0] if self.config.supported_assets else "BTC"
+        asset_key = f"{primary_asset.lower()}/usd"
+        price = chainlink_prices.get(asset_key, 0.0)
+
+        # Build per-asset price info
+        assets_info = []
+        for asset in self.config.supported_assets:
+            akey = f"{asset.lower()}/usd"
+            cl = chainlink_prices.get(akey)
+            bn = binance_prices.get(asset)
+            if cl:
+                target = None
+                for m in self.markets.values():
+                    if m.asset == asset:
+                        target = m.target_price
+                        break
+                dist_pct = ((cl - target) / target * 100) if target and target > 0 else 0.0
+                assets_info.append({
+                    "asset": asset,
+                    "chainlink": round(cl, 2),
+                    "binance": round(bn, 2) if bn else None,
+                    "target": round(target, 2) if target else None,
+                    "distance_pct": round(dist_pct, 2),
+                })
+
+        # Open positions
+        open_positions = []
+        for mk, pos in self.risk_manager.positions.items():
+            market = self.markets.get(mk) or self.expiring_markets.get(mk)
+            mark_price, source, _ = self._get_position_mark_price(
+                pos, market, self._derive_position_state(pos, market)
+            )
+            mark_val = pos.shares * mark_price if mark_price else pos.cost_basis
+            pos_pnl = mark_val - pos.cost_basis
+            pnl_pct = (pos_pnl / pos.cost_basis * 100) if pos.cost_basis > 0 else 0.0
+            open_positions.append({
+                "symbol": pos.market.asset if pos.market else "?",
+                "side": pos.side.value if hasattr(pos.side, 'value') else str(pos.side),
+                "entry_price": round(pos.entry_price, 4),
+                "size": round(pos.shares, 2),
+                "cost": round(pos.cost_basis, 2),
+                "mark": round(mark_price, 4) if mark_price else None,
+                "pnl": round(pos_pnl, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "variant": getattr(pos.market, 'variant', 'fifteen') if pos.market else 'fifteen',
+                "time_remaining": round(market.time_remaining, 0) if market else None,
+            })
+
+        # Recent closed trades (risk_manager.trade_history is a list of PnL floats)
+        recent_trades = []
+        for pnl_val in reversed(self.risk_manager.trade_history[-10:]):
+            recent_trades.append({
+                "side": "WIN" if pnl_val > 0 else "LOSS",
+                "symbol": primary_asset,
+                "pnl": round(pnl_val, 2),
+                "price": 0,
+            })
+
+        # Win rate
+        daily = self.risk_manager.daily_stats
+        total_trades = daily.trades_count if daily else 0
+        wins = daily.wins if daily else 0
+        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
+
+        # Bot status
+        pauses = getattr(self, '_active_pauses', {})
+        if self.kill_switch.is_active:
+            bot_status = "KILLED"
+        elif pauses:
+            bot_status = "PAUSED"
+        elif not self._running:
+            bot_status = "STOPPED"
+        else:
+            bot_status = "RUNNING"
+
+        # Data feed health
+        clob_ok = self.clob_feed.is_connected and self.clob_feed.is_warmed_up
+        chainlink_ok = not self.chainlink_feed._circuit_open
+
+        return {
+            "symbol": primary_asset,
+            "price": round(price, 2),
+            "assets": assets_info,
+            "bot_status": bot_status,
+            "timestamp": now.isoformat(),
+            "mode": self._execution_mode,
+
+            # Account
+            "bankroll": round(bankroll, 2),
+            "equity": round(equity, 2),
+            "peak_bankroll": round(peak, 2),
+            "drawdown_pct": round((1 - equity / peak) * 100, 2) if peak > 0 else 0.0,
+            "total_exposure": round(self.risk_manager.get_total_exposure(), 2),
+
+            # PnL
+            "total_pnl": round(realized_today + unrealized, 2),
+            "realized_pnl": round(realized_today, 2),
+            "unrealized_pnl": round(unrealized, 2),
+            "win_rate": round(win_rate, 1),
+            "total_trades": total_trades,
+
+            # Positions & trades
+            "open_positions": open_positions[:5],
+            "recent_trades": recent_trades[:5],
+
+            # Markets
+            "active_markets": len(self.markets),
+            "expiring_markets": len(self.expiring_markets),
+            "pending_orders": len(self._pending_orders) if hasattr(self, '_pending_orders') else 0,
+
+            # Feed health
+            "clob_connected": clob_ok,
+            "chainlink_connected": chainlink_ok,
+
+            # Signals (empty list — filled by downstream if needed)
+            "signals": [],
+        }
 
     def _log_order_block(self, asset: str, reason: str, **kwargs) -> bool:
         """
@@ -5331,13 +5503,14 @@ class TradingBot:
                     PositionState.RESOLVED_LOSS,
                 )
                 logger.info(
-                    "POSITION_VALUATION market=%s asset=%s side=%s "
+                    "POSITION_VALUATION market=%s asset=%s variant=%s side=%s "
                     "token_id_used=%s bid=%s ask=%s mid=%s "
                     "mark_price=%s mark_source=%s "
                     "entry=%.4f shares=%.2f unrealized_pnl=%s realized_pnl=0.00 "
                     "state=%s pending_settlement=%s",
                     market_key[:8] if market_key else "????????",
                     asset,
+                    getattr(position.market, 'variant', 'fifteen') if position.market else 'fifteen',
                     side,
                     token_id_used[:16] if token_id_used else "None",
                     f"{dbg_bid:.4f}" if dbg_bid is not None else "None",
@@ -5367,16 +5540,18 @@ class TradingBot:
                     else:
                         mark_display = f"{mark_price:.3f}"
 
+                    variant_tag = "5m" if getattr(position.market, 'variant', 'fifteen') == "five" else "15"
                     logger.info(
-                        f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {side_color}{side_arrow} {asset:4}{Colors.RESET} │ "
+                        f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {side_color}{side_arrow} {asset:4}{Colors.RESET}{Colors.DIM}/{variant_tag}{Colors.RESET} │ "
                         f"{position.shares:>6.1f} @ {position.entry_price:.3f} → {mark_display} │ "
                         f"{pnl_color}{unrealized_pnl:>+7.2f} ({pnl_pct:>+5.0f}%){Colors.RESET} │ "
                         f"{prob_color}{prob_icon} {our_win_prob:>3.0%}{Colors.RESET} │ {status_str}  {Colors.BRIGHT_CYAN}│{Colors.RESET}"
                     )
                 else:
                     # No valid mark - show pending
+                    variant_tag = "5m" if getattr(position.market, 'variant', 'fifteen') == "five" else "15"
                     logger.info(
-                        f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {side_color}{side_arrow} {asset:4}{Colors.RESET} │ "
+                        f"{Colors.BRIGHT_CYAN}│{Colors.RESET}  {side_color}{side_arrow} {asset:4}{Colors.RESET}{Colors.DIM}/{variant_tag}{Colors.RESET} │ "
                         f"{position.shares:>6.1f} @ {position.entry_price:.3f} → {'--':>5} │ "
                         f"{'(pending)':^16} │ "
                         f"{prob_color}{prob_icon} {our_win_prob:>3.0%}{Colors.RESET} │ {status_str}  {Colors.BRIGHT_CYAN}│{Colors.RESET}"
@@ -5643,8 +5818,8 @@ class TradingBot:
             result = await self.executor.execute_signal_async(averaging_signal)
         except Exception as e:
             logger.error(
-                "ORDER_RESULT asset=%s side=%s status=exception error=%s mode=averaging",
-                asset, position.side.value, str(e)[:200]
+                "ORDER_RESULT asset=%s variant=%s side=%s status=exception error=%s mode=averaging",
+                asset, getattr(position.market, 'variant', 'fifteen'), position.side.value, str(e)[:200]
             )
             logger.debug("Averaging execution exception traceback:", exc_info=True)
             return  # Exit gracefully
@@ -6008,9 +6183,9 @@ class TradingBot:
 
         # ORDER_DECISION is logged here AFTER all blocking gates (cooldown/dup/rate-limit/exposure)
         logger.info(
-            "ORDER_DECISION asset=%s decision=PLACE_ORDER side=%s edge=%.4f min_edge=%.4f "
+            "ORDER_DECISION asset=%s variant=%s decision=PLACE_ORDER side=%s edge=%.4f min_edge=%.4f "
             "true_prob=%.4f price=%.4f size_usd=%.2f time_remaining=%.0f order_type=%s",
-            asset,
+            asset, signal.market.variant,
             signal.side.value,
             float(signal.edge or 0.0),
             float(self.config.trading.min_edge),
@@ -6074,8 +6249,8 @@ class TradingBot:
 
         # Log ORDER_SUBMIT BEFORE execution attempt
         logger.info(
-            "ORDER_SUBMIT asset=%s market=%s side=%s price=%.4f size_usd=%.2f size_shares=%.4f type=%s mode=%s",
-            asset,
+            "ORDER_SUBMIT asset=%s variant=%s market=%s side=%s price=%.4f size_usd=%.2f size_shares=%.4f type=%s mode=%s",
+            asset, signal.market.variant,
             market_id[:8],
             signal.side.value,
             float(signal.recommended_price or 0.0),
@@ -6128,9 +6303,9 @@ class TradingBot:
         # Log ORDER_RESULT AFTER execution
         if result.success:
             logger.info(
-                "ORDER_RESULT asset=%s market=%s side=%s status=success order_id=%s "
+                "ORDER_RESULT asset=%s variant=%s market=%s side=%s status=success order_id=%s "
                 "filled_size=%.4f filled_price=%.4f mode=%s",
-                asset,
+                asset, signal.market.variant,
                 market_id[:8],
                 signal.side.value,
                 result.order_id[:16] if result.order_id else "none",
@@ -6150,8 +6325,8 @@ class TradingBot:
             )
         else:
             logger.info(
-                "ORDER_RESULT asset=%s market=%s side=%s status=failed error=%s mode=%s",
-                asset,
+                "ORDER_RESULT asset=%s variant=%s market=%s side=%s status=failed error=%s mode=%s",
+                asset, signal.market.variant,
                 market_id[:8],
                 signal.side.value,
                 result.error_message[:50] if result.error_message else "unknown",

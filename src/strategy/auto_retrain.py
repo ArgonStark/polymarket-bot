@@ -309,7 +309,7 @@ class AutoRetrainer:
             # Reset logistic regression weights
             import random
             random.seed(42)
-            n_features = getattr(self.ml_predictor.model, 'n_features', 82)
+            n_features = getattr(self.ml_predictor.model, 'n_features', 83)
             self.ml_predictor.model.weights = [random.uniform(-0.1, 0.1) for _ in range(n_features)]
             self.ml_predictor.model.bias = 0.0
 
