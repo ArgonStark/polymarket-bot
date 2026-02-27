@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 

@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from src.config import BotConfig
-from src.models import MarketState, ChainlinkPrice, Signal, OrderAction, Side, PositionState
+from src.models import MarketState, ChainlinkPrice, Side
 from src.data import (
     ChainlinkFeed,
     CLOBFeed,
@@ -29,13 +29,12 @@ from src.data import (
 )
 from src.data.binance import BinancePrice
 from src.execution import create_trading_client, OrderExecutor
-from src.execution.client import get_account_balance, get_trades
+from src.execution.client import get_account_balance
 from src.execution.orders import OrderSafetyGuard, get_safety_guard
 from src.strategy import SignalGenerator, RiskManager
 from src.strategy.regime import RegimeDetector
 from src.strategy.meta import MultiStrategyMeta, StrategyWeights
 from src.strategy.risk_sizing import RiskSizer, RiskSizingConfig
-from src.strategy.strategies.context import StrategyContext
 from src.monitoring.metrics import MetricsCollector, MetricsConfig
 from src.execution.low_latency.router import SmartOrderRouter, SmartRouterConfig
 from src.execution.paper import PaperOrderExecutor, PaperTradingConfig
@@ -2333,5 +2332,5 @@ async def main(argv=None) -> None:
     if argv is not None:
         import sys
         sys.argv = [sys.argv[0], *argv]
-    from src.bot.run import main as run_main
+    from main import main as run_main
     await run_main()

@@ -55,3 +55,12 @@ htmlcov/
 Thumbs.db
 ml_model.json
 /data/
+
+# Runtime state
+bot_state.json
+bot_state.json.bak
+retrain_state.json
+trade_history.json
+trader_data.json
+trader_model.json
+src/metrics.json
