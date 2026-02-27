@@ -44,6 +44,8 @@ class MonitorServer:
         self._thread: Optional[threading.Thread] = None
         self._ws_server = None
         self._http_runner = None
+        self._started = threading.Event()
+        self._start_error: Optional[str] = None
 
     # ── public API (thread-safe) ─────────────────────────────────
 
@@ -52,13 +54,23 @@ class MonitorServer:
         if self._thread and self._thread.is_alive():
             logger.warning("MonitorServer already running")
             return
+        self._started.clear()
+        self._start_error = None
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="monitor-server")
         self._thread.start()
-        logger.info(
-            "MonitorServer started — ws://0.0.0.0:%d  http://0.0.0.0:%d",
-            self.ws_port, self.http_port,
-        )
+
+        # Wait for servers to actually bind (up to 5s)
+        if self._started.wait(timeout=5.0):
+            if self._start_error:
+                logger.error("MonitorServer failed to start: %s", self._start_error)
+            else:
+                logger.info(
+                    "MonitorServer started — ws://0.0.0.0:%d  http://0.0.0.0:%d",
+                    self.ws_port, self.http_port,
+                )
+        else:
+            logger.warning("MonitorServer start timed out (may still be starting)")
 
     def stop(self):
         """Shut down servers and join the background thread."""
@@ -114,7 +126,14 @@ class MonitorServer:
 
     def _run_loop(self):
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._serve())
+        try:
+            self._loop.run_until_complete(self._serve())
+            self._started.set()
+        except Exception as e:
+            self._start_error = str(e)
+            self._started.set()
+            logger.error("MonitorServer _serve() failed: %s", e)
+            return
         self._loop.run_forever()
 
     async def _serve(self):
@@ -131,6 +150,7 @@ class MonitorServer:
         app = web.Application()
         app.router.add_get("/", self._http_dashboard)
         app.router.add_get("/health", self._http_health)
+        app.router.add_get("/api/snapshot", self._http_snapshot)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", self.http_port)
@@ -181,6 +201,20 @@ class MonitorServer:
             html = html.replace("{{WS_PORT}}", str(self.ws_port))
             return web.Response(text=html, content_type="text/html")
         return web.Response(text="web_dashboard.html not found", status=404)
+
+    async def _http_snapshot(self, request: web.Request) -> web.Response:
+        """Return the latest snapshot as JSON (useful for debugging without WebSocket)."""
+        if self._last_snapshot:
+            return web.Response(
+                text=self._last_snapshot,
+                content_type="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        return web.Response(
+            text=json.dumps({"error": "no data yet"}),
+            content_type="application/json",
+            status=503,
+        )
 
     async def _http_health(self, request: web.Request) -> web.Response:
         return web.Response(

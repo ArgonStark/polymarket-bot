@@ -21,6 +21,7 @@ from src.data import (
     CLOBFeed,
     GammaAPI,
     BinanceFeed,
+    BinanceTradeFeed,
     fetch_all_historical_prices,
     prepopulate_price_histories,
     get_data_api,
@@ -31,32 +32,16 @@ from src.execution import create_trading_client, OrderExecutor
 from src.execution.client import get_account_balance, get_trades
 from src.execution.orders import OrderSafetyGuard, get_safety_guard
 from src.strategy import SignalGenerator, RiskManager
+from src.strategy.regime import RegimeDetector
 from src.strategy.meta import MultiStrategyMeta, StrategyWeights
 from src.strategy.risk_sizing import RiskSizer, RiskSizingConfig
 from src.strategy.strategies.context import StrategyContext
-from src.prediction import FeatureBuilder, ProbabilityModel
 from src.monitoring.metrics import MetricsCollector, MetricsConfig
 from src.execution.low_latency.router import SmartOrderRouter, SmartRouterConfig
 from src.execution.paper import PaperOrderExecutor, PaperTradingConfig
-from src.ml import (
-    MLInterface,
-    MLInput,
-    MLDecision,
-    MLPredictor,
-    NoOpML,
-    create_ml_input_from_signal,
-    TradeSide,
-    MarketContext,
-    TrendContext,
-    ChartContext,
-    IndicatorContext,
-    PriceContext,
-)
-from src.ml.infer import ModelBundle, InferenceEngine
-from src.ml.policy import Policy, PolicyConfig
 from src.state import BotStateManager
 from src.kill_switch import KillSwitch
-from src.attribution import AttributionTracker, determine_source
+from src.attribution import AttributionTracker
 from src.capital_scaling import CapitalScaler
 from src.monitoring.dashboard import MetricsDashboard
 from monitoring.monitor_server import MonitorServer
@@ -118,6 +103,19 @@ class TradingBot(
         )
         self.gamma_api = GammaAPI(config=config)
 
+        # Binance aggTrade feed for OFI (Order Flow Imbalance)
+        self.binance_trade_feed = BinanceTradeFeed(config=config) if config.ofi.enabled else None
+
+        # Regime detector (ATR + Efficiency Ratio)
+        self.regime_detector = RegimeDetector(
+            binance_feed=self.binance_feed,
+            er_trending_threshold=config.regime.er_trending_threshold,
+            er_ranging_threshold=config.regime.er_ranging_threshold,
+            atr_low_percentile=config.regime.atr_low_percentile,
+            ranging_kelly_mult=config.regime.ranging_kelly_mult,
+            _cache_ttl=config.regime.cache_ttl,
+        ) if config.regime.enabled else None
+
         # Trading components
         self.client = None
         self.executor = None
@@ -135,16 +133,6 @@ class TradingBot(
             )
             self.meta_strategy = MultiStrategyMeta(weights)
             logger.info("🧠 Multi-strategy meta-layer enabled")
-
-        # Probabilistic prediction model
-        self.feature_builder = FeatureBuilder(
-            velocity_window=config.prediction.velocity_window,
-            vol_window=config.prediction.vol_window,
-        )
-        self.prediction_model = None
-        if config.prediction.enabled:
-            self.prediction_model = ProbabilityModel(model_path=config.prediction.model_path)
-            logger.info("🧪 Probabilistic prediction layer enabled")
 
         # Dynamic risk sizing
         self.risk_sizer = RiskSizer(
@@ -165,52 +153,6 @@ class TradingBot(
                 rolling_window=config.monitoring.rolling_window,
             )
         )
-
-        # EV-based ML engine
-        self.ml_engine = None
-        self.ml_policy = None
-        if config.ml_engine.enabled:
-            try:
-                bundle = ModelBundle(config.ml_engine.bundle_path)
-                self.ml_engine = InferenceEngine(bundle)
-                self.ml_policy = Policy(
-                    PolicyConfig(
-                        min_ev=config.ml_engine.min_ev,
-                        max_uncertainty=config.ml_engine.max_uncertainty,
-                        max_spread=config.ml_engine.max_spread,
-                        min_depth=config.ml_engine.min_depth,
-                        max_exposure_pct=config.ml_engine.max_exposure_pct,
-                        ev_sizing_scale=config.ml_engine.ev_sizing_scale,
-                        target_volatility=config.ml_engine.target_volatility,
-                    )
-                )
-                logger.info("🧠 EV-based ML engine enabled")
-            except Exception as e:
-                logger.error(f"Failed to load ML bundle: {e}")
-                self.ml_engine = None
-                self.ml_policy = None
-
-        # Optional ML interface (bundle-aware)
-        self.ml_interface: Optional[MLInterface] = None
-        bundle_path = os.getenv("ML_BUNDLE") or os.getenv("ML_BUNDLE_PATH") or None
-        # ML_MIN_EDGE falls back to config.trading.min_edge (unified source)
-        ml_min_edge_env = os.getenv("ML_MIN_EDGE")
-        if ml_min_edge_env is not None:
-            try:
-                min_edge = float(ml_min_edge_env)
-            except ValueError:
-                min_edge = config.trading.min_edge
-        else:
-            min_edge = config.trading.min_edge
-        if bundle_path or config.trading.ml_enabled:
-            if bundle_path:
-                logger.info(f"ML bundle path resolved: {bundle_path}")
-            self.ml_interface = MLPredictor(
-                min_confidence=config.trading.ml_min_confidence,
-                min_samples=config.trading.ml_min_samples,
-                bundle_path=bundle_path,
-                min_edge=min_edge,
-            )
 
         # Settlement verifier (on-chain verification via The Graph)
         self.settlement_verifier = get_settlement_verifier()
@@ -235,7 +177,6 @@ class TradingBot(
         self._logged_rejections: set[str] = set()
         self._last_rejection_clear: Optional[datetime] = None
         self._rejection_clear_interval = 30.0  # Clear rejections every 30s to re-log
-        self._ml_decision_log_ts: dict[str, float] = {}
         self._signal_log_ts: dict[str, float] = {}
         self._price_log_ts: dict[str, float] = {}
         self._order_submit_ts: deque[float] = deque()
@@ -304,10 +245,22 @@ class TradingBot(
         self.position_log_interval = 30.0  # Log position status every 30s
         self.last_position_log = None  # Track last position log time
 
+        # Compact position table throttling
+        self._last_compact_table_ts: float = 0.0
+        self._compact_table_interval: float = 10.0
+        self._recent_settlements: deque = deque(maxlen=10)
+
+        # Signal-processing diagnostics (reset each tick, displayed in compact table)
+        self._tick_block_reasons: dict[str, int] = {}  # reason -> count
+        self._tick_markets_processed: int = 0
+        self._tick_signals_generated: int = 0
+        self._tick_trades_executed: int = 0
+        self._last_trade_ts: Optional[float] = None  # monotonic time of last successful trade
+
         # ORDER_BLOCK log throttling - prevent spam for repeated blocks
         # Key: "asset:reason" -> last log timestamp
         self._order_block_log_ts: dict[str, float] = {}
-        self._order_block_log_interval = 15.0  # Only log same block once per 15s
+        self._order_block_log_interval = 5.0  # Only log same block once per 5s
 
         # Kill switch (hard safety gate)
         self.kill_switch = KillSwitch()
@@ -534,32 +487,42 @@ class TradingBot(
                             self._last_order_time[f"{asset}:{_v}"] = now
                         break
 
-            # 2. Sync active positions (filled trades in active 15-min markets)
-            positions = get_active_positions(self.client)
-            position_count = len(positions)
+            # 2. Sync active positions (filled trades in active 5m/15m markets)
+            positions_raw = get_active_positions(self.client)
+            position_count = len(positions_raw)
 
-            # Cache positions for duplicate checking
-            self._update_cached_positions(positions)
+            # Build asset-keyed cache for duplicate-trade prevention
+            # (legacy format: keyed by asset name)
+            asset_cache: dict[str, dict] = {}
+            for _pk, pos_info in positions_raw.items():
+                _a = pos_info.get("asset", _pk)
+                if _a not in asset_cache:
+                    asset_cache[_a] = pos_info
+            self._update_cached_positions(asset_cache)
 
-            for asset, pos_info in positions.items():
+            for _pk, pos_info in positions_raw.items():
+                asset = pos_info.get("asset", _pk.split(":")[0] if ":" in _pk else _pk)
                 synced_assets.add(asset)
+                variant = pos_info.get("variant", "fifteen")
                 # Set cooldown so we don't try to trade this asset again
-                for _v in self.config.trading.trading_variants:
-                    self._last_order_time[f"{asset}:{_v}"] = now
+                self._last_order_time[f"{asset}:{variant}"] = now
 
-                # Track this as an external position
+                # Check if we already track this position internally
+                condition_id = pos_info.get("conditionId", "")
+                if not condition_id:
+                    continue
+
+                # Already tracked by risk manager → skip
+                if condition_id in self.risk_manager.positions:
+                    continue
+
                 cost = pos_info.get("cost", 0)
                 size = pos_info.get("size", 0)
-                market_slug = pos_info.get("market", "unknown")
+                if cost <= 0 or size <= 0:
+                    continue
 
-                # Check if we already know about this position
-                known_positions = [p.market.asset for p in self.risk_manager.positions.values()]
-                if asset not in known_positions and cost > 0:
-                    logger.info(
-                        f"📊 POSITION FOUND: {asset} | "
-                        f"{size:.2f} shares @ ${pos_info.get('price', 0):.2f} | "
-                        f"Cost: ${cost:.2f} | Market: {market_slug}"
-                    )
+                # Try to import into risk_manager.positions
+                self._import_api_position(condition_id, pos_info)
 
             # 3. Log summary
             if force or synced_assets:
@@ -573,6 +536,94 @@ class TradingBot(
 
         except Exception as e:
             logger.warning(f"Could not sync orders/positions: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+    def _import_api_position(self, condition_id: str, pos_info: dict):
+        """
+        Import an API-discovered position into risk_manager.positions.
+
+        Called when _sync_existing_orders() finds a position on the Data API
+        that isn't tracked internally (e.g., fill detection missed it).
+        """
+        from src.models import Position, Side
+
+        asset = pos_info.get("asset", "???")
+        variant = pos_info.get("variant", "fifteen")
+        size = pos_info.get("size", 0)
+        avg_price = pos_info.get("price", 0)
+        held_token = pos_info.get("token_id", "")
+        outcome = pos_info.get("outcome", "")
+        cost = pos_info.get("cost", size * avg_price)
+
+        # Find the matching MarketState
+        market = self.markets.get(condition_id)
+        if market is None:
+            # Also check expiring markets (keyed by condition_id)
+            market = getattr(self, 'expiring_markets', {}).get(condition_id)
+        if market is None:
+            logger.info(
+                "POSITION_IMPORT_SKIP asset=%s condition=%s reason=no_matching_market",
+                asset, condition_id[:16],
+            )
+            return
+
+        # Determine side from token matching (primary) or outcome (fallback)
+        side = None
+        if held_token and market.up_token_id and held_token == market.up_token_id:
+            side = Side.UP
+        elif held_token and market.down_token_id and held_token == market.down_token_id:
+            side = Side.DOWN
+        elif outcome:
+            # Fallback: "Yes" = UP, "No" = DOWN
+            if outcome.lower() in ("yes", "up"):
+                side = Side.UP
+            elif outcome.lower() in ("no", "down"):
+                side = Side.DOWN
+
+        if side is None:
+            logger.warning(
+                "POSITION_IMPORT_SKIP asset=%s condition=%s reason=cannot_determine_side "
+                "token=%s outcome=%s up_token=%s down_token=%s",
+                asset, condition_id[:16],
+                held_token[:16] if held_token else "none",
+                outcome,
+                market.up_token_id[:16] if market.up_token_id else "none",
+                market.down_token_id[:16] if market.down_token_id else "none",
+            )
+            return
+
+        # Set held token from market if not available from API
+        if not held_token:
+            held_token = market.up_token_id if side == Side.UP else market.down_token_id
+
+        # Create Position and insert into risk manager
+        position = Position(
+            market=market,
+            side=side,
+            token_id=held_token,
+            entry_price=avg_price,
+            shares=size,
+            entry_time=datetime.now(timezone.utc),
+            market_id=condition_id,
+            yes_token_id=market.up_token_id,
+            no_token_id=market.down_token_id,
+            held_token_id=held_token,
+            total_cost=cost,
+        )
+        self.risk_manager.positions[condition_id] = position
+        self.risk_manager.current_bankroll -= cost
+
+        # Also credit paper executor if in paper mode
+        if self.config.paper_trading.enabled and hasattr(self.executor, 'account'):
+            self.executor.account.balance -= cost
+
+        logger.info(
+            "POSITION_IMPORTED asset=%s variant=%s side=%s shares=%.2f "
+            "price=%.4f cost=%.2f condition=%s token=%s",
+            asset, variant, side.value, size,
+            avg_price, cost, condition_id[:16], held_token[:16],
+        )
 
     async def _fetch_historical_prices(self):
         """
@@ -717,6 +768,32 @@ class TradingBot(
                 if order_info is None:
                     # Order not found - might have been filled or cancelled
                     if wait_time > 60:  # 1 minute timeout (reduced from 2)
+                        # Check if API shows a position for this asset (order likely filled
+                        # but was archived before we could check status)
+                        signal = order_data.get("signal")
+                        market_id = order_data.get("market_id", "")
+                        api_has_position = (
+                            hasattr(self, '_api_positions')
+                            and asset in self._api_positions
+                        )
+                        if api_has_position and signal and market_id not in self.risk_manager.positions:
+                            api_pos = self._api_positions[asset]
+                            api_size = float(api_pos.get("size", 0)) if isinstance(api_pos, dict) else 0
+                            api_price = float(api_pos.get("price", 0)) if isinstance(api_pos, dict) else 0
+                            if api_size > 0:
+                                logger.warning(
+                                    "PENDING_ORDER_RESCUED order=%s asset=%s: API shows position "
+                                    "(%s shares @ %.4f), recording fill",
+                                    order_id[:8], asset, api_size, api_price,
+                                )
+                                self.risk_manager.record_position_open(
+                                    signal=signal,
+                                    entry_price=api_price or order_data.get("price", 0),
+                                    shares=api_size,
+                                )
+                                orders_to_remove.append(order_id)
+                                continue
+
                         logger.warning(
                             f"Order {order_id[:8]}... ({_av_key}) not found after {wait_time:.0f}s - removing"
                         )
@@ -1101,6 +1178,11 @@ class TradingBot(
             else:
                 logger.info("Using Polymarket's bundled Binance prices (BINANCE_DIRECT=false)")
 
+            # Binance aggTrade feed for Order Flow Imbalance
+            if self.binance_trade_feed is not None:
+                logger.info("Starting Binance aggTrade feed for OFI")
+                tasks.append(self._run_binance_trade_feed())
+
             # Run all components concurrently
             await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
@@ -1147,6 +1229,8 @@ class TradingBot(
         self.clob_feed.disconnect()
         if self.config.endpoints.binance_direct_enabled:
             self.binance_feed.disconnect()
+        if self.binance_trade_feed is not None:
+            self.binance_trade_feed.disconnect()
         self.gamma_api.close()
 
         # Stop monitoring server
@@ -1307,6 +1391,13 @@ class TradingBot(
         except Exception as e:
             logger.error(f"Binance feed error: {e}")
 
+    async def _run_binance_trade_feed(self):
+        """Run Binance aggTrade feed for Order Flow Imbalance."""
+        try:
+            await self.binance_trade_feed.connect_async()
+        except Exception as e:
+            logger.error(f"Binance aggTrade feed error: {e}")
+
     def _check_data_health(self) -> tuple[bool, str]:
         """
         Check if data feeds are healthy enough for trading.
@@ -1391,6 +1482,10 @@ class TradingBot(
                     )
                     logger.warning("DATA_HEALTH STALE: %s", reason)
                     return (False, reason)
+
+        # aggTrade feed is non-blocking — log warning but don't gate trading
+        if self.binance_trade_feed is not None and not self.binance_trade_feed.is_connected:
+            logger.debug("DATA_HEALTH INFO: Binance aggTrade feed not connected (OFI unavailable)")
 
         return (True, "")
 
@@ -1529,14 +1624,9 @@ class TradingBot(
                 # Refresh paper quote cache every tick so mark-to-market is fresh
                 self._refresh_paper_quotes()
 
-                # Log position status periodically (every 30s)
-                self._log_position_status()
-
                 # Calculate equity (cash + unrealized position value)
                 # This prevents false drawdown triggers when positions are open
-                # Reuse cached value if _log_position_status just computed it
-                detail = getattr(self, '_last_equity_detail', None)
-                equity = detail["equity"] if detail else self._calculate_equity()
+                equity = self._calculate_equity()
 
                 # Update peak equity (only increases, never decreases)
                 self.risk_manager.update_peak_equity(equity)
@@ -1614,14 +1704,11 @@ class TradingBot(
                             len(self._market_first_seen), len(self._last_order_time_by_market),
                         )
 
-                # Generate and execute signals for each active market
-                active_count = len(self.markets)
-                if active_count > 0:
-                    # Log status every 30 seconds (instead of randomly)
-                    if (self._last_status_log is None or
-                        (now - self._last_status_log).total_seconds() > self._status_log_interval):
-                        self._log_status_line()
-                        self._last_status_log = now
+                # Reset tick-level diagnostics before processing markets
+                self._tick_block_reasons.clear()
+                self._tick_markets_processed = 0
+                self._tick_signals_generated = 0
+                self._tick_trades_executed = 0
 
                 # Sort markets by asset priority (BTC/ETH first for better liquidity)
                 priority = self.config.trading.asset_priority
@@ -1647,6 +1734,20 @@ class TradingBot(
                     # Sequential execution
                     for market in sorted_markets:
                         await self._process_market(market)
+
+                # ── POST-PROCESSING: Status & position display ──
+                # Placed AFTER signal processing so position info isn't buried
+                # under per-market ML/ORDER_BLOCK/PREFLIGHT noise.
+                now_status = datetime.now(timezone.utc)
+                if (self._last_status_log is None or
+                    (now_status - self._last_status_log).total_seconds() > self._status_log_interval):
+                    self._log_status_line()
+                    self._last_status_log = now_status
+
+                self._log_compact_table()
+
+                # Detailed position status (every 30s) — mark prices, win prob, etc.
+                self._log_position_status()
 
                 # Periodic state save (crash protection)
                 now_save = datetime.now(timezone.utc)
@@ -1807,14 +1908,38 @@ class TradingBot(
                     # Inject captured prices into gamma API cache for immediate use
                     self._inject_captured_prices_to_gamma(ref_ts)
 
-                    # Clear markets from old period (they should be in expiring/settled by now)
+                    # Move expired markets to expiring queue for settlement
                     async with self._markets_lock:
                         old_markets = list(self.markets.keys())
                         for market_id in old_markets:
                             market = self.markets.get(market_id)
                             if market and market.time_remaining <= 0:
+                                # Skip if already in expiring or settled
+                                if market_id in self.expiring_markets or market_id in self.settled_markets:
+                                    self.markets.pop(market_id, None)
+                                    logger.debug(f"Removed expired market (already tracked): {market.asset}/{market.variant}")
+                                    continue
+
                                 self.markets.pop(market_id, None)
-                                logger.debug(f"Removed expired market: {market.asset}/{market.variant}")
+
+                                # Snapshot Chainlink price for local resolution
+                                if market.expiry_chainlink_price is None:
+                                    try:
+                                        snap_price = self.signal_generator.get_price(market.asset)
+                                        market.expiry_chainlink_price = snap_price
+                                        logger.info(
+                                            "EXPIRY_SNAPSHOT market=%s asset=%s "
+                                            "chainlink=%.2f target=%.2f time_remaining=%.1fs "
+                                            "(period_transition)",
+                                            market_id[:8], market.asset,
+                                            snap_price or 0, market.target_price,
+                                            market.time_remaining,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(f"Failed to snapshot expiry price for {market.asset}: {e}")
+
+                                self.expiring_markets[market_id] = market
+                                logger.info(f"Period transition: moved expired market to expiring queue: {market.asset}/{market.variant}")
 
                     # Force refresh by clearing last_market_refresh
                     self.last_market_refresh = None
@@ -1874,7 +1999,7 @@ class TradingBot(
                         self._active_market_per_asset[av_key] = market_id
                         guard = self.safety_guard or get_safety_guard()
                         if guard:
-                            guard.set_active_market(asset, market_id)
+                            guard.set_active_market(asset, market_id, variant=market.variant)
 
                         # Target price is now fetched from Polymarket API in gamma.py
                         logger.info(

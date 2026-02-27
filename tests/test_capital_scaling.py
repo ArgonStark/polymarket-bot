@@ -5,7 +5,7 @@ Validates:
 1. Multiplier reduces sizing during drawdown
 2. Multiplier never allows size beyond cap
 3. Peak bonus applied when at peak with positive EV
-4. Severe drawdown returns 0.0
+4. Severe drawdown returns minimum-viable multiplier (0.25)
 5. Normal (no drawdown) returns 1.0
 6. Edge cases: zero peak, empty PnL history
 """
@@ -23,6 +23,7 @@ def _make_scaler(**kwargs):
     defaults = dict(
         tier_severe_pct=0.10,
         tier_moderate_pct=0.05,
+        multiplier_severe=0.25,
         multiplier_moderate=0.5,
         multiplier_peak_bonus=1.2,
     )
@@ -35,14 +36,14 @@ def _make_scaler(**kwargs):
 # ---------------------------------------------------------------------------
 
 class TestDrawdownTiers:
-    def test_severe_drawdown_returns_zero(self):
+    def test_severe_drawdown_returns_minimum(self):
         scaler = _make_scaler()
         mult, reason = scaler.compute_multiplier(
             peak_bankroll=1000.0,
             current_equity=890.0,  # 11% drawdown
             recent_pnls=[],
         )
-        assert mult == 0.0
+        assert mult == 0.25
         assert "severe" in reason
 
     def test_moderate_drawdown_returns_half(self):
@@ -143,7 +144,7 @@ class TestCapEnforcement:
         assert adjusted == 25.0
         assert mult == 0.5
 
-    def test_apply_severe_returns_zero(self):
+    def test_apply_severe_returns_reduced(self):
         scaler = _make_scaler()
         adjusted, mult, reason = scaler.apply(
             size_usd=50.0,
@@ -153,7 +154,9 @@ class TestCapEnforcement:
             max_position_pct=0.10,
             bankroll=880.0,
         )
-        assert adjusted == 0.0
+        # 50 * 0.25 = 12.50
+        assert adjusted == 12.50
+        assert mult == 0.25
 
     def test_normal_no_change(self):
         scaler = _make_scaler()

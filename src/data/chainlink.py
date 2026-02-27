@@ -70,6 +70,7 @@ class ChainlinkFeed:
     # Internal state
     _ws: Optional[websocket.WebSocketApp] = None
     _prices: dict[str, float] = field(default_factory=dict)  # Chainlink prices
+    _chainlink_timestamps: dict[str, datetime] = field(default_factory=dict)
     _binance_prices: dict[str, float] = field(default_factory=dict)  # Binance prices
     _binance_timestamps: dict[str, datetime] = field(default_factory=dict)
     _price_history: dict[str, PriceHistory] = field(default_factory=dict)
@@ -215,6 +216,9 @@ class ChainlinkFeed:
                         )
                     else:
                         timestamp = datetime.now(timezone.utc)
+
+                    # Track per-asset Chainlink update time
+                    self._chainlink_timestamps[symbol] = timestamp
 
                     # Update price history
                     if symbol in self._price_history:
@@ -465,6 +469,15 @@ class ChainlinkFeed:
             Dict of asset -> price (e.g., {"BTC": 104000.50, "ETH": 3200.25})
         """
         return dict(self._binance_prices)
+
+    def get_chainlink_price_age(self, asset: str) -> Optional[float]:
+        """Get how old the Chainlink price data is in seconds."""
+        # Chainlink keys are like "btc/usd"
+        key = f"{asset.lower()}/usd"
+        timestamp = self._chainlink_timestamps.get(key)
+        if timestamp:
+            return (datetime.now(timezone.utc) - timestamp).total_seconds()
+        return None
 
     def get_binance_price_age(self, asset: str) -> Optional[float]:
         """

@@ -1,12 +1,15 @@
 """
 Capital scaling — deterministic position-sizing multiplier.
 
-Multiplier based on drawdown tier and recent EV:
+Graduated drawdown tiers (never blocks — the kill switch handles halts):
 
-  drawdown > 10%  →  0.0  (should also trip kill-switch)
-  drawdown > 5%   →  0.5
-  drawdown == 0   →  1.0  (or 1.2 if last 50 trades EV-positive)
-  else            →  1.0
+  drawdown > severe  →  0.25  (minimum-viable sizing)
+  drawdown > moderate →  0.50
+  drawdown == 0      →  1.0  (or 1.2 if last 50 trades EV-positive)
+  else               →  1.0
+
+Severe/moderate thresholds default to fractions of MAX_DRAWDOWN_PCT so they
+stay in sync with the kill switch and risk manager.
 
 The multiplier is applied to the signal's ``size_usd`` BEFORE risk-manager
 caps.  The final size never exceeds ``max_position_pct * bankroll`` or any
@@ -23,16 +26,33 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _default_severe() -> float:
+    """Severe threshold: SCALE_SEVERE_DD_PCT env, else 75% of MAX_DRAWDOWN_PCT."""
+    raw = os.getenv("SCALE_SEVERE_DD_PCT")
+    if raw:
+        return float(raw)
+    max_dd = float(os.getenv("MAX_DRAWDOWN_PCT", "0.40"))
+    return max_dd * 0.75  # 30% for default 40% max DD
+
+
+def _default_moderate() -> float:
+    """Moderate threshold: SCALE_MODERATE_DD_PCT env, else 50% of MAX_DRAWDOWN_PCT."""
+    raw = os.getenv("SCALE_MODERATE_DD_PCT")
+    if raw:
+        return float(raw)
+    max_dd = float(os.getenv("MAX_DRAWDOWN_PCT", "0.40"))
+    return max_dd * 0.50  # 20% for default 40% max DD
+
+
 @dataclass
 class CapitalScaler:
     """Compute a sizing multiplier from drawdown + recent performance."""
 
-    # Drawdown tiers (configurable via env)
-    tier_severe_pct: float = field(
-        default_factory=lambda: float(os.getenv("SCALE_SEVERE_DD_PCT", "0.10"))
-    )
-    tier_moderate_pct: float = field(
-        default_factory=lambda: float(os.getenv("SCALE_MODERATE_DD_PCT", "0.05"))
+    # Drawdown tiers (configurable via env, defaults derived from MAX_DRAWDOWN_PCT)
+    tier_severe_pct: float = field(default_factory=_default_severe)
+    tier_moderate_pct: float = field(default_factory=_default_moderate)
+    multiplier_severe: float = field(
+        default_factory=lambda: float(os.getenv("SCALE_SEVERE_MULT", "0.25"))
     )
     multiplier_moderate: float = field(
         default_factory=lambda: float(os.getenv("SCALE_MODERATE_MULT", "0.5"))
@@ -62,13 +82,19 @@ class CapitalScaler:
 
         dd = (peak_bankroll - current_equity) / peak_bankroll
 
-        # Severe drawdown → block entirely
+        # Severe drawdown → minimum-viable sizing (kill switch handles full halt)
         if dd >= self.tier_severe_pct:
-            logger.info(
-                "CAPITAL_SCALING multiplier=0.0 reason=severe_drawdown dd=%.4f threshold=%.4f",
-                dd, self.tier_severe_pct,
-            )
-            return 0.0, f"severe_drawdown_{dd:.1%}"
+            # Throttle: only log once per 30s to avoid spam
+            import time as _time
+            _now = _time.monotonic()
+            _last = getattr(self, '_last_severe_log', 0.0)
+            if _now - _last >= 30.0:
+                self._last_severe_log = _now
+                logger.info(
+                    "CAPITAL_SCALING multiplier=%.2f reason=severe_drawdown dd=%.4f threshold=%.4f",
+                    self.multiplier_severe, dd, self.tier_severe_pct,
+                )
+            return self.multiplier_severe, f"severe_drawdown_{dd:.1%}"
 
         # Moderate drawdown → reduce size
         if dd >= self.tier_moderate_pct:

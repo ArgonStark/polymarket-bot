@@ -83,12 +83,20 @@ def create_trading_client(config: BotConfig) -> Optional[ClobClient]:
                     f"Derived API credentials successfully. "
                     f"API Key: {derived_creds.api_key[:8]}..."
                 )
-                # Log the credentials so user can save them
+                # Log redacted credentials — user should check .env or derive again
                 logger.info(
                     "Save these credentials to your .env file:\n"
-                    f"  CLOB_API_KEY={derived_creds.api_key}\n"
-                    f"  CLOB_SECRET={derived_creds.api_secret}\n"
-                    f"  CLOB_PASS_PHRASE={derived_creds.api_passphrase}"
+                    f"  CLOB_API_KEY={derived_creds.api_key[:8]}...\n"
+                    f"  CLOB_SECRET={derived_creds.api_secret[:8]}...\n"
+                    f"  CLOB_PASS_PHRASE={derived_creds.api_passphrase[:8]}...\n"
+                    "(Full values printed once to stderr for copy-paste)"
+                )
+                import sys
+                print(
+                    f"CLOB_API_KEY={derived_creds.api_key}\n"
+                    f"CLOB_SECRET={derived_creds.api_secret}\n"
+                    f"CLOB_PASS_PHRASE={derived_creds.api_passphrase}",
+                    file=sys.stderr,
                 )
             except Exception as e:
                 logger.warning(f"Could not derive API credentials: {e}")
@@ -288,11 +296,13 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
             # Log all non-zero positions for debugging (at INFO level for visibility)
             logger.info(f"  📍 Position found: slug={slug[:50]}, size={size:.2f}")
 
-            # Check if this is a 15-min crypto market
+            # Check if this is a supported crypto market (5-min or 15-min)
             is_15m = "updown-15m" in slug or "15m" in title or "15-min" in title
-            if not is_15m:
-                logger.info(f"    ⏭️ Skipped: not a 15-min market (slug: {slug[:60]})")
+            is_5m = "updown-5m" in slug or "5m" in title or "5-min" in title
+            if not (is_15m or is_5m):
+                logger.info(f"    ⏭️ Skipped: not a 5m/15m market (slug: {slug[:60]})")
                 continue
+            variant = "five" if is_5m else "fifteen"
 
             # Identify asset first (before timestamp check)
             asset = None
@@ -330,20 +340,26 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
                 logger.debug(f"  -> Skipped: cannot determine market timestamp")
                 continue
 
-            # Check if market is still active (settles at market_ts + 900)
+            # Check if market is still active
             # Add 60s buffer for settlement processing delays
+            duration = 300 if is_5m else 900
             settle_buffer = 60
-            if current_time > market_ts + 900 + settle_buffer:
+            if current_time > market_ts + duration + settle_buffer:
                 elapsed = current_time - market_ts - 900
                 logger.info(f"    ⏭️ Skipped: market already settled {elapsed:.0f}s ago")
                 continue
 
-            # Track position (only one per asset)
-            if asset not in positions:
+            # Track position — key by "asset:variant" to support multiple per asset
+            pos_key = f"{asset}:{variant}"
+            if pos_key not in positions:
                 avg_price = float(pos.get("avgPrice", 0))
                 current_value = float(pos.get("currentValue", 0))
+                # Token ID: the API field 'asset' is the token the user holds
+                held_token = pos.get("asset", "")
+                outcome = pos.get("outcome", "")  # "Yes" or "No"
 
-                positions[asset] = {
+                positions[pos_key] = {
+                    "asset": asset,
                     "size": size,
                     "price": avg_price,
                     "cost": size * avg_price,
@@ -351,13 +367,20 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
                     "market": slug,
                     "title": pos.get("title", ""),
                     "conditionId": pos.get("conditionId", ""),
+                    "token_id": held_token,
+                    "outcome": outcome,
+                    "variant": variant,
                 }
-                logger.info(f"📍 Found position: {asset} | {size:.2f} shares @ {avg_price:.2f} | Value: ${current_value:.2f}")
+                logger.info(
+                    f"📍 Found position: {asset}/{variant} | {size:.2f} shares @ {avg_price:.2f} | "
+                    f"Value: ${current_value:.2f} | outcome={outcome} | token={held_token[:16]}..."
+                )
 
         if positions:
-            logger.info(f"📊 Active positions: {', '.join(positions.keys())}")
+            summary = ", ".join(f"{v.get('asset','?')}/{v.get('variant','?')}" for v in positions.values())
+            logger.info(f"📊 Active positions: {summary}")
         else:
-            logger.debug("No active 15-min crypto positions found")
+            logger.debug("No active 5m/15m crypto positions found")
 
         return positions
 

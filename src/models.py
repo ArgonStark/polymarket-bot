@@ -233,56 +233,6 @@ class Position:
     entry_time: datetime        # When position was opened
     unrealized_pnl: float = 0.0 # Current unrealized P&L
 
-    # ML data (stored at entry for outcome recording)
-    ml_volatility: Optional[float] = None
-    ml_momentum: Optional[float] = None
-    ml_confidence: Optional[float] = None
-    ml_arb_type: Optional[str] = None
-    ml_spread: Optional[float] = None
-    ml_bid_depth: Optional[float] = None
-    ml_ask_depth: Optional[float] = None
-    ml_price_trend: Optional[float] = None
-    ml_distance_from_target: Optional[float] = None
-    ml_binance_lead_pct: Optional[float] = None
-    ml_binance_confirmation: Optional[str] = None
-    ml_trend_1h: Optional[float] = None
-    ml_trend_4h: Optional[float] = None
-    ml_trend_1d: Optional[float] = None
-
-    # Chart analysis data (from Binance candlestick analysis at entry)
-    ml_chart_rsi: Optional[float] = None
-    ml_chart_trend_strength: Optional[float] = None
-    ml_chart_is_uptrend: Optional[float] = None
-    ml_chart_is_downtrend: Optional[float] = None
-    ml_chart_is_ranging: Optional[float] = None
-    ml_chart_bullish_reversal: Optional[float] = None
-    ml_chart_bearish_reversal: Optional[float] = None
-    ml_chart_momentum: Optional[float] = None
-    ml_chart_bias_bullish: Optional[float] = None
-    ml_chart_bias_bearish: Optional[float] = None
-    ml_chart_confidence: Optional[float] = None
-    ml_chart_bullish_pattern: Optional[float] = None
-    ml_chart_bearish_pattern: Optional[float] = None
-
-    # NEW INDICATOR FEATURES (MACD, BB, Stochastic, RSI Div, Volume, HA, VWAP)
-    ml_macd_histogram: Optional[float] = None
-    ml_macd_crossover: Optional[str] = None
-    ml_bb_bandwidth: Optional[float] = None
-    ml_bb_position: Optional[str] = None
-    ml_stoch_k: Optional[float] = None
-    ml_stoch_d: Optional[float] = None
-    ml_stoch_signal: Optional[str] = None
-    ml_rsi_divergence: Optional[str] = None
-    ml_rsi_divergence_strength: Optional[float] = None
-    ml_volume_ratio: Optional[float] = None
-    ml_is_high_volume: Optional[bool] = None
-    ml_obv_trend: Optional[float] = None
-    ml_ha_trend: Optional[str] = None
-    ml_ha_consecutive: Optional[int] = None
-    ml_ha_strength: Optional[float] = None
-    ml_vwap_distance_pct: Optional[float] = None
-    ml_vwap_position: Optional[str] = None
-
     # Explicit token mapping (set at open time, immutable for settlement)
     market_id: str = ""          # condition_id of market this position was opened in
     yes_token_id: str = ""       # UP token id at open time

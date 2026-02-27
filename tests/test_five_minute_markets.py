@@ -244,6 +244,7 @@ class TestStateRoundtrip:
         rm.daily_stats.losses = 1
         rm.daily_stats.fees_paid = 0.1
         rm.daily_stats.rebates_earned = 0.05
+        rm.daily_stats.starting_bankroll = 1000.0
         rm._peak_decay_started_at = None
 
         assert mgr.save(rm)

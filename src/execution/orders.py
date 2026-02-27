@@ -21,7 +21,7 @@ import asyncio
 import threading
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from ..models import Order, OrderStatus, TradeResult, Signal, OrderAction
@@ -71,8 +71,8 @@ class OrderSafetyGuard:
         # Pending order count for paper trading
         self._pending_count: int = 0
 
-        # Active market per asset - for stale market detection
-        # Key: asset (BTC, ETH, etc.), Value: condition_id of active market
+        # Active market per asset:variant - for stale market detection
+        # Key: "asset:variant" (e.g. "BTC:five", "BTC:fifteen"), Value: condition_id
         self._active_market_per_asset: Dict[str, str] = {}
 
     def check_can_submit(
@@ -110,7 +110,10 @@ class OrderSafetyGuard:
 
         with self._lock:
             # 0. FIRST: Check for stale market (order for old market_id after transition)
-            active_market = self._active_market_per_asset.get(asset)
+            # Key by asset:variant so 5m and 15m markets don't conflict
+            variant = getattr(signal.market, 'variant', 'fifteen') if signal and signal.market else 'fifteen'
+            av_key = f"{asset}:{variant}"
+            active_market = self._active_market_per_asset.get(av_key)
             if active_market and market_id != active_market:
                 return False, f"stale_market:{market_id[:8]}!=active:{active_market[:8]}"
 
@@ -195,35 +198,39 @@ class OrderSafetyGuard:
                 if self._pending_count > 0:
                     self._pending_count -= 1
 
-    def set_active_market(self, asset: str, market_id: str) -> Optional[str]:
+    def set_active_market(self, asset: str, market_id: str, variant: str = "fifteen") -> Optional[str]:
         """
-        Set the active market for an asset.
+        Set the active market for an asset:variant pair.
 
         Returns the old market_id if there was one (for stale order cancellation).
 
         Args:
             asset: Asset symbol (BTC, ETH, SOL, XRP)
             market_id: condition_id of the new active market
+            variant: Market variant ("five" or "fifteen")
 
         Returns:
             Old market_id if there was a transition, None otherwise
         """
+        av_key = f"{asset}:{variant}"
         with self._lock:
-            old_market_id = self._active_market_per_asset.get(asset)
-            self._active_market_per_asset[asset] = market_id
+            old_market_id = self._active_market_per_asset.get(av_key)
+            self._active_market_per_asset[av_key] = market_id
             if old_market_id and old_market_id != market_id:
                 return old_market_id
             return None
 
-    def get_active_market(self, asset: str) -> Optional[str]:
-        """Get the active market_id for an asset."""
+    def get_active_market(self, asset: str, variant: str = "fifteen") -> Optional[str]:
+        """Get the active market_id for an asset:variant pair."""
+        av_key = f"{asset}:{variant}"
         with self._lock:
-            return self._active_market_per_asset.get(asset)
+            return self._active_market_per_asset.get(av_key)
 
-    def clear_active_market(self, asset: str) -> None:
-        """Clear the active market for an asset (e.g., on settlement)."""
+    def clear_active_market(self, asset: str, variant: str = "fifteen") -> None:
+        """Clear the active market for an asset:variant pair (e.g., on settlement)."""
+        av_key = f"{asset}:{variant}"
         with self._lock:
-            self._active_market_per_asset.pop(asset, None)
+            self._active_market_per_asset.pop(av_key, None)
 
     def get_pending_count(self) -> int:
         """Get current pending order count."""
@@ -591,22 +598,20 @@ class OrderExecutor:
             )
 
         try:
-            # For market buy, use aggressive price
-            # For market sell, use low price
+            # Use MarketOrderArgs + create_market_order for proper amount rounding.
+            # The SDK rounds maker_amount to 2 decimals (API requirement for market orders)
+            # and taker_amount to 4 decimals automatically.
             price = 0.99 if side.upper() == "BUY" else 0.01
 
-            # Calculate approximate shares from USD
-            # This is approximate - actual fill may vary
-            size_shares = size_usd / price
-
-            order_args = OrderArgs(
-                price=price,
-                size=size_shares,
-                side=BUY if side.upper() == "BUY" else SELL,
+            market_order_args = MarketOrderArgs(
                 token_id=token_id,
+                amount=round(size_usd, 2),
+                side=BUY if side.upper() == "BUY" else SELL,
+                price=price,
+                order_type=OrderType.FOK,
             )
 
-            signed_order = self.client.create_order(order_args)
+            signed_order = self.client.create_market_order(market_order_args)
             response = self.client.post_order(signed_order, OrderType.FOK)
 
             # Validate response
@@ -627,6 +632,17 @@ class OrderExecutor:
                 logger.warning(f"Failed to parse fill data: size={filled_size_raw}, price={filled_price_raw}")
                 filled_size = 0.0
                 filled_price = price
+
+            # FOK orders are Fill-or-Kill: if the API accepted it, it filled.
+            # Some responses omit filledSize — use intended amount as fallback.
+            if filled_size == 0.0 and order_id:
+                logger.warning(
+                    f"FOK_FILL_FALLBACK: API returned success but no fill data. "
+                    f"Using intended size=${size_usd:.2f} as filled_size."
+                )
+                # size_usd is dollars; shares = dollars / price
+                filled_size = round(size_usd / filled_price, 4) if filled_price > 0 else 0.0
+                filled_price = filled_price or price
 
             logger.info(
                 f"MARKET ORDER executed: {side} ${size_usd:.2f} "

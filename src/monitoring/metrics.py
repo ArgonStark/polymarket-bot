@@ -36,7 +36,11 @@ class MetricsCollector:
         self.stats = TradeStats()
         self.recent_pnls: list[float] = []
         if self.config.enabled:
-            Path(self.config.output_path).parent.mkdir(parents=True, exist_ok=True)
+            if not self.config.output_path:
+                logger.warning("Metrics enabled but output_path is empty — disabling")
+                self.config.enabled = False
+            else:
+                Path(self.config.output_path).parent.mkdir(parents=True, exist_ok=True)
 
     def record_trade(self, asset: str, pnl: float, latency_ms: Optional[float] = None):
         if not self.config.enabled:

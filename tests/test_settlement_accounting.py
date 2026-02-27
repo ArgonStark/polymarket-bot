@@ -32,6 +32,8 @@ def _make_config(**overrides):
     trading.min_win_rate = 0.40
     trading.cooloff_period_minutes = 5
     trading.daily_loss_limit = 0.25
+    trading.trade_history_size = 20
+    trading.capital_buffer = 0.90
     for k, v in overrides.items():
         setattr(trading, k, v)
     config = MagicMock()

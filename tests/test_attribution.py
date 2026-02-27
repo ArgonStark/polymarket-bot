@@ -19,14 +19,8 @@ from src.attribution import AttributionTracker, DecisionRecord, determine_source
 # ---------------------------------------------------------------------------
 
 class TestDetermineSource:
-    def test_no_ml(self):
-        assert determine_source(ml_engine_active=False, ml_confidence=None) == "RULES"
-
-    def test_ml_with_confidence(self):
-        assert determine_source(ml_engine_active=True, ml_confidence=0.65) == "ML_EV"
-
-    def test_ml_without_confidence(self):
-        assert determine_source(ml_engine_active=True, ml_confidence=None) == "HYBRID"
+    def test_always_rules(self):
+        assert determine_source() == "RULES"
 
 
 # ---------------------------------------------------------------------------

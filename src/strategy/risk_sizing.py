@@ -59,7 +59,7 @@ class RiskSizer:
         size = max(self.config.min_trade_usd, min(size, bankroll * self.config.max_exposure_pct))
 
         if edge <= 0:
-            logger.info(
+            logger.debug(
                 "RISK_SIZING_DETAIL reason=negative_edge edge=%.4f prob=%.4f price=%.4f "
                 "kelly_raw=%.4f kelly_capped=%.4f vol_adjust=%.2f size_pre_clamp=%.2f "
                 "min_trade=%.2f max_exp_pct=%.2f bankroll=%.2f",

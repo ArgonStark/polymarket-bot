@@ -35,14 +35,14 @@ class KellyCalculator:
         f* = (edge) / (odds - 1) when edge = p - market_price
     """
 
-    # Fractional Kelly multiplier (0.25 = quarter Kelly, safer)
-    kelly_fraction: float = 0.25
+    # Fractional Kelly multiplier (0.35 = aggressive fractional Kelly for small bankrolls)
+    kelly_fraction: float = 0.35
 
     # Minimum confidence to apply Kelly (below this, use minimum size)
     min_confidence: float = 0.52
 
     # Maximum Kelly fraction (cap to prevent over-betting)
-    max_kelly_fraction: float = 0.15  # Never bet more than 15% of bankroll
+    max_kelly_fraction: float = 0.20  # Allow up to 20% of bankroll per position
 
     # Minimum position size as fraction of bankroll
     min_position_fraction: float = 0.02  # At least 2% of bankroll

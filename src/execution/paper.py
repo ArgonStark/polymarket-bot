@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Dict
@@ -91,9 +92,10 @@ class PaperOrderExecutor:
         # Filled orders history (for reference)
         self._filled_orders: Dict[str, PaperOrder] = {}
 
-        # Quote cache: token_id -> CachedQuote, keyed by (market_id, token_id)
+        # Quote cache: token_id -> CachedQuote (LRU-bounded)
         # Fallback when clob_feed.get_orderbook() returns None
-        self._quote_cache: Dict[str, CachedQuote] = {}
+        self._quote_cache: OrderedDict[str, CachedQuote] = OrderedDict()
+        self._quote_cache_max_size: int = 200
 
     @property
     def safety_guard(self) -> OrderSafetyGuard:
@@ -108,6 +110,9 @@ class PaperOrderExecutor:
     ):
         """Cache a bid/ask quote for a token (fed from MarketState each tick)."""
         mid = (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+        # Move to end if already exists (LRU behavior)
+        if token_id in self._quote_cache:
+            self._quote_cache.move_to_end(token_id)
         self._quote_cache[token_id] = CachedQuote(
             token_id=token_id,
             market_id=market_id,
@@ -117,6 +122,9 @@ class PaperOrderExecutor:
             timestamp=datetime.now(timezone.utc),
             source=source,
         )
+        # Evict oldest entries if over limit
+        while len(self._quote_cache) > self._quote_cache_max_size:
+            self._quote_cache.popitem(last=False)
 
     def get_cached_quote(self, token_id: str) -> Optional[CachedQuote]:
         """Get cached quote for a token (used by mark-to-market)."""
@@ -347,7 +355,10 @@ class PaperOrderExecutor:
 
     def _fill_paper_order(self, order: PaperOrder, fill_price: float, is_taker: bool = True) -> TradeResult:
         """Fill a paper order and update account."""
-        fill_price = _apply_slippage(fill_price, self.config.slippage_bps)
+        # Only apply slippage for taker fills. Maker orders rest on the book
+        # and fill at their exact limit price — no slippage.
+        if is_taker:
+            fill_price = _apply_slippage(fill_price, self.config.slippage_bps)
         notional = fill_price * order.size
         fee = self._fee(notional, taker=is_taker)
         self.account.debit(notional + fee)

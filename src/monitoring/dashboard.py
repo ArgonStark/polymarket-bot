@@ -77,6 +77,9 @@ class MetricsDashboard:
         self._veto_window = 300.0  # 5 minutes
         self._vetoes: deque[VetoRecord] = deque()
 
+        # Equity history for dashboard chart (last 200 samples, ~100 min at 30s interval)
+        self._equity_history: deque[dict] = deque(maxlen=200)
+
         # Timing
         self._last_emit: float = 0.0
 
@@ -114,6 +117,42 @@ class MetricsDashboard:
     def record_veto(self, reason: str):
         """Record a blocked/vetoed trade decision."""
         self._vetoes.append(VetoRecord(reason=reason, timestamp=time.monotonic()))
+
+    def record_equity_sample(self, equity: float, bankroll: float):
+        """Sample current equity + bankroll for chart. Called each snapshot (~30s).
+
+        De-duplicates if both values are unchanged from the last sample.
+        """
+        rounded_eq = round(equity, 2)
+        rounded_br = round(bankroll, 2)
+        if (self._equity_history and
+                self._equity_history[-1]["equity"] == rounded_eq and
+                self._equity_history[-1]["bankroll"] == rounded_br):
+            return  # Skip duplicate
+        self._equity_history.append({
+            "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            "equity": rounded_eq,
+            "bankroll": rounded_br,
+        })
+
+    @property
+    def equity_history(self) -> list[dict]:
+        """Return equity history as a list for JSON serialization."""
+        return list(self._equity_history)
+
+    def get_trade_stats(self) -> dict:
+        """Compute detailed trade stats from rolling PnL history."""
+        pnls = list(self._trade_pnls)
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        return {
+            "total_wins": len(wins),
+            "total_losses": len(losses),
+            "avg_win": round(sum(wins) / len(wins), 2) if wins else 0.0,
+            "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0.0,
+            "largest_win": round(max(wins), 2) if wins else 0.0,
+            "largest_loss": round(min(losses), 2) if losses else 0.0,
+        }
 
     # ── snapshot emission ───────────────────────────────────────
 

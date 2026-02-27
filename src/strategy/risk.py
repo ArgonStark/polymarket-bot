@@ -7,6 +7,7 @@ to ensure the bot operates within defined risk parameters.
 
 import logging
 import math
+import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
@@ -16,6 +17,10 @@ from ..config import BotConfig
 
 
 logger = logging.getLogger(__name__)
+
+# Throttle for RISK_LIMIT log to avoid spamming every tick
+_risk_limit_log_ts: dict[str, float] = {}
+_RISK_LIMIT_LOG_INTERVAL = 30.0  # seconds
 
 
 @dataclass
@@ -187,12 +192,8 @@ class RiskManager:
             if drawdown >= trading.max_drawdown_pct:
                 return (False, f"Drawdown {drawdown:.1%} exceeds {trading.max_drawdown_pct:.0%} limit")
 
-        # Check win rate (only after minimum trades)
-        if len(self.trade_history) >= trading.min_trades_for_winrate:
-            wins = sum(1 for t in self.trade_history if t > 0)
-            win_rate = wins / len(self.trade_history)
-            if win_rate < trading.min_win_rate:
-                return (False, f"Win rate {win_rate:.0%} below {trading.min_win_rate:.0%} minimum")
+        # Win rate: advisory metric only — logged in periodic status, not here.
+        # Blocking on win rate creates an unrecoverable deadlock.
 
         return (True, "")
 
@@ -224,11 +225,13 @@ class RiskManager:
         if market_key in self.positions:
             return (False, "Already have position in this market")
 
-        # Check if we already have a position in this ASSET (any market)
-        # This prevents opening positions in both current and future markets
+        # Check if we already have a position in this ASSET+VARIANT
+        # Allows simultaneous positions in different variants (e.g. BTC:five + BTC:fifteen)
+        signal_variant = getattr(signal.market, "variant", "fifteen")
         for pos in self.positions.values():
-            if pos.market.asset == signal.market.asset:
-                return (False, f"Already have {signal.market.asset} position")
+            pos_variant = getattr(pos.market, "variant", "fifteen") if hasattr(pos, "market") else "fifteen"
+            if pos.market.asset == signal.market.asset and pos_variant == signal_variant:
+                return (False, f"Already have {signal.market.asset}:{signal_variant} position")
 
         # Check position count limit
         trading = self.config.trading
@@ -240,7 +243,7 @@ class RiskManager:
 
         # Basic capital check - need at least $1 available to trade
         min_trade_size = 1.0
-        available = self.current_bankroll * 0.90  # Keep 10% buffer
+        available = self.current_bankroll * self.config.trading.capital_buffer
         if available < min_trade_size:
             return (
                 False,
@@ -249,28 +252,18 @@ class RiskManager:
 
         return (True, "")
 
-    def adjust_signal_size(
-        self,
-        signal: Signal,
-        ml_confidence: Optional[float] = None,
-        use_kelly: bool = True,
-    ) -> Signal:
+    def adjust_signal_size(self, signal: Signal) -> Signal:
         """
         Adjust signal size to fit within risk limits.
 
         IMPORTANT: This only REDUCES size, never increases it.
         The signal already calculated its desired size based on conviction.
         We only cap it to prevent exceeding risk limits.
-
-        Args:
-            signal: Trading signal to adjust
-            ml_confidence: ML predicted win probability (enables Kelly sizing)
-            use_kelly: Whether to use Kelly criterion when confidence available
         """
         trading = self.config.trading
 
-        # Keep 10% buffer for fees
-        available = self.current_bankroll * 0.90
+        # Keep buffer for fees
+        available = self.current_bankroll * self.config.trading.capital_buffer
         max_position = self.current_bankroll * trading.max_position_pct
 
         # The signal's original size is the MAXIMUM we want to trade
@@ -284,21 +277,37 @@ class RiskManager:
         # This ensures we NEVER scale UP, only DOWN
         position_size = min(original_size, risk_limit)
 
-        # Ensure minimum viable trade size ($1)
-        # Polymarket minimum is ~5 shares, at $0.50 that's $2.50
-        # We use $1 to allow small bankroll users to participate
-        if position_size < 1.0:
-            logger.debug(f"[{signal.market.asset}] Size ${position_size:.2f} below $1 min, skipping")
-            signal.size_usd = 0
-            signal.size_shares = 0
-            return signal
+        # Floor at Polymarket minimum: max($1, 5 shares * price)
+        # If max_position_pct cap pushes below the exchange minimum, we still
+        # need to trade at the minimum viable size — otherwise the bot can
+        # never trade at all on small bankrolls or during drawdown.
+        price = max(0.01, signal.recommended_price) if signal.recommended_price > 0 else 0.50
+        min_viable_usd = max(1.0, 5.0 * price)
+        if position_size < min_viable_usd:
+            # If the uncapped size was viable, floor at the exchange minimum
+            if original_size >= min_viable_usd:
+                position_size = min_viable_usd
+            else:
+                # Even uncapped size is below minimum — skip
+                logger.debug(
+                    "[%s] Size $%.2f below min viable $%.2f, skipping",
+                    signal.market.asset, position_size, min_viable_usd,
+                )
+                signal.size_usd = 0
+                signal.size_shares = 0
+                return signal
 
         # Only adjust if we need to scale DOWN
         if position_size < original_size:
-            logger.info(
-                f"📏 RISK LIMIT [{signal.market.asset}]: ${original_size:.2f} → ${position_size:.2f} "
-                f"(bankroll ${self.current_bankroll:.2f} × {trading.max_position_pct:.0%} = ${max_position:.2f})"
-            )
+            # Throttle this log — fires every tick per market, very spammy
+            _log_key = f"{signal.market.asset}:{signal.market.variant}"
+            _now = time.time()
+            if _now - _risk_limit_log_ts.get(_log_key, 0.0) >= _RISK_LIMIT_LOG_INTERVAL:
+                _risk_limit_log_ts[_log_key] = _now
+                logger.debug(
+                    f"RISK_LIMIT [{signal.market.asset}]: ${original_size:.2f} → ${position_size:.2f} "
+                    f"(bankroll ${self.current_bankroll:.2f} × {trading.max_position_pct:.0%} = ${max_position:.2f})"
+                )
             if signal.size_usd > 0:
                 ratio = position_size / signal.size_usd
                 signal.size_shares = signal.size_shares * ratio
@@ -314,52 +323,6 @@ class RiskManager:
         signal: Signal,
         entry_price: float,
         shares: float,
-        ml_volatility: Optional[float] = None,
-        ml_momentum: Optional[float] = None,
-        ml_confidence: Optional[float] = None,
-        ml_arb_type: Optional[str] = None,
-        ml_spread: Optional[float] = None,
-        ml_bid_depth: Optional[float] = None,
-        ml_ask_depth: Optional[float] = None,
-        ml_price_trend: Optional[float] = None,
-        ml_distance_from_target: Optional[float] = None,
-        ml_binance_lead_pct: Optional[float] = None,
-        ml_binance_confirmation: Optional[str] = None,
-        ml_trend_1h: Optional[float] = None,
-        ml_trend_4h: Optional[float] = None,
-        ml_trend_1d: Optional[float] = None,
-        # Chart analysis features
-        ml_chart_rsi: Optional[float] = None,
-        ml_chart_trend_strength: Optional[float] = None,
-        ml_chart_is_uptrend: Optional[float] = None,
-        ml_chart_is_downtrend: Optional[float] = None,
-        ml_chart_is_ranging: Optional[float] = None,
-        ml_chart_bullish_reversal: Optional[float] = None,
-        ml_chart_bearish_reversal: Optional[float] = None,
-        ml_chart_momentum: Optional[float] = None,
-        ml_chart_bias_bullish: Optional[float] = None,
-        ml_chart_bias_bearish: Optional[float] = None,
-        ml_chart_confidence: Optional[float] = None,
-        ml_chart_bullish_pattern: Optional[float] = None,
-        ml_chart_bearish_pattern: Optional[float] = None,
-        # NEW INDICATOR FEATURES
-        ml_macd_histogram: Optional[float] = None,
-        ml_macd_crossover: Optional[str] = None,
-        ml_bb_bandwidth: Optional[float] = None,
-        ml_bb_position: Optional[str] = None,
-        ml_stoch_k: Optional[float] = None,
-        ml_stoch_d: Optional[float] = None,
-        ml_stoch_signal: Optional[str] = None,
-        ml_rsi_divergence: Optional[str] = None,
-        ml_rsi_divergence_strength: Optional[float] = None,
-        ml_volume_ratio: Optional[float] = None,
-        ml_is_high_volume: Optional[bool] = None,
-        ml_obv_trend: Optional[float] = None,
-        ml_ha_trend: Optional[str] = None,
-        ml_ha_consecutive: Optional[int] = None,
-        ml_ha_strength: Optional[float] = None,
-        ml_vwap_distance_pct: Optional[float] = None,
-        ml_vwap_position: Optional[str] = None,
     ):
         """
         Record a new position being opened.
@@ -368,28 +331,6 @@ class RiskManager:
             signal: Signal that generated the position
             entry_price: Actual entry price
             shares: Number of shares acquired
-            ml_volatility: ML feature - asset volatility at entry
-            ml_momentum: ML feature - price momentum at entry
-            ml_confidence: ML predicted win probability
-            ml_arb_type: ML feature - arbitrage type (none, binary_arb, etc.)
-            ml_spread: ML feature - market spread at entry
-            ml_bid_depth: ML feature - bid depth at entry
-            ml_ask_depth: ML feature - ask depth at entry
-            ml_price_trend: ML feature - price trend at entry
-            ml_distance_from_target: ML feature - distance from target at entry
-            ml_binance_lead_pct: ML feature - Binance price lead percentage
-            ml_binance_confirmation: ML feature - Binance confirmation type
-            ml_trend_1h: ML feature - 1-hour trend
-            ml_trend_4h: ML feature - 4-hour trend
-            ml_trend_1d: ML feature - 1-day trend
-            ml_chart_*: Chart analysis features from Binance candlestick data
-            ml_macd_*: MACD indicator features
-            ml_bb_*: Bollinger Bands features
-            ml_stoch_*: Stochastic oscillator features
-            ml_rsi_divergence*: RSI divergence features
-            ml_volume_*: Volume analysis features
-            ml_ha_*: Heiken Ashi features
-            ml_vwap_*: VWAP features
         """
         market_key = signal.market.condition_id
 
@@ -420,52 +361,6 @@ class RiskManager:
             yes_token_id=signal.market.up_token_id,
             no_token_id=signal.market.down_token_id,
             held_token_id=held_token,
-            ml_volatility=ml_volatility,
-            ml_momentum=ml_momentum,
-            ml_confidence=ml_confidence,
-            ml_arb_type=ml_arb_type,
-            ml_spread=ml_spread,
-            ml_bid_depth=ml_bid_depth,
-            ml_ask_depth=ml_ask_depth,
-            ml_price_trend=ml_price_trend,
-            ml_distance_from_target=ml_distance_from_target,
-            ml_binance_lead_pct=ml_binance_lead_pct,
-            ml_binance_confirmation=ml_binance_confirmation,
-            ml_trend_1h=ml_trend_1h,
-            ml_trend_4h=ml_trend_4h,
-            ml_trend_1d=ml_trend_1d,
-            # Chart analysis features
-            ml_chart_rsi=ml_chart_rsi,
-            ml_chart_trend_strength=ml_chart_trend_strength,
-            ml_chart_is_uptrend=ml_chart_is_uptrend,
-            ml_chart_is_downtrend=ml_chart_is_downtrend,
-            ml_chart_is_ranging=ml_chart_is_ranging,
-            ml_chart_bullish_reversal=ml_chart_bullish_reversal,
-            ml_chart_bearish_reversal=ml_chart_bearish_reversal,
-            ml_chart_momentum=ml_chart_momentum,
-            ml_chart_bias_bullish=ml_chart_bias_bullish,
-            ml_chart_bias_bearish=ml_chart_bias_bearish,
-            ml_chart_confidence=ml_chart_confidence,
-            ml_chart_bullish_pattern=ml_chart_bullish_pattern,
-            ml_chart_bearish_pattern=ml_chart_bearish_pattern,
-            # NEW INDICATOR FEATURES
-            ml_macd_histogram=ml_macd_histogram,
-            ml_macd_crossover=ml_macd_crossover,
-            ml_bb_bandwidth=ml_bb_bandwidth,
-            ml_bb_position=ml_bb_position,
-            ml_stoch_k=ml_stoch_k,
-            ml_stoch_d=ml_stoch_d,
-            ml_stoch_signal=ml_stoch_signal,
-            ml_rsi_divergence=ml_rsi_divergence,
-            ml_rsi_divergence_strength=ml_rsi_divergence_strength,
-            ml_volume_ratio=ml_volume_ratio,
-            ml_is_high_volume=ml_is_high_volume,
-            ml_obv_trend=ml_obv_trend,
-            ml_ha_trend=ml_ha_trend,
-            ml_ha_consecutive=ml_ha_consecutive,
-            ml_ha_strength=ml_ha_strength,
-            ml_vwap_distance_pct=ml_vwap_distance_pct,
-            ml_vwap_position=ml_vwap_position,
         )
 
         self.positions[market_key] = position
@@ -474,11 +369,9 @@ class RiskManager:
         cost = shares * entry_price
         self.current_bankroll -= cost
 
-        confidence_str = f" | ML: {ml_confidence:.0%}" if ml_confidence else ""
-        arb_str = f" | ARB: {ml_arb_type}" if ml_arb_type and ml_arb_type != "none" else ""
         logger.info(
             f"Position opened: {signal.side.value} {signal.market.asset} "
-            f"{shares:.2f} shares @ {entry_price:.4f} (${cost:.2f}){confidence_str}{arb_str}"
+            f"{shares:.2f} shares @ {entry_price:.4f} (${cost:.2f})"
         )
 
     def record_position_close(
@@ -518,7 +411,7 @@ class RiskManager:
 
         # Track consecutive losses and wins
         self.trade_history.append(pnl)
-        if len(self.trade_history) > 20:  # Keep last 20 trades
+        if len(self.trade_history) > self.config.trading.trade_history_size:
             self.trade_history.pop(0)
 
         if pnl > 0:
@@ -590,16 +483,8 @@ class RiskManager:
                 )
                 self._start_cooloff("max drawdown")
 
-        # Check win rate
-        if len(self.trade_history) >= trading.min_trades_for_winrate:
-            wins = sum(1 for t in self.trade_history if t > 0)
-            win_rate = wins / len(self.trade_history)
-            if win_rate < trading.min_win_rate:
-                logger.warning(
-                    f"⚠️ Win rate {win_rate:.0%} below {trading.min_win_rate:.0%} - "
-                    f"entering cooloff"
-                )
-                self._start_cooloff("low win rate")
+        # Win rate: advisory metric only — logged in periodic status, not here.
+        # Blocking/cooloff on win rate creates an unrecoverable deadlock.
 
     def _start_cooloff(self, reason: str):
         """Start a cooling off period."""
@@ -616,7 +501,19 @@ class RiskManager:
         """Reset state after cooloff period ends."""
         logger.info("✅ Cooloff period ended - resetting protection counters")
         self.consecutive_losses = 0
-        # Don't reset trade_history - win rate should still be monitored
+
+        # Trim trade_history so win-rate gate doesn't permanently block trading.
+        # Keep only the most recent min_trades_for_winrate - 1 entries so the
+        # next trade result will push it back over the threshold for evaluation,
+        # giving the bot a fair chance to recover.
+        min_trades = self.config.trading.min_trades_for_winrate
+        if len(self.trade_history) >= min_trades:
+            self.trade_history = self.trade_history[-(min_trades - 1):]
+            logger.info(
+                "WINRATE_RESET trimmed trade_history to %d entries (below %d threshold)",
+                len(self.trade_history), min_trades,
+            )
+
         # Don't reset peak_bankroll immediately — start gradual decay instead
         self._maybe_start_peak_decay()
 

@@ -20,6 +20,8 @@ def _make_config(**overrides):
     trading.daily_loss_limit = 0.25
     trading.max_position_pct = 0.05
     trading.max_total_exposure_pct = 0.25
+    trading.trade_history_size = 20
+    trading.capital_buffer = 0.90
     for k, v in overrides.items():
         setattr(trading, k, v)
     config = MagicMock()

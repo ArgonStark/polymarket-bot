@@ -8,6 +8,7 @@ bid/ask updates and trade executions.
 import json
 import asyncio
 import logging
+import os
 import threading
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -59,6 +60,13 @@ class CLOBFeed:
         self._max_retries = self.config.websocket.max_retries
         self._ping_interval = self.config.websocket.ping_interval
         self._ping_timeout = self.config.websocket.ping_timeout
+        # Warmup seconds configurable via env var
+        warmup_env = os.getenv("CLOB_WARMUP_SECONDS")
+        if warmup_env is not None:
+            try:
+                self._warmup_seconds = float(warmup_env)
+            except ValueError:
+                pass  # Keep default 5.0
 
     @property
     def is_connected(self) -> bool:

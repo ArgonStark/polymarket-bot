@@ -147,16 +147,6 @@ class AttributionTracker:
             self._decisions = self._decisions[-self._max_history:]
 
 
-def determine_source(ml_engine_active: bool, ml_confidence: Optional[float]) -> str:
-    """
-    Determine trade source label.
-
-    - ML_EV:  ML engine is active and provided confidence
-    - RULES:  No ML, pure signal-generator rules
-    - HYBRID: ML active but no confidence for this signal (fallback path)
-    """
-    if not ml_engine_active:
-        return "RULES"
-    if ml_confidence is not None:
-        return "ML_EV"
-    return "HYBRID"
+def determine_source() -> str:
+    """Return trade source label. Always RULES (ML pipeline removed)."""
+    return "RULES"

@@ -2,7 +2,7 @@
 Kill switch — hard safety gate that disables new order placement.
 
 Triggers:
-  1. Max drawdown from peak_bankroll exceeds KILL_DD_PCT (default 10%)
+  1. Max drawdown from peak_bankroll exceeds KILL_DD_PCT (default: MAX_DRAWDOWN_PCT)
   2. Daily loss exceeds config.trading.daily_loss_limit
   3. N consecutive losses exceeds KILL_CONSEC_LOSSES (default 5)
   4. Manual file flag: presence of ``kill.switch`` file in project root
@@ -37,8 +37,8 @@ class KillSwitchState:
 class KillSwitch:
     """Hard safety gate — blocks all new order placement when tripped."""
 
-    # Configurable thresholds (env var fallback to constructor defaults)
-    dd_pct: float = field(default_factory=lambda: float(os.getenv("KILL_DD_PCT", "0.10")))
+    # Configurable thresholds (env var overrides constructor arg)
+    dd_pct: float = 0.0  # Set by __post_init__; 0.0 means "use config default"
     consec_losses: int = field(default_factory=lambda: int(os.getenv("KILL_CONSEC_LOSSES", "5")))
     flag_path: str = field(default_factory=lambda: os.getenv("KILL_SWITCH_FILE", _DEFAULT_FLAG_PATH))
 
@@ -47,6 +47,15 @@ class KillSwitch:
     reason: str = field(default="", init=False)
     triggered_at: Optional[datetime] = field(default=None, init=False)
     _last_log_ts: float = field(default=0.0, init=False, repr=False)
+
+    def __post_init__(self):
+        # Precedence: KILL_DD_PCT env var > constructor arg > MAX_DRAWDOWN_PCT config
+        env_val = os.getenv("KILL_DD_PCT")
+        if env_val is not None:
+            self.dd_pct = float(env_val)
+        elif self.dd_pct <= 0:
+            # No explicit value — fall back to config's MAX_DRAWDOWN_PCT
+            self.dd_pct = float(os.getenv("MAX_DRAWDOWN_PCT", "0.40"))
 
     # ── public API ──────────────────────────────────────────────
 
@@ -63,6 +72,24 @@ class KillSwitch:
         Returns True when the kill switch is (or becomes) active.
         """
         if self.active:
+            # Auto-recover from drawdown kills when drawdown falls below limit
+            if self.reason.startswith("drawdown") and peak_bankroll > 0:
+                dd = (peak_bankroll - current_equity) / peak_bankroll
+                if dd < self.dd_pct:
+                    self.reset(reason=f"drawdown recovered to {dd:.1%}")
+                    return False
+
+            # Auto-recover from daily loss kills when daily loss clears
+            # (e.g. new day started, or starting_bankroll was corrected)
+            if self.reason == "daily loss limit exceeded" and not daily_loss_hit:
+                self.reset(reason="daily loss recovered")
+                return False
+
+            # Auto-recover from consecutive losses when streak resets
+            if "consecutive losses" in self.reason and consecutive_losses < self.consec_losses:
+                self.reset(reason=f"consecutive losses recovered to {consecutive_losses}")
+                return False
+
             return True
 
         # 1. Drawdown

@@ -37,6 +37,7 @@ class PersistedState:
     daily_losses: int = 0
     daily_fees: float = 0.0
     daily_rebates: float = 0.0
+    daily_starting_bankroll: float = 0.0  # bankroll at start of day (for loss limit)
 
     # Open positions (minimal dicts for reconstruction)
     open_positions: list = field(default_factory=list)
@@ -44,7 +45,11 @@ class PersistedState:
     # Kill switch state
     kill_switch: dict = field(default_factory=dict)
 
+    # Settled market IDs (prevent re-processing after restart)
+    settled_markets: list = field(default_factory=list)
+
     # Metadata
+    execution_mode: str = ""  # "PAPER", "DRY", or "LIVE" — detects mode switches
     saved_at: str = ""
     version: int = 1
 
@@ -128,7 +133,7 @@ class BotStateManager:
             state_file = os.path.join(project_root, "bot_state.json")
         self.state_file = state_file
 
-    def save(self, risk_manager, markets: Optional[dict] = None, kill_switch=None) -> bool:
+    def save(self, risk_manager, markets: Optional[dict] = None, kill_switch=None, execution_mode: str = "", settled_markets: Optional[set] = None) -> bool:
         """
         Snapshot risk manager state and write atomically to disk.
 
@@ -166,8 +171,11 @@ class BotStateManager:
                 daily_losses=ds.losses if ds else 0,
                 daily_fees=ds.fees_paid if ds else 0.0,
                 daily_rebates=ds.rebates_earned if ds else 0.0,
+                daily_starting_bankroll=ds.starting_bankroll if ds else risk_manager.current_bankroll,
                 open_positions=positions,
                 kill_switch=ks_dict,
+                settled_markets=list(settled_markets)[-100:] if settled_markets else [],
+                execution_mode=execution_mode,
                 saved_at=datetime.now(timezone.utc).isoformat(),
             )
 
@@ -222,8 +230,11 @@ class BotStateManager:
                 daily_losses=data.get("daily_losses", 0),
                 daily_fees=data.get("daily_fees", 0.0),
                 daily_rebates=data.get("daily_rebates", 0.0),
+                daily_starting_bankroll=data.get("daily_starting_bankroll", data.get("current_bankroll", 0.0)),
                 open_positions=data.get("open_positions", []),
                 kill_switch=data.get("kill_switch", {}),
+                settled_markets=data.get("settled_markets", []),
+                execution_mode=data.get("execution_mode", ""),
                 saved_at=data.get("saved_at", ""),
                 version=data.get("version", 1),
             )
@@ -244,27 +255,69 @@ class BotStateManager:
             logger.error("STATE_LOAD_FAILED file=%s error=%s", self.state_file, e)
             return None
 
-    def restore_risk_manager(self, rm, state: PersistedState):
+    def restore_risk_manager(self, rm, state: PersistedState, current_mode: str = ""):
         """
         Apply saved state to an already-initialized risk manager.
 
         Called AFTER rm.initialize() so defaults are set, then overwritten.
         Peak is set to max(saved_peak, current_bankroll) to prevent false drawdown.
+
+        If execution mode has changed (e.g. PAPER → LIVE), skip restoring
+        bankroll/peak to avoid stale paper values triggering false drawdown
+        on a live account with a different balance.
         """
         from .models import DailyStats
 
-        rm.current_bankroll = state.current_bankroll
-        rm.peak_bankroll = max(state.peak_bankroll, state.current_bankroll)
-        rm.starting_bankroll = state.starting_bankroll
-        rm.consecutive_losses = state.consecutive_losses
-        rm.trade_history = list(state.trade_history)
+        mode_changed = (
+            state.execution_mode
+            and current_mode
+            and state.execution_mode != current_mode
+        )
 
-        # Restore daily stats if same day, otherwise let daily reset handle it
+        # Heuristic: if saved state has no execution_mode (old format), detect
+        # likely mode switch by comparing fresh balance vs saved peak.
+        # A 10x+ divergence between fresh balance and saved peak strongly
+        # suggests a paper→live or live→paper switch.
+        if not mode_changed and not state.execution_mode and current_mode:
+            fresh_balance = rm.current_bankroll  # set by initialize() before this call
+            if fresh_balance > 0 and state.peak_bankroll > 0:
+                ratio = max(fresh_balance, state.peak_bankroll) / min(fresh_balance, state.peak_bankroll)
+                if ratio >= 10.0:
+                    logger.warning(
+                        "STATE_BALANCE_MISMATCH fresh_balance=%.2f saved_peak=%.2f ratio=%.1fx — "
+                        "possible mode switch (saved state has no execution_mode). "
+                        "Treating as mode switch to prevent false drawdown.",
+                        fresh_balance, state.peak_bankroll, ratio,
+                    )
+                    mode_changed = True
+
+        if mode_changed:
+            logger.warning(
+                "STATE_MODE_SWITCH saved_mode=%s current_mode=%s — "
+                "skipping bankroll/peak restore (using fresh balance %.2f)",
+                state.execution_mode,
+                current_mode,
+                rm.current_bankroll,
+            )
+            # Keep rm.current_bankroll and rm.peak_bankroll as set by initialize()
+            # Only restore non-financial state that's still useful
+            rm.consecutive_losses = 0
+            rm.trade_history = []
+        else:
+            rm.current_bankroll = state.current_bankroll
+            rm.peak_bankroll = max(state.peak_bankroll, state.current_bankroll)
+            rm.starting_bankroll = state.starting_bankroll
+            rm.consecutive_losses = state.consecutive_losses
+            rm.trade_history = list(state.trade_history)
+
+        # Restore daily stats if same day and same mode, otherwise start fresh
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if state.daily_date == today:
+        if state.daily_date == today and not mode_changed:
+            # Use the day's actual starting bankroll, not the original starting_bankroll
+            day_start = state.daily_starting_bankroll or state.current_bankroll
             rm.daily_stats = DailyStats(
                 date=today,
-                starting_bankroll=state.starting_bankroll,
+                starting_bankroll=day_start,
                 current_bankroll=state.current_bankroll,
             )
             rm.daily_stats.total_pnl = state.daily_pnl
@@ -274,34 +327,37 @@ class BotStateManager:
             rm.daily_stats.fees_paid = state.daily_fees
             rm.daily_stats.rebates_earned = state.daily_rebates
         else:
-            # New day — start fresh daily stats but keep bankroll
+            # New day or mode switch — start fresh daily stats
             rm.daily_stats = DailyStats(
                 date=today,
-                starting_bankroll=state.current_bankroll,
-                current_bankroll=state.current_bankroll,
+                starting_bankroll=rm.current_bankroll,
+                current_bankroll=rm.current_bankroll,
             )
             rm._last_daily_date = today
 
-        # Restore peak decay state
-        if state.peak_decay_started_at:
+        # Restore peak decay state (skip on mode switch — not relevant)
+        if state.peak_decay_started_at and not mode_changed:
             try:
                 rm._peak_decay_started_at = datetime.fromisoformat(state.peak_decay_started_at)
                 logger.info("STATE_RESTORE peak_decay active since %s", state.peak_decay_started_at)
             except (ValueError, TypeError):
                 rm._peak_decay_started_at = None
 
-        # Restore positions
-        for pos_data in state.open_positions:
-            try:
-                position = _deserialize_position(pos_data)
-                cid = pos_data["condition_id"]
-                rm.positions[cid] = position
-                # Deduct cost from bankroll (it was included in current_bankroll
-                # but positions are tracked separately)
-                # Actually: current_bankroll already reflects the cash AFTER
-                # opening these positions, so no adjustment needed.
-            except Exception as e:
-                logger.warning("STATE_RESTORE skip position: %s", e)
+        # Restore positions (skip on mode switch — paper positions don't exist on-chain)
+        if not mode_changed:
+            for pos_data in state.open_positions:
+                try:
+                    position = _deserialize_position(pos_data)
+                    cid = pos_data["condition_id"]
+                    rm.positions[cid] = position
+                except Exception as e:
+                    logger.warning("STATE_RESTORE skip position: %s", e)
+        elif state.open_positions:
+            logger.warning(
+                "STATE_MODE_SWITCH dropping %d positions from %s mode",
+                len(state.open_positions),
+                state.execution_mode,
+            )
 
         logger.info(
             "STATE_RESTORE_RM bankroll=%.2f peak=%.2f positions=%d consecutive_losses=%d",
