@@ -1,15 +1,21 @@
 """
 Trading client setup for Polymarket CLOB.
 
-Handles authentication and client creation using py-clob-client.
+Handles authentication and client creation using py-clob-client-v2
+(CLOB V2, live since April 28 2026 — V1 SDKs are no longer supported).
 """
 
 import logging
 from typing import Optional
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
-from py_clob_client.constants import POLYGON
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
+    ApiCreds,
+    AssetType,
+    BalanceAllowanceParams,
+    OrderPayload,
+)
+from py_clob_client_v2.constants import POLYGON
 
 from ..config import BotConfig
 
@@ -77,7 +83,7 @@ def create_trading_client(config: BotConfig) -> Optional[ClobClient]:
         if not config.api.is_configured:
             logger.info("No API credentials configured, attempting to derive...")
             try:
-                derived_creds = client.create_or_derive_api_creds()
+                derived_creds = client.create_or_derive_api_key()
                 client.set_api_creds(derived_creds)
                 logger.info(
                     f"Derived API credentials successfully. "
@@ -134,11 +140,11 @@ def get_account_balance(client: Optional[ClobClient]) -> Optional[float]:
 
     try:
         # Get the signature type from the client's builder
-        # 0 = EOA wallet, 1 = proxy/browser wallet
-        # The sig_type is stored in client.builder.sig_type
+        # 0 = EOA, 1 = POLY_PROXY (Magic/browser), 2 = POLY_GNOSIS_SAFE
+        # V2 stores it as client.builder.signature_type (SignatureTypeV2 enum)
         sig_type = 0  # default to EOA
         if hasattr(client, 'builder') and client.builder is not None:
-            sig_type = getattr(client.builder, 'sig_type', 0) or 0
+            sig_type = int(getattr(client.builder, 'signature_type', 0) or 0)
 
         logger.debug(f"Fetching balance with signature_type={sig_type}")
 
@@ -189,7 +195,7 @@ def get_open_orders(client: Optional[ClobClient]) -> list[dict]:
         return []
 
     try:
-        orders = client.get_orders()
+        orders = client.get_open_orders()
         return orders if orders else []
     except Exception as e:
         logger.error(f"Failed to get open orders: {e}")
@@ -275,6 +281,9 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
             "eth": "ETH",
             "sol": "SOL",
             "xrp": "XRP",
+            "doge": "DOGE",
+            "hype": "HYPE",
+            "bnb": "BNB",
         }
 
         for pos in all_positions:
@@ -312,7 +321,7 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
                     break
 
             if not asset:
-                logger.debug(f"  -> Skipped: unknown asset (not BTC/ETH/SOL/XRP)")
+                logger.debug(f"  -> Skipped: unknown asset (not in {list(asset_patterns.values())})")
                 continue
 
             # Extract timestamp from slug (e.g., btc-updown-15m-1706123400)
@@ -331,10 +340,13 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
                 cond_id = pos.get("conditionId", "")
                 if cond_id:
                     # Sometimes the timestamp is embedded differently
-                    # Just accept the position if it's a valid 15m market
-                    logger.debug(f"  -> Could not parse timestamp, but accepting 15m {asset} position")
-                    # Use current time as approximate (will be slightly off but better than missing)
-                    market_ts = current_time - 450  # Assume ~7.5 min into period
+                    # Just accept the position if it's a valid 5m/15m market
+                    logger.debug(f"  -> Could not parse timestamp, but accepting {asset} position")
+                    # Assume halfway into the period. (A fixed 450s assumption
+                    # made every unparseable 5m position look already-settled
+                    # — 450 > 300 + buffer — so they silently vanished.)
+                    half_duration = 150 if is_5m else 450
+                    market_ts = current_time - half_duration
 
             if market_ts is None:
                 logger.debug(f"  -> Skipped: cannot determine market timestamp")
@@ -345,12 +357,16 @@ def get_active_positions(client: Optional[ClobClient]) -> dict[str, dict]:
             duration = 300 if is_5m else 900
             settle_buffer = 60
             if current_time > market_ts + duration + settle_buffer:
-                elapsed = current_time - market_ts - 900
+                elapsed = current_time - market_ts - duration
                 logger.info(f"    ⏭️ Skipped: market already settled {elapsed:.0f}s ago")
                 continue
 
-            # Track position — key by "asset:variant" to support multiple per asset
-            pos_key = f"{asset}:{variant}"
+            # Track position — key by condition ID + outcome so that multiple
+            # positions per asset (e.g. consecutive market windows, or both
+            # sides held) are ALL returned. Keying by asset:variant silently
+            # dropped every position after the first one per asset.
+            cond_id = pos.get("conditionId", "") or slug
+            pos_key = f"{cond_id}:{pos.get('outcome', '')}"
             if pos_key not in positions:
                 avg_price = float(pos.get("avgPrice", 0))
                 current_value = float(pos.get("currentValue", 0))
@@ -440,7 +456,7 @@ def cancel_order(client: Optional[ClobClient], order_id: str) -> bool:
         return False
 
     try:
-        result = client.cancel(order_id=order_id)
+        result = client.cancel_order(OrderPayload(orderID=order_id))
         logger.info(f"Cancelled order {order_id}: {result}")
         return True
     except Exception as e:

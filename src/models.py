@@ -89,16 +89,27 @@ class OrderBook:
     asks: list[OrderBookLevel] = field(default_factory=list)
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
+    # Authoritative top-of-book reported directly by the CLOB feed
+    # (price_change / best_bid_ask messages). Preferred over max()/min() of the
+    # accumulated level list, which can drift on fast markets when a stale deep
+    # level (e.g. a phantom 0.99 bid) lingers after a missed cancellation.
+    feed_best_bid: Optional[float] = None
+    feed_best_ask: Optional[float] = None
+
     @property
     def best_bid(self) -> Optional[float]:
-        """Get best bid price."""
+        """Get best bid price (prefer feed's authoritative value)."""
+        if self.feed_best_bid is not None and self.feed_best_bid > 0:
+            return self.feed_best_bid
         if not self.bids:
             return None
         return max(level.price for level in self.bids)
 
     @property
     def best_ask(self) -> Optional[float]:
-        """Get best ask price."""
+        """Get best ask price (prefer feed's authoritative value)."""
+        if self.feed_best_ask is not None and 0 < self.feed_best_ask < 1:
+            return self.feed_best_ask
         if not self.asks:
             return None
         return min(level.price for level in self.asks)
@@ -150,6 +161,11 @@ class MarketState:
 
     # Variant: "five" (5-min) or "fifteen" (15-min)
     variant: str = "fifteen"
+
+    # Exchange order constraints (from Gamma: orderMinSize / orderPriceMinTickSize).
+    # Defaults match Polymarket's common crypto-market values; overridden per market.
+    min_order_size: float = 5.0   # minimum order size in SHARES
+    tick_size: float = 0.001      # minimum price increment
 
     # Metadata
     last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

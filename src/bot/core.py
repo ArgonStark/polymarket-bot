@@ -141,6 +141,7 @@ class TradingBot(
                 kelly_cap=config.risk_sizing.kelly_cap,
                 max_exposure_pct=config.risk_sizing.max_exposure_pct,
                 min_trade_usd=config.risk_sizing.min_trade_usd,
+                kelly_fraction=config.risk_sizing.kelly_fraction,
             )
         )
 
@@ -287,6 +288,11 @@ class TradingBot(
         self._running = False
         self._shutdown_event = asyncio.Event()
 
+        # When True, drawdown tracking is reset AFTER state restore (set via
+        # --reset-drawdown). Resetting before restore is a no-op because the
+        # restore overwrites peak_bankroll.
+        self.reset_drawdown_requested = False
+
         # Warm-up / observation tracking
         self._startup_time: Optional[datetime] = None  # When bot started
         self._market_first_seen: dict[str, datetime] = {}  # market_id -> first observation time
@@ -415,6 +421,17 @@ class TradingBot(
             # Clean up positions in markets that expired while bot was down
             self._cleanup_orphaned_positions()
 
+        # Honor --reset-drawdown AFTER restore so it isn't overwritten. Baseline
+        # peak to the current (just-restored / freshly-initialized) bankroll and
+        # clear the loss streak, peak decay, and any kill-switch drawdown trip.
+        if self.reset_drawdown_requested:
+            self.risk_manager.reset_drawdown()
+            self.kill_switch = KillSwitch()
+            logger.info(
+                "DRAWDOWN_RESET_APPLIED peak=%.2f bankroll=%.2f (via --reset-drawdown)",
+                self.risk_manager.peak_bankroll, self.risk_manager.current_bankroll,
+            )
+
         # Display startup info AFTER state restore so balance/positions are correct
         await self._display_startup_info()
 
@@ -468,7 +485,10 @@ class TradingBot(
 
             self.last_orders_sync = now
             synced_assets = set()
-            token_to_asset = {"btc": "BTC", "eth": "ETH", "sol": "SOL", "xrp": "XRP"}
+            token_to_asset = {
+                "btc": "BTC", "eth": "ETH", "sol": "SOL", "xrp": "XRP",
+                "doge": "DOGE", "hype": "HYPE", "bnb": "BNB",
+            }
 
             # 1. Sync open orders (unfilled limit orders)
             open_orders = get_open_orders(self.client)
@@ -498,6 +518,9 @@ class TradingBot(
                 if _a not in asset_cache:
                     asset_cache[_a] = pos_info
             self._update_cached_positions(asset_cache)
+            # Full per-market list (condition_id:outcome keyed) so displays can
+            # show API positions that failed to import into internal tracking
+            self._api_positions_raw = positions_raw
 
             for _pk, pos_info in positions_raw.items():
                 asset = pos_info.get("asset", _pk.split(":")[0] if ":" in _pk else _pk)
@@ -1613,9 +1636,10 @@ class TradingBot(
                 # Check pending orders for fills
                 await self._check_pending_orders()
 
-                # Check positions for early exit (take-profit / stop-loss)
-                if self.config.trading.early_exit_enabled:
-                    await self._check_early_exits()
+                # Check positions for early exit (take-profit / stop-loss).
+                # Always called: the 5-min take-profit rule is active even when
+                # the broader early-exit system is disabled (gated inside).
+                await self._check_early_exits()
 
                 # Move expiring markets out of active trading
                 await self._check_expiring_markets()
@@ -1654,7 +1678,9 @@ class TradingBot(
                     if self.risk_manager.daily_stats
                     else 0.0
                 )
-                unrealized = equity - self.risk_manager.current_bankroll
+                # True unrealized = mark value - cost basis (cash was already
+                # debited at open; equity - cash would overstate by cost basis)
+                unrealized = self._last_equity_detail["unrealized_pnl"]
                 self.dashboard.maybe_emit(
                     bankroll=self.risk_manager.current_bankroll,
                     peak_bankroll=self.risk_manager.peak_bankroll,
@@ -1709,11 +1735,16 @@ class TradingBot(
                 self._tick_signals_generated = 0
                 self._tick_trades_executed = 0
 
-                # Sort markets by asset priority (BTC/ETH first for better liquidity)
+                # Sort markets: 5m first (time-sensitive — a 15m market can
+                # wait a tick, a 5m market can't), then by asset priority
+                # (BTC/ETH first for better liquidity)
                 priority = self.config.trading.asset_priority
                 sorted_markets = sorted(
                     self.markets.values(),
-                    key=lambda m: priority.index(m.asset) if m.asset in priority else 99
+                    key=lambda m: (
+                        0 if m.variant == "five" else 1,
+                        priority.index(m.asset) if m.asset in priority else 99,
+                    )
                 )
 
                 # Process markets - parallel or sequential based on config
@@ -2319,12 +2350,13 @@ class TradingBot(
         if not market:
             return
 
-        # Only update prices for UP token (which determines market price)
+        # Only update prices for UP token (which determines market price).
+        # Propagate empty sides as sentinels (0 bid / 1 ask) rather than
+        # keeping stale values — a collapsed side that lingers as a stale
+        # price produces phantom crossed books and DATA_SANITY_FAIL spam.
         if token_id == market.up_token_id:
-            if orderbook.best_bid is not None:
-                market.best_bid = orderbook.best_bid
-            if orderbook.best_ask is not None:
-                market.best_ask = orderbook.best_ask
+            market.best_bid = orderbook.best_bid if orderbook.best_bid is not None else 0.0
+            market.best_ask = orderbook.best_ask if orderbook.best_ask is not None else 1.0
             market.last_updated = datetime.now(timezone.utc)
 
 

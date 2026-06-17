@@ -25,33 +25,16 @@ logger = logging.getLogger(__name__)
 
 # Binance symbol mapping for Polymarket's crypto_prices topic
 # Handle various formats that Polymarket might use
-BINANCE_SYMBOL_MAP = {
-    # Standard format: lowercase concatenated
-    "btcusdt": "BTC",
-    "ethusdt": "ETH",
-    "solusdt": "SOL",
-    "xrpusdt": "XRP",
-    # Uppercase format
-    "BTCUSDT": "BTC",
-    "ETHUSDT": "ETH",
-    "SOLUSDT": "SOL",
-    "XRPUSDT": "XRP",
-    # Slash format
-    "btc/usdt": "BTC",
-    "eth/usdt": "ETH",
-    "sol/usdt": "SOL",
-    "xrp/usdt": "XRP",
-    # Dash format
-    "btc-usdt": "BTC",
-    "eth-usdt": "ETH",
-    "sol-usdt": "SOL",
-    "xrp-usdt": "XRP",
-    # Just the asset (in case Polymarket only sends base asset)
-    "btc": "BTC",
-    "eth": "ETH",
-    "sol": "SOL",
-    "xrp": "XRP",
-}
+_CHAINLINK_ASSETS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"]
+
+BINANCE_SYMBOL_MAP = {}
+for _a in _CHAINLINK_ASSETS:
+    _l = _a.lower()
+    BINANCE_SYMBOL_MAP[f"{_l}usdt"] = _a       # lowercase concatenated
+    BINANCE_SYMBOL_MAP[f"{_a}USDT"] = _a       # uppercase
+    BINANCE_SYMBOL_MAP[f"{_l}/usdt"] = _a      # slash format
+    BINANCE_SYMBOL_MAP[f"{_l}-usdt"] = _a      # dash format
+    BINANCE_SYMBOL_MAP[_l] = _a                # just the base asset
 
 
 @dataclass

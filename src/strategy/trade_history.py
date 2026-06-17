@@ -188,7 +188,7 @@ class TradeHistory:
         completed = [t for t in self.trades if t.get("actual_outcome") is not None]
 
         stats = {}
-        for asset in ["BTC", "ETH", "SOL", "XRP"]:
+        for asset in ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"]:
             asset_trades = [t for t in completed if t["asset"] == asset]
             if not asset_trades:
                 continue

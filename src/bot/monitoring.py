@@ -48,7 +48,10 @@ class MonitoringMixin:
         bankroll = self.risk_manager.current_bankroll
         equity = self._calculate_equity()
         realized = self.risk_manager.daily_stats.total_pnl if self.risk_manager.daily_stats else 0.0
-        unrealized = equity - bankroll
+        # True unrealized = mark value - cost basis. (equity - bankroll) would
+        # overstate P&L by the full cost basis of every open position, since
+        # cash was already debited when the position opened.
+        unrealized = self._last_equity_detail["unrealized_pnl"]
         total_pnl = realized + unrealized
         peak = self.risk_manager.peak_bankroll
         dd_pct = (1 - equity / peak) * 100 if peak > 0 else 0.0
@@ -57,11 +60,11 @@ class MonitoringMixin:
         W = 68  # inner box width
 
         # ── Asset prices header ──
+        # get_all_prices() keys are plain asset symbols ("BTC"), not "btc/usd"
         chainlink_prices = self.chainlink_feed.get_all_prices()
         price_parts = []
         for asset in self.config.supported_assets:
-            asset_key = f"{asset.lower()}/usd"
-            cl_price = chainlink_prices.get(asset_key)
+            cl_price = chainlink_prices.get(asset)
             if not cl_price:
                 continue
             target = None
@@ -125,9 +128,14 @@ class MonitoringMixin:
                 )
                 logger.info(line)
 
+            self._log_untracked_api_positions(W)
             logger.info("\u251c%s\u2524", "\u2500" * W)
         else:
-            logger.info("\u250c%s\u2510", "\u2500" * W)
+            had_api_rows = self._log_untracked_api_positions(W, open_box=True)
+            if had_api_rows:
+                logger.info("\u251c%s\u2524", "\u2500" * W)
+            else:
+                logger.info("\u250c%s\u2510", "\u2500" * W)
 
         # ── Signal processing diagnostics (when no positions, show WHY) ──
         blocks = getattr(self, '_tick_block_reasons', {})
@@ -199,6 +207,48 @@ class MonitoringMixin:
                 logger.info(f"{line}{' ' * padding}\u2502")
             logger.info("\u2514%s\u2518", "\u2500" * W)
 
+    def _log_untracked_api_positions(self, W: int, open_box: bool = False) -> bool:
+        """Render exchange positions that exist on the Data API but are NOT in
+        internal tracking (import failed, e.g. market no longer discovered).
+
+        Previously these were invisible in the compact table — the bot held
+        them on Polymarket but displayed nothing. Returns True if any rows
+        were printed.
+        """
+        raw = getattr(self, '_api_positions_raw', None)
+        if not raw:
+            return False
+
+        tracked_ids = {
+            getattr(p, 'market_id', None) or k
+            for k, p in self.risk_manager.positions.items()
+        } | set(self.risk_manager.positions.keys())
+
+        rows = []
+        for _pk, info in raw.items():
+            cond_id = info.get("conditionId", "")
+            if cond_id and cond_id in tracked_ids:
+                continue
+            asset = info.get("asset", "?")
+            variant = "5m" if info.get("variant") == "five" else "15m"
+            outcome = (info.get("outcome") or "?").upper()
+            size = info.get("size", 0.0)
+            price = info.get("price", 0.0)
+            value = info.get("current_value", 0.0)
+            rows.append(
+                f"│ {asset:4} {variant:3} {outcome:5} "
+                f"@{price:.3f} ×{size:>7.1f}  "
+                f"value=${value:>6.2f}  (on exchange, untracked) │"
+            )
+
+        if not rows:
+            return False
+        if open_box:
+            logger.info("┌─ EXCHANGE POSITIONS %s┐", "─" * (W - 21))
+        for line in rows:
+            logger.info(line)
+        return True
+
     def _log_status_line(self):
         """Log a clean status line with key info."""
         now = datetime.now(timezone.utc)
@@ -214,8 +264,8 @@ class MonitoringMixin:
         # Build compact price string with distance info
         price_parts = []
         for asset in self.config.supported_assets:
-            asset_key = f"{asset.lower()}/usd"
-            cl_price = chainlink_prices.get(asset_key)
+            # get_all_prices() keys are plain asset symbols ("BTC")
+            cl_price = chainlink_prices.get(asset)
             bn_price = binance_prices.get(asset)
 
             # Find market for this asset to get target
@@ -287,14 +337,13 @@ class MonitoringMixin:
 
         # Pick the primary asset's price for the header
         primary_asset = self.config.supported_assets[0] if self.config.supported_assets else "BTC"
-        asset_key = f"{primary_asset.lower()}/usd"
-        price = chainlink_prices.get(asset_key, 0.0)
+        # get_all_prices() keys are plain asset symbols ("BTC")
+        price = chainlink_prices.get(primary_asset, 0.0)
 
         # Build per-asset price info with signal pipeline diagnostics
         assets_info = []
         for asset in self.config.supported_assets:
-            akey = f"{asset.lower()}/usd"
-            cl = chainlink_prices.get(akey)
+            cl = chainlink_prices.get(asset)
             bn = binance_prices.get(asset)
             if cl:
                 target = None

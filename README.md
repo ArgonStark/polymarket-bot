@@ -252,7 +252,7 @@ At the exact moment a new 15/5-minute period starts, the bot captures the curren
 |------|--------|-------------|
 | **Dry Run** | `DRY_RUN=true` | Logs signals only, no orders |
 | **Paper Trading** | `PAPER_TRADING_ENABLED=true` | Simulated fills with realistic fees/slippage |
-| **Live Trading** | Both `false` | Real orders via py-clob-client |
+| **Live Trading** | Both `false` | Real orders via py-clob-client-v2 |
 
 ### Smart Order Routing
 
@@ -576,7 +576,7 @@ Log throttling prevents spam: `PRICE_LOG` (5s), `SIGNAL_LOG` (30s), `ML_DECISION
           v                      v                          v
  +-----------------------------------------------------------------------+
  |                       EXECUTION LAYER                                 |
- |  Paper Executor (simulated)  |  Live Executor (py-clob-client)       |
+ |  Paper Executor (simulated)  |  Live Executor (py-clob-client-v2)     |
  |  Smart Router (POST_ONLY / LIMIT / MARKET)                           |
  |  Order Safety Guard  |  Stale Order Cancellation                     |
  +-----------------------------------------------------------------------+
@@ -627,7 +627,7 @@ cp .env.example .env
 
 | Package | Purpose |
 |---------|---------|
-| `py-clob-client` | Polymarket CLOB API client |
+| `py-clob-client-v2` | Polymarket CLOB V2 API client |
 | `websocket-client` | WebSocket connections (Chainlink, CLOB) |
 | `numpy`, `scipy` | Numerical computation |
 | `scikit-learn` | ML models (Random Forest, calibration) |
@@ -877,7 +877,7 @@ polymarket-bot/
 │   │   └── historical.py            # Historical data loading
 │   │
 │   ├── execution/                   # Order execution
-│   │   ├── client.py                # Live trading client (py-clob-client)
+│   │   ├── client.py                # Live trading client (py-clob-client-v2)
 │   │   ├── paper.py                 # Paper trading executor (simulated fills)
 │   │   ├── orders.py                # Order management + safety guard
 │   │   └── low_latency/

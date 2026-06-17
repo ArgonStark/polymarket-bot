@@ -277,12 +277,13 @@ class RiskManager:
         # This ensures we NEVER scale UP, only DOWN
         position_size = min(original_size, risk_limit)
 
-        # Floor at Polymarket minimum: max($1, 5 shares * price)
+        # Floor at the market's real minimum order size (shares * price).
         # If max_position_pct cap pushes below the exchange minimum, we still
         # need to trade at the minimum viable size — otherwise the bot can
         # never trade at all on small bankrolls or during drawdown.
         price = max(0.01, signal.recommended_price) if signal.recommended_price > 0 else 0.50
-        min_viable_usd = max(1.0, 5.0 * price)
+        min_shares = getattr(signal.market, "min_order_size", 5.0)
+        min_viable_usd = max(1.0, min_shares * price)
         if position_size < min_viable_usd:
             # If the uncapped size was viable, floor at the exchange minimum
             if original_size >= min_viable_usd:

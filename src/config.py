@@ -121,7 +121,7 @@ class TradingConfig:
 
     # Maximum position as percentage of bankroll
     max_position_pct: float = field(
-        default_factory=lambda: _safe_float("MAX_POSITION_PCT", "0.10")
+        default_factory=lambda: _safe_float("MAX_POSITION_PCT", "0.15")
     )
 
     # Maximum concurrent positions (filled + pending orders)
@@ -159,7 +159,9 @@ class TradingConfig:
     # BTC and ETH are most liquid, SOL has good volume
     # XRP has lowest priority - less correlated with BTC
     asset_priority: list = field(
-        default_factory=lambda: os.getenv("ASSET_PRIORITY", "BTC,ETH,SOL,XRP").split(",")
+        default_factory=lambda: os.getenv(
+            "ASSET_PRIORITY", "BTC,ETH,SOL,XRP,DOGE,HYPE,BNB"
+        ).split(",")
     )
 
     # Enable parallel market processing (faster but more API calls)
@@ -190,8 +192,10 @@ class TradingConfig:
     )
 
     # Minimum trades before win rate check kicks in
+    # 10 (not 5): with binary outcomes, 5 trades is pure noise — 2W/3L is a
+    # 40% sample win rate and would pause an even strategy half the time.
     min_trades_for_winrate: int = field(
-        default_factory=lambda: _safe_int("MIN_TRADES_FOR_WINRATE", "5")
+        default_factory=lambda: _safe_int("MIN_TRADES_FOR_WINRATE", "10")
     )
 
     # Cooling off period after hitting any limit (minutes)
@@ -216,6 +220,20 @@ class TradingConfig:
             if v.strip() in ("five", "fifteen")
         ] or ["fifteen"]
     )
+
+    # Per-variant position cap. 0 = auto: ceil(max_concurrent / n_variants).
+    # Reserves slots per market duration — without this, long-lived 15m
+    # positions occupy all slots and crowd out 5m trading entirely.
+    max_positions_per_variant: int = field(
+        default_factory=lambda: _safe_int("MAX_POSITIONS_PER_VARIANT", "0")
+    )
+
+    def variant_position_cap(self) -> int:
+        """Max concurrent positions per market variant (five/fifteen)."""
+        if self.max_positions_per_variant > 0:
+            return self.max_positions_per_variant
+        n = max(1, len(self.trading_variants))
+        return max(1, -(-self.max_concurrent_positions // n))  # ceil division
 
     # Per-variant timing overrides (5-min defaults are tighter)
     min_time_remaining_5m: float = field(
@@ -260,6 +278,13 @@ class TradingConfig:
     # Take-profit threshold (e.g., 0.30 = close when +30% profit)
     take_profit_pct: float = field(
         default_factory=lambda: _safe_float("TAKE_PROFIT_PCT", "0.30")
+    )
+
+    # Take-profit for 5-MINUTE markets — ALWAYS active, even when
+    # early_exit_enabled is false. 5m markets move fast and unrealized
+    # gains evaporate; lock in profits above this threshold.
+    take_profit_pct_5m: float = field(
+        default_factory=lambda: _safe_float("TAKE_PROFIT_PCT_5M", "0.40")
     )
 
     # Stop-loss threshold (e.g., 0.25 = close when -25% loss)
@@ -317,7 +342,7 @@ class TradingConfig:
 
     # Warm-up period at startup - observe before trading (seconds)
     warmup_period_seconds: int = field(
-        default_factory=lambda: _safe_int("WARMUP_PERIOD", "60")
+        default_factory=lambda: _safe_int("WARMUP_PERIOD", "30")
     )
 
     # Minimum price samples needed before trading an asset
@@ -327,7 +352,7 @@ class TradingConfig:
 
     # Minimum observation time per market before trading (seconds)
     min_observation_time: float = field(
-        default_factory=lambda: _safe_float("MIN_OBSERVATION_TIME", "30")
+        default_factory=lambda: _safe_float("MIN_OBSERVATION_TIME", "15")
     )
 
     # Edge thresholds for different order types (configurable via env)
@@ -438,6 +463,13 @@ class RiskSizingConfig:
     target_volatility: float = field(
         default_factory=lambda: _safe_float("TARGET_VOLATILITY", "0.006")
     )
+    # Fraction of FULL Kelly to actually bet (safety). 0.25 = quarter Kelly.
+    # Fractional Kelly is the standard practice: smoother equity curve, far
+    # lower variance. The sizer only ever scales DOWN from full Kelly.
+    kelly_fraction: float = field(
+        default_factory=lambda: _safe_float("KELLY_FRACTION", "0.5")
+    )
+    # Hard ceiling on the bet fraction after all adjustments.
     kelly_cap: float = field(
         default_factory=lambda: _safe_float("KELLY_CAP", "0.20")
     )
@@ -521,6 +553,9 @@ class VolatilityConfig:
     eth: float = 0.0055  # 0.55% (was 0.45%)
     sol: float = 0.0070  # 0.70%
     xrp: float = 0.0060  # 0.60%
+    doge: float = 0.0080  # 0.80% — memecoin, moves harder
+    hype: float = 0.0100  # 1.00% — newer/thinner, most volatile of the set
+    bnb: float = 0.0040  # 0.40% — large cap, calmest of the set
 
     def get(self, asset: str) -> float:
         """Get volatility for an asset."""
@@ -601,6 +636,18 @@ class TrendProtectionConfig:
     velocity_xrp: float = field(
         default_factory=lambda: _safe_float("VELOCITY_MAX_XRP", "0.00025")
     )  # ~1.5% per minute (lowered to trade less)
+
+    velocity_doge: float = field(
+        default_factory=lambda: _safe_float("VELOCITY_MAX_DOGE", "0.00040")
+    )  # ~2.4% per minute (memecoin moves fast)
+
+    velocity_hype: float = field(
+        default_factory=lambda: _safe_float("VELOCITY_MAX_HYPE", "0.00050")
+    )  # ~3.0% per minute (most volatile of the set)
+
+    velocity_bnb: float = field(
+        default_factory=lambda: _safe_float("VELOCITY_MAX_BNB", "0.00025")
+    )  # ~1.5% per minute (large cap, calm)
 
     # === Multi-Timeframe Agreement ===
     timeframe_agreement_enabled: bool = field(
@@ -820,6 +867,24 @@ class EdgeSignalConfig:
     max_edge: float = field(
         default_factory=lambda: _safe_float("EDGE_MAX", "0.12")
     )
+    # EV thresholds: edge = model win probability − executable ask − taker fee
+    min_edge_ev: float = field(
+        default_factory=lambda: _safe_float("EDGE_MIN_EV", "0.015")
+    )
+    medium_edge_ev: float = field(
+        default_factory=lambda: _safe_float("EDGE_MEDIUM_EV", "0.035")
+    )
+    high_edge_ev: float = field(
+        default_factory=lambda: _safe_float("EDGE_HIGH_EV", "0.07")
+    )
+    # Taker fee at price 0.50 (15-min crypto markets: ~1.56%; 0 disables)
+    taker_fee_peak: float = field(
+        default_factory=lambda: _safe_float("TAKER_FEE_PEAK", "0.0156")
+    )
+    # Max Binance-lead drift adjustment to the model numerator (fraction)
+    max_drift_adj: float = field(
+        default_factory=lambda: _safe_float("EDGE_MAX_DRIFT", "0.002")
+    )
 
 
 @dataclass
@@ -846,7 +911,7 @@ class BotConfig:
 
     # Supported assets for crypto up/down markets
     supported_assets: list = field(
-        default_factory=lambda: ["BTC", "ETH", "SOL", "XRP"]
+        default_factory=lambda: ["BTC", "ETH", "SOL", "XRP", "DOGE", "HYPE", "BNB"]
     )
 
     # Trading loop interval (seconds) - lower = faster signal detection
@@ -974,6 +1039,9 @@ class BotConfig:
                 "eth": self.volatility.eth,
                 "sol": self.volatility.sol,
                 "xrp": self.volatility.xrp,
+                "doge": self.volatility.doge,
+                "hype": self.volatility.hype,
+                "bnb": self.volatility.bnb,
             },
             "dry_run": self.dry_run,
             "supported_assets": self.supported_assets,

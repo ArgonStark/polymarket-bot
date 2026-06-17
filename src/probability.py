@@ -137,6 +137,68 @@ def estimate_volatility(
     return max(vol, 0.0001)
 
 
+def estimate_vol_15m_from_ticks(
+    history: list,
+    default_vol: float = 0.005,
+    min_span_seconds: float = 120.0,
+    max_gap_seconds: float = 120.0,
+    max_ratio: float = 4.0,
+) -> float:
+    """
+    Time-aware realized volatility from irregular (timestamp, price) ticks,
+    correctly scaled to a 15-minute horizon.
+
+    The legacy estimate_volatility() treats tick-to-tick returns (arriving
+    every few seconds) as if they were 15-minute returns — understating
+    volatility by ~sqrt(900/dt), i.e. 15-30x. This version estimates the
+    per-second realized variance rate and scales by sqrt(900):
+
+        var_rate = sum(r_i^2) / sum(dt_i)      (per-second variance)
+        sigma_15m = sqrt(var_rate * 900)
+
+    Args:
+        history: List of (datetime, price) tuples, oldest first.
+        default_vol: Fallback / anchor when data is insufficient.
+        min_span_seconds: Minimum total time span required to trust the estimate.
+        max_gap_seconds: Ignore intervals longer than this (feed reconnects).
+        max_ratio: Clamp result to [default/max_ratio, default*max_ratio] —
+                   resists quiet-feed underestimates and single-tick spikes.
+
+    Returns:
+        Estimated 15-minute volatility as a decimal fraction.
+    """
+    if not history or len(history) < 5:
+        return default_vol
+
+    sum_r2 = 0.0
+    sum_dt = 0.0
+    prev_t = None
+    prev_p = None
+    for item in history:
+        if not (isinstance(item, (list, tuple)) and len(item) >= 2):
+            continue
+        t, p = item[0], item[1]
+        if prev_p is not None and p > 0 and prev_p > 0:
+            try:
+                dt = (t - prev_t).total_seconds()
+            except (TypeError, AttributeError):
+                dt = 0.0
+            if 0.0 < dt <= max_gap_seconds:
+                r = math.log(p / prev_p)
+                sum_r2 += r * r
+                sum_dt += dt
+        prev_t, prev_p = t, p
+
+    if sum_dt < min_span_seconds or sum_r2 <= 0.0:
+        return default_vol
+
+    sigma_15m = math.sqrt(sum_r2 / sum_dt * 900.0)
+
+    lo = default_vol / max_ratio
+    hi = default_vol * max_ratio
+    return min(hi, max(lo, sigma_15m))
+
+
 def estimate_volatility_from_range(
     high: float,
     low: float,

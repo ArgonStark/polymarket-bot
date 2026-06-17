@@ -8,7 +8,7 @@ Supports both EOA wallets and proxy wallets (Magic/browser wallets).
 
 import os
 from dotenv import load_dotenv
-from py_clob_client.client import ClobClient
+from py_clob_client_v2.client import ClobClient
 
 load_dotenv()
 
@@ -59,7 +59,7 @@ def main():
         client = ClobClient(**client_kwargs)
 
         # Derive or create API credentials
-        creds = client.create_or_derive_api_creds()
+        creds = client.create_or_derive_api_key()
 
         print("\n" + "=" * 60)
         print("  SUCCESS! Add these to your .env file:")
@@ -78,7 +78,7 @@ def main():
         print()
         print("Verifying credentials by fetching balance...")
         try:
-            from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
 
             # Set credentials and try to get balance
             client.set_api_creds(creds)
@@ -113,7 +113,7 @@ def main():
         print("2. For proxy wallets (Magic/browser), set FUNDER to your deposit address")
         print("   Find it at: https://polymarket.com/wallet")
         print("3. Make sure you have internet connectivity")
-        print("4. The py-clob-client package must be installed")
+        print("4. The py-clob-client-v2 package must be installed")
 
         import traceback
         print()

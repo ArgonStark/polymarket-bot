@@ -157,10 +157,12 @@ async def main():
     # Create and run bot
     bot = TradingBot(config)
 
-    # Reset drawdown if requested
+    # Reset drawdown if requested. NOTE: this must happen AFTER state restore
+    # (which runs inside bot.start() -> initialize()), otherwise the restore
+    # immediately overwrites the reset. We set a flag the bot honors post-restore.
     if args.reset_drawdown:
-        print("🔄 Resetting drawdown tracking...")
-        bot.risk_manager.reset_drawdown()
+        print("🔄 Drawdown reset requested — will apply after state restore...")
+        bot.reset_drawdown_requested = True
 
     try:
         await bot.start()

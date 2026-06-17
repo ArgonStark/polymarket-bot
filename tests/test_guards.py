@@ -236,18 +236,19 @@ class TestCanExecuteTrade:
         assert not result.can_execute
         assert result.reason == "exposure_cap"
 
-    def test_untradeable_size_with_scaling(self):
+    def test_cap_below_min_floors_when_affordable(self):
         """bankroll=$30, base_size=$25 (from risk sizer), scale=0.5 → $12.5
-        But max_position_pct cap: $30 * 0.10 = $3.00 → below min $5.
+        max_position_pct cap: $30 * 0.10 = $3.00 → below min $5, but the
+        bankroll affords min_trade so the size floors at $5 instead of
+        deadlocking small bankrolls.
         """
         result = can_execute_trade(**{
             **self.COMMON,
             "capital_scale_mult": 0.5,
             "base_size_usd": 25.0,
         })
-        assert not result.can_execute
-        assert result.reason == "untradeable_size"
-        assert result.computed_size_usd == pytest.approx(3.0)  # capped by max_position_pct
+        assert result.can_execute
+        assert result.computed_size_usd == pytest.approx(5.0)  # floored at min_trade_usd
 
     def test_untradeable_tiny_base(self):
         """base_size=$2, scale=1.0, but cap=$3 → below min $5."""
@@ -413,6 +414,7 @@ class TestPaperModeBehavior:
             pending_count=0,
             max_concurrent_positions=4,
         )
-        # cap = 30 * 0.10 = $3.00, < $5 min_trade → blocked
-        assert not result.can_execute
-        assert result.reason == "untradeable_size"
+        # cap = 30 * 0.10 = $3.00, < $5 min_trade, bankroll affords min
+        # → floors at min_trade_usd (same logic regardless of mode)
+        assert result.can_execute
+        assert result.computed_size_usd == pytest.approx(5.0)

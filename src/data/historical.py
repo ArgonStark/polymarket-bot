@@ -20,6 +20,9 @@ COINGECKO_IDS = {
     "ETH": "ethereum",
     "SOL": "solana",
     "XRP": "ripple",
+    "DOGE": "dogecoin",
+    "HYPE": "hyperliquid",
+    "BNB": "binancecoin",
 }
 
 # CoinGecko API base URL (free tier)

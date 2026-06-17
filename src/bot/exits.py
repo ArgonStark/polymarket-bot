@@ -70,6 +70,25 @@ class EarlyExitMixin:
                 entry_price = position.entry_price
                 pnl_pct = (current_price - entry_price) / entry_price
 
+                variant = getattr(market, "variant", "fifteen")
+
+                # 5-MINUTE TAKE-PROFIT: always active, independent of the
+                # early_exit_enabled master switch. Lock in fast gains.
+                if variant == "five" and pnl_pct >= trading.take_profit_pct_5m:
+                    logger.info(
+                        f"{Colors.BRIGHT_GREEN}💰 TAKE PROFIT (5m rule): {market.asset} {position.side.value} | "
+                        f"P&L: {pnl_pct:+.0%} >= {trading.take_profit_pct_5m:.0%} | "
+                        f"Entry: {entry_price:.2f} → Exit: {current_price:.2f}{Colors.RESET}"
+                    )
+                    await self._execute_early_exit(market, position, current_price, "take_profit")
+                    continue
+
+                # Remaining exit types (TP/SL/time/chart) only when the
+                # broader early-exit system is enabled. The tick loop calls
+                # this method unconditionally for the 5m rule above.
+                if not trading.early_exit_enabled:
+                    continue
+
                 # Check take-profit
                 if pnl_pct >= trading.take_profit_pct:
                     logger.info(

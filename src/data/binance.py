@@ -36,6 +36,12 @@ BINANCE_SYMBOLS = {
     "ETH": "ethusdt",
     "SOL": "solusdt",
     "XRP": "xrpusdt",
+    "DOGE": "dogeusdt",
+    "BNB": "bnbusdt",
+    # NOTE: HYPE is intentionally absent — not listed on Binance spot.
+    # All Binance-derived signals (OFI, drift, regime klines, momentum)
+    # degrade gracefully to neutral for HYPE; the probability model runs
+    # on Chainlink prices + real orderbooks.
 }
 
 # Reverse mapping for lookups

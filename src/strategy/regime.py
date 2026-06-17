@@ -89,13 +89,15 @@ class RegimeDetector:
 
         # --- Classification ---
         if atr_pct is not None and atr_pct < self.atr_low_percentile:
-            # Low volatility — unpredictable, coin-flip outcomes
+            # Low volatility favors distance-from-strike bets: less movement
+            # means less chance the price crosses back over the target.
+            # Trade at reduced size rather than blocking outright.
             return RegimeState(
-                regime=RegimeType.CHOPPY,
+                regime=RegimeType.RANGING,
                 efficiency_ratio=er,
-                atr_percentile=atr_pct if atr_pct is not None else 50.0,
-                should_trade=False,
-                kelly_multiplier=0.0,
+                atr_percentile=atr_pct,
+                should_trade=True,
+                kelly_multiplier=self.ranging_kelly_mult,
                 detail=f"low_vol atr_pct={atr_pct:.0f}",
             )
 

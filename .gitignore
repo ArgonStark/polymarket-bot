@@ -64,3 +64,9 @@ trade_history.json
 trader_data.json
 trader_model.json
 src/metrics.json
+
+# Runtime state backups
+bot_state.json.*
+
+# Local Claude settings
+.claude/settings.local.json

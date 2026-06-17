@@ -21,6 +21,22 @@ from src.bot.guards import (
 
 logger = logging.getLogger(__name__)
 
+
+def _round_to_tick(price: float, tick: float) -> float:
+    """Round a price to the market's tick size so the order isn't rejected.
+
+    Polymarket rejects orders whose price doesn't conform to the market's
+    ``orderPriceMinTickSize`` (e.g. 0.001). Rounds to the nearest tick and
+    trims float noise to the tick's decimal precision.
+    """
+    if tick <= 0:
+        return price
+    steps = round(price / tick)
+    # Decimal places implied by the tick (0.001 -> 3, 0.01 -> 2)
+    decimals = max(0, len(f"{tick:.10f}".rstrip("0").split(".")[-1]))
+    return round(steps * tick, decimals)
+
+
 # Import Binance chart analyzer for ML features
 try:
     from src.data.binance_chart import analyze_chart
@@ -76,11 +92,21 @@ class TradingMixin:
                 kelly_multiplier=0.75,
             )
 
-        # Compute DOWN token prices from UP token prices
         best_bid_up = market.best_bid or 0.0
         best_ask_up = market.best_ask or 1.0
+
+        # DOWN token prices: prefer the REAL DOWN orderbook (subscribed
+        # alongside UP). The complement (1 - UP price) is only an
+        # approximation — real DOWN asks can be cheaper, which is exactly
+        # where edge and complete-set gaps live. Fall back to complement.
         best_bid_down = 1.0 - best_ask_up
         best_ask_down = 1.0 - best_bid_up
+        down_book = self.clob_feed.get_orderbook(market.down_token_id) if self.clob_feed else None
+        if down_book:
+            if down_book.best_bid is not None and down_book.best_bid > 0:
+                best_bid_down = down_book.best_bid
+            if down_book.best_ask is not None and 0 < down_book.best_ask < 1:
+                best_ask_down = down_book.best_ask
 
         # Total market duration
         total_duration = 900.0  # Default 15 min
@@ -98,10 +124,21 @@ class TradingMixin:
             kelly_medium=cfg.kelly_medium,
             kelly_low=cfg.kelly_low,
             max_edge=cfg.max_edge,
+            min_edge_ev=cfg.min_edge_ev,
+            medium_edge_ev=cfg.medium_edge_ev,
+            high_edge_ev=cfg.high_edge_ev,
+            taker_fee_peak=cfg.taker_fee_peak,
+            max_drift_adj=cfg.max_drift_adj,
             min_ofi_threshold=self.config.ofi.min_ofi_threshold if hasattr(self.config, 'ofi') else 0.15,
             strong_ofi_threshold=self.config.ofi.strong_ofi_threshold if hasattr(self.config, 'ofi') else 0.40,
             ofi_confirmation_threshold=self.config.ofi.confirmation_threshold if hasattr(self.config, 'ofi') else 0.10,
         )
+
+        # Per-asset 15-minute volatility for the probability model
+        vol_15m = self.signal_generator.get_volatility(asset)
+
+        # Binance-lead drift: where Chainlink is about to print (0 if stale)
+        drift = self.signal_generator.get_binance_drift(asset)
 
         edge_signal = generate_edge_signal(
             asset=asset,
@@ -118,6 +155,8 @@ class TradingMixin:
             time_remaining=market.time_remaining,
             total_duration=total_duration,
             config=es_config,
+            vol_15m=vol_15m,
+            drift=drift,
         )
 
         if not edge_signal.should_trade:
@@ -128,32 +167,61 @@ class TradingMixin:
             return None
 
         # Convert EdgeSignal → Signal (existing model)
-        # POST_ONLY (maker) orders sit on the BID side of the book.
-        # Using the ASK price would cross the book and get rejected.
         direction = edge_signal.direction
         if direction == Side.UP:
-            price = best_bid_up
+            bid, ask = best_bid_up, best_ask_up
             market_prob = best_bid_up  # Market implied probability
         else:
-            price = best_bid_down
+            bid, ask = best_bid_down, best_ask_down
             market_prob = best_bid_down
+
+        # Order routing: resting maker bids suffer adverse selection in these
+        # short markets — they fill fully when the signal is wrong and barely
+        # at all when it's right. Cross the spread (taker) when the signal is
+        # strong or time is short; only rest at the bid for weaker signals.
+        spread = (ask - bid) if (0 < bid < ask < 1) else 1.0
+        timing = self.config.trading.get_timing(market.variant)
+        take_liquidity = (
+            0 < ask < 0.95
+            and spread <= self.config.execution.max_spread
+            and (
+                edge_signal.conviction == Conviction.HIGH
+                or edge_signal.edge >= self.config.execution.taker_edge_threshold
+                or market.time_remaining < timing["time_for_market"]
+            )
+        )
+        if take_liquidity:
+            price = ask
+            action = OrderAction.LIMIT  # crosses the book, fills immediately
+        else:
+            price = bid
+            action = OrderAction.POST_ONLY
 
         if price <= 0 or price >= 1:
             price = 0.50
+            action = OrderAction.POST_ONLY
+
+        # Conform the limit price to the market's tick size (Gamma orderPriceMinTickSize).
+        price = _round_to_tick(price, market.tick_size)
+
+        # Don't chase nearly-resolved markets: paying >=0.92 risks ~12x the
+        # remaining payoff, and a resting bid up there only fills on an
+        # adverse flash reversal. Kelly would mostly reject these anyway —
+        # skip early to avoid noise and accidental fills.
+        if price >= 0.92:
+            logger.debug(
+                "EDGE_SIGNAL asset=%s result=SKIP reason=price_too_high price=%.3f dir=%s",
+                asset, price, direction.value,
+            )
+            return None
 
         # Size from Kelly fraction * bankroll
         bankroll = self.risk_manager.current_bankroll
         size_usd = bankroll * edge_signal.size_fraction
-        # Floor at Polymarket minimum (max($1, 5 shares * price)), cap at 20% of bankroll
-        min_usd_for_5_shares = max(1.0, 5.0 * price) if price > 0 else 5.0
-        size_usd = max(min_usd_for_5_shares, min(size_usd, bankroll * 0.20))
+        # Floor at the market's real minimum order size (shares), cap at 20% of bankroll
+        min_size_usd = max(1.0, market.min_order_size * price) if price > 0 else 5.0
+        size_usd = max(min_size_usd, min(size_usd, bankroll * 0.20))
         size_shares = size_usd / price if price > 0 else 0.0
-
-        # Always use LIMIT (post-only, zero fees)
-        action = OrderAction.LIMIT
-        # Fall back to POST_ONLY if available, otherwise LIMIT is fine
-        if hasattr(OrderAction, 'POST_ONLY'):
-            action = OrderAction.POST_ONLY
 
         # Throttle EDGE_SIGNAL logs to once per 5s per asset to prevent spam
         _es_log_ts = getattr(self, '_edge_signal_log_ts', {})
@@ -167,10 +235,12 @@ class TradingMixin:
             self._edge_signal_log_ts[asset] = _now_ts
         _es_log_fn(
             "EDGE_SIGNAL asset=%s conviction=%s dir=%s edge=%.4f win_prob=%.2f "
-            "size=$%.2f ofi=%.2f regime=%s reason=%s",
+            "size=$%.2f ofi=%.2f regime=%s route=%s price=%.3f reason=%s",
             asset, edge_signal.conviction.value, direction.value,
             edge_signal.edge, edge_signal.win_probability,
-            size_usd, ofi, regime.regime.value, edge_signal.reason[:60],
+            size_usd, ofi, regime.regime.value,
+            "taker" if take_liquidity else "maker", price,
+            edge_signal.reason[:60],
         )
 
         return Signal(
@@ -219,6 +289,19 @@ class TradingMixin:
         if len(self.risk_manager.positions) >= self.config.trading.max_concurrent_positions:
             # Max positions reached - skip (logged via throttled block later if signal generated)
             self._record_block("max_positions")
+            return
+
+        # === SHORT-CIRCUIT: Skip if this variant's slots are full ===
+        # Reserves capacity per market duration so long-lived 15m positions
+        # can't crowd out 5m trading.
+        variant_cap = self.config.trading.variant_position_cap()
+        variant_count = sum(
+            1 for pos in self.risk_manager.positions.values()
+            if hasattr(pos, 'market')
+            and getattr(pos.market, 'variant', 'fifteen') == market.variant
+        )
+        if variant_count >= variant_cap:
+            self._record_block("variant_cap")
             return
 
         # Track when we first saw this market
@@ -316,7 +399,16 @@ class TradingMixin:
                 self._sanity_throttle = LogThrottle(interval=10.0)
             throttle_key = f"{market.condition_id}:{qv.reason}"
             if self._sanity_throttle.should_log(throttle_key):
-                logger.warning(
+                # A side collapsing to empty near resolution is EXPECTED, not
+                # a fault — log those quietly at DEBUG. Genuinely anomalous
+                # states (crossed book, probability inconsistency) stay at WARN.
+                _expected = {
+                    "missing_prices", "price_out_of_range",
+                    "derived_price_out_of_range", "spread_too_wide_yes",
+                    "spread_too_wide_no",
+                }
+                _log = logger.debug if qv.reason in _expected else logger.warning
+                _log(
                     "DATA_SANITY_FAIL asset=%s variant=%s reason=%s "
                     "yes_bid=%.4f yes_ask=%.4f no_bid=%.4f no_ask=%.4f "
                     "spread_yes=%.4f detail=%s",
@@ -676,10 +768,14 @@ class TradingMixin:
         # Get UP token order book
         up_book = self.clob_feed.get_orderbook(market.up_token_id)
         if up_book:
-            if up_book.best_bid is not None:
-                market.best_bid = up_book.best_bid
-            if up_book.best_ask is not None:
-                market.best_ask = up_book.best_ask
+            # Propagate emptiness, don't keep stale prices. When a side
+            # collapses (near-resolved market: bid empty, ask 0.01) the feed
+            # returns None for that side. Keeping the previous value would make
+            # the validator see a phantom crossed book (stale bid > fresh ask)
+            # and spam DATA_SANITY_FAIL forever. Reset to a sentinel so the
+            # sanity gate reports a quiet "missing_prices" instead.
+            market.best_bid = up_book.best_bid if up_book.best_bid is not None else 0.0
+            market.best_ask = up_book.best_ask if up_book.best_ask is not None else 1.0
 
             # Calculate depth - make thread-safe copies to avoid race conditions
             # with WebSocket thread that may be modifying the orderbook
@@ -985,6 +1081,26 @@ class TradingMixin:
             )
             return
 
+        # Per-variant cap (filled + pending) — reserves slots per market
+        # duration so 15m positions can't occupy all capacity
+        variant_cap = self.config.trading.variant_position_cap()
+        variant_filled = sum(
+            1 for pos in self.risk_manager.positions.values()
+            if hasattr(pos, 'market')
+            and getattr(pos.market, 'variant', 'fifteen') == variant
+        )
+        variant_pending = sum(
+            1 for _, od in pending_items
+            if od.get("variant", "fifteen") == variant
+        )
+        if variant_filled + variant_pending >= variant_cap:
+            self._log_order_block(
+                asset, "variant_position_limit",
+                variant=variant, filled=variant_filled,
+                pending=variant_pending, cap=variant_cap,
+            )
+            return
+
         # Compute exposure breakdown (positions + pending orders) — reused for all exposure checks
         _per_asset_exposure: dict[str, float] = {}
         for pos in self.risk_manager.positions.values():
@@ -1179,17 +1295,17 @@ class TradingMixin:
                 asset, scale_mult, scale_reason, pre_scale_size, signal.size_usd,
             )
 
-        # Floor: ensure size meets Polymarket minimums (max($1, 5 shares * price)).
+        # Floor: ensure size meets the market's real minimum order size (shares).
         # Capital scaling + position cap can both push below the exchange minimum.
         # The kill switch handles full halts; sizing should reduce, not block.
-        MIN_SHARES = 5.0
-        min_floor_usd = max(1.0, MIN_SHARES * signal.recommended_price) if signal.recommended_price > 0 else 5.0
+        min_shares = signal.market.min_order_size
+        min_floor_usd = max(1.0, min_shares * signal.recommended_price) if signal.recommended_price > 0 else 5.0
         if signal.size_usd < min_floor_usd:
             signal.size_usd = min_floor_usd
-            signal.size_shares = MIN_SHARES
+            signal.size_shares = min_shares
             logger.debug(
-                "ORDER_SIZE_FLOOR asset=%s floored=$%.2f (%d shares) pre_scale=%.2f mult=%.2f",
-                asset, min_floor_usd, int(MIN_SHARES), pre_scale_size, scale_mult,
+                "ORDER_SIZE_FLOOR asset=%s floored=$%.2f (%.1f shares) pre_scale=%.2f mult=%.2f",
+                asset, min_floor_usd, min_shares, pre_scale_size, scale_mult,
             )
 
         # ORDER_DECISION is logged here AFTER all blocking gates (cooldown/dup/rate-limit/exposure)

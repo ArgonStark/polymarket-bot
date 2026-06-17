@@ -29,6 +29,7 @@ from ..probability import (
     calculate_true_probability,
     calculate_edge,
     estimate_volatility,
+    estimate_vol_15m_from_ticks,
 )
 from ..config import BotConfig
 from .arbitrage import ArbitrageDetector, select_best_opportunity
@@ -147,6 +148,8 @@ class SignalGenerator:
     # Binance prices (faster, leading indicator)
     binance_prices: dict[str, float] = None
     binance_last_update: dict[str, datetime] = None
+    # Short (timestamp, price) history per asset for drift estimation
+    binance_histories: dict[str, list] = None
 
     # Volatility estimates
     volatilities: dict[str, float] = None
@@ -174,6 +177,8 @@ class SignalGenerator:
             self.binance_prices = {}
         if self.binance_last_update is None:
             self.binance_last_update = {}
+        if self.binance_histories is None:
+            self.binance_histories = {}
         if self.volatilities is None:
             self.volatilities = {}
             # Initialize with default volatilities
@@ -240,17 +245,12 @@ class SignalGenerator:
         # Update volatility estimate periodically
         if len(self.price_histories[symbol_lower]) >= 5:
             asset = symbol_lower.split("/")[0]
-            # Extract just the prices for volatility calculation
-            # Handle both tuple format (timestamp, price) and raw float format
-            prices_only = []
-            for p in self.price_histories[symbol_lower]:
-                if isinstance(p, (list, tuple)) and len(p) >= 2:
-                    prices_only.append(p[1])
-                elif isinstance(p, (int, float)):
-                    prices_only.append(float(p))
-            self.volatilities[asset] = estimate_volatility(
-                prices_only,
-                window=20,
+            # Time-aware realized vol (per-second variance rate scaled to
+            # 15 minutes). The legacy estimate_volatility() treated per-tick
+            # returns as 15-min returns — understating sigma 15-30x, which
+            # made the probability model wildly overconfident.
+            self.volatilities[asset] = estimate_vol_15m_from_ticks(
+                self.price_histories[symbol_lower],
                 default_vol=self.config.volatility.get(asset.upper()),
             )
 
@@ -265,12 +265,47 @@ class SignalGenerator:
             asset: Asset symbol like "BTC", "ETH", etc.
         """
         asset_lower = asset.lower()
+        now = datetime.now(timezone.utc)
         self.binance_prices[asset_lower] = price
-        self.binance_last_update[asset_lower] = datetime.now(timezone.utc)
+        self.binance_last_update[asset_lower] = now
+
+        # Keep a short timestamped history for drift estimation
+        hist = self.binance_histories.setdefault(asset_lower, [])
+        hist.append((now, price))
+        if len(hist) > 60:
+            del hist[:-60]
 
     def get_binance_price(self, asset: str) -> Optional[float]:
         """Get current Binance price for an asset."""
         return self.binance_prices.get(asset.lower())
+
+    def get_binance_drift(self, asset: str, horizon_seconds: float = 5.0) -> float:
+        """
+        Short-horizon Binance return (fraction) over the last ~horizon_seconds.
+
+        Binance leads Chainlink by ~0.5-2s, so the freshest Binance move
+        predicts where Chainlink (the settlement source) is about to print.
+        Returns 0.0 when data is missing or stale (>3s old) — never guesses.
+        """
+        hist = self.binance_histories.get(asset.lower())
+        if not hist or len(hist) < 2:
+            return 0.0
+
+        now = datetime.now(timezone.utc)
+        last_t, last_p = hist[-1]
+        if (now - last_t).total_seconds() > 3.0 or last_p <= 0:
+            return 0.0  # stale feed — no drift signal
+
+        # Earliest tick within the horizon window
+        base_p = None
+        for t, p in hist:
+            if (now - t).total_seconds() <= horizon_seconds and p > 0:
+                base_p = p
+                break
+        if base_p is None or base_p <= 0:
+            return 0.0
+
+        return (last_p - base_p) / base_p
 
     def get_binance_lead(self, asset: str) -> Optional[float]:
         """

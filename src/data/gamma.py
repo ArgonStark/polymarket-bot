@@ -484,6 +484,17 @@ class GammaAPI:
                 duration_min = 5 if variant == "five" else 15
                 start_time = end_time - timedelta(minutes=duration_min)
 
+            # Exchange order constraints (sourced from Gamma, not hardcoded).
+            # orderMinSize = min order size in shares; orderPriceMinTickSize = price tick.
+            try:
+                min_order_size = float(market.get("orderMinSize") or 5.0)
+            except (TypeError, ValueError):
+                min_order_size = 5.0
+            try:
+                tick_size = float(market.get("orderPriceMinTickSize") or 0.001)
+            except (TypeError, ValueError):
+                tick_size = 0.001
+
             return MarketState(
                 condition_id=condition_id,
                 question=question,
@@ -496,6 +507,8 @@ class GammaAPI:
                 best_bid=best_bid,
                 best_ask=best_ask,
                 variant=variant,
+                min_order_size=min_order_size,
+                tick_size=tick_size,
             )
 
         except Exception as e:
@@ -810,20 +823,30 @@ class GammaAPI:
             Market dict or None if not found
         """
         # Use query parameter instead of path parameter
-        # The Gamma API uses condition_ids (plural) as the filter parameter
+        # The Gamma API uses condition_ids (plural) as the filter parameter.
+        #
+        # IMPORTANT (Gamma change 2026-04-09): GET /markets now defaults
+        # closed=false, so a plain condition_ids filter EXCLUDES resolved
+        # markets. This method is only used for settlement resolution, where
+        # the market is (or is about to be) closed. So we try the default
+        # (covers the post-expiry lag window where it's still open) and then
+        # explicitly retry with closed=true.
         url = f"{self.base_url}/markets"
-        params = {"condition_ids": condition_id}
 
-        try:
-            response = self._session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            markets = response.json()
-            if markets and len(markets) > 0:
-                return markets[0]
-            return None
-        except requests.RequestException as e:
-            logger.debug(f"Failed to fetch market by condition_id {condition_id}: {e}")
-            return None
+        for params in ({"condition_ids": condition_id},
+                       {"condition_ids": condition_id, "closed": "true"}):
+            try:
+                response = self._session.get(url, params=params, timeout=10)
+                response.raise_for_status()
+                markets = response.json()
+                if markets and len(markets) > 0:
+                    return markets[0]
+            except requests.RequestException as e:
+                logger.debug(
+                    "Failed to fetch market by condition_id %s (params=%s): %s",
+                    condition_id, params, e,
+                )
+        return None
 
     def get_market_by_slug(self, slug: str) -> Optional[dict]:
         """

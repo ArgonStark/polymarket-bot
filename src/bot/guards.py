@@ -298,6 +298,12 @@ def can_execute_trade(
         if capital_scale_mult < 1.0 and size_without_scaler >= min_trade_usd:
             # Capital scaler is the specific cause — floor at min_trade_usd
             scaled_size = min_trade_usd
+        elif base_size_usd >= min_trade_usd and bankroll * capital_buffer >= min_trade_usd:
+            # The max_position_pct cap (not the signal) pushed the size below
+            # the minimum viable trade. On small bankrolls that cap can sit
+            # permanently below min_trade_usd, which would block trading
+            # entirely — floor at min_trade_usd while the bankroll affords it.
+            scaled_size = min_trade_usd
         else:
             return ExecutionFeasibility(
                 can_execute=False,

@@ -20,9 +20,9 @@ from typing import Optional, Dict, Set, Tuple, Deque
 import asyncio
 import threading
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import OrderArgs, MarketOrderArgs, OrderPayload, OrderType
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 
 from ..models import Order, OrderStatus, TradeResult, Signal, OrderAction
 from ..config import BotConfig
@@ -927,7 +927,7 @@ class OrderExecutor:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                self.client.cancel(order_id=order_id)
+                self.client.cancel_order(OrderPayload(orderID=order_id))
                 logger.info(f"Cancelled order: {order_id[:16]}...")
                 return True
             except Exception as e:

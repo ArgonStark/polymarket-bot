@@ -31,6 +31,9 @@ BINANCE_SYMBOLS = {
     "ETH": "ethusdt",
     "SOL": "solusdt",
     "XRP": "xrpusdt",
+    "DOGE": "dogeusdt",
+    "BNB": "bnbusdt",
+    # HYPE intentionally absent — not on Binance spot (OFI neutral for it)
 }
 SYMBOL_TO_ASSET = {v.upper(): k for k, v in BINANCE_SYMBOLS.items()}
 

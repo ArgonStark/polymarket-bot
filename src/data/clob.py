@@ -95,6 +95,8 @@ class CLOBFeed:
                 bids=list(ob.bids),
                 asks=list(ob.asks),
                 timestamp=ob.timestamp,
+                feed_best_bid=ob.feed_best_bid,
+                feed_best_ask=ob.feed_best_ask,
             )
 
     def get_best_bid(self, token_id: str) -> Optional[float]:
@@ -358,6 +360,33 @@ class CLOBFeed:
                         orderbook.asks.append(OrderBookLevel(price=price, size=size))
                         orderbook.asks.sort(key=lambda x: x.price)
 
+                # Trust the authoritative top-of-book the feed includes in each
+                # change — guards against stale deep levels (phantom 0.99 bids)
+                # that would otherwise poison max()/min().
+                # best_bid=0 / best_ask>=1 mean that side of the book is EMPTY
+                # (e.g. a nearly-resolved UP token: bid 0, ask 0.01). Clear the
+                # accumulated levels too — otherwise stale/synthetic levels
+                # linger and produce phantom crossed books (bid 0.32 vs ask 0.01).
+                try:
+                    fb = change.get("best_bid")
+                    fa = change.get("best_ask")
+                    if fb is not None:
+                        fbv = float(fb)
+                        if fbv > 0:
+                            orderbook.feed_best_bid = fbv
+                        else:
+                            orderbook.feed_best_bid = None
+                            orderbook.bids = []
+                    if fa is not None:
+                        fav = float(fa)
+                        if 0 < fav < 1:
+                            orderbook.feed_best_ask = fav
+                        else:
+                            orderbook.feed_best_ask = None
+                            orderbook.asks = []
+                except (TypeError, ValueError):
+                    pass
+
                 orderbook.timestamp = datetime.now(timezone.utc)
                 modified_books[asset_id] = orderbook
 
@@ -377,8 +406,15 @@ class CLOBFeed:
         if not asset_id:
             return
 
-        best_bid = float(data.get("best_bid", 0))
-        best_ask = float(data.get("best_ask", 0))
+        # Parse with None sentinel: only an EXPLICIT zero/out-of-range value
+        # means "this side is empty" — a missing field must not wipe the book.
+        raw_bid = data.get("best_bid")
+        raw_ask = data.get("best_ask")
+        try:
+            best_bid = float(raw_bid) if raw_bid is not None else None
+            best_ask = float(raw_ask) if raw_ask is not None else None
+        except (TypeError, ValueError):
+            return
 
         with self._orderbook_lock:
             if asset_id not in self._orderbooks:
@@ -386,21 +422,35 @@ class CLOBFeed:
 
             orderbook = self._orderbooks[asset_id]
 
-            # Update top-of-book: ensure at least the best level exists
-            if best_bid > 0:
-                # Remove stale best bid levels above the new best_bid, add new one
-                orderbook.bids = [b for b in orderbook.bids if b.price <= best_bid]
-                if not orderbook.bids or orderbook.bids[0].price != best_bid:
-                    # Synthetic level (size unknown but non-zero)
-                    orderbook.bids = [OrderBookLevel(price=best_bid, size=1.0)] + [
-                        b for b in orderbook.bids if b.price < best_bid
-                    ]
-            if best_ask > 0:
-                orderbook.asks = [a for a in orderbook.asks if a.price >= best_ask]
-                if not orderbook.asks or orderbook.asks[0].price != best_ask:
-                    orderbook.asks = [OrderBookLevel(price=best_ask, size=1.0)] + [
-                        a for a in orderbook.asks if a.price > best_ask
-                    ]
+            # Authoritative top-of-book from the feed (preferred by best_bid/ask).
+            # best_bid=0 / best_ask out of (0,1) mean that side is EMPTY — clear
+            # the accumulated levels (incl. synthetic ones added below) so stale
+            # entries can't produce phantom crossed books (bid 0.32 vs ask 0.01).
+            if best_bid is not None:
+                if best_bid > 0:
+                    orderbook.feed_best_bid = best_bid
+                    # Remove stale best bid levels above the new best_bid, add new one
+                    orderbook.bids = [b for b in orderbook.bids if b.price <= best_bid]
+                    if not orderbook.bids or orderbook.bids[0].price != best_bid:
+                        # Synthetic level (size unknown but non-zero)
+                        orderbook.bids = [OrderBookLevel(price=best_bid, size=1.0)] + [
+                            b for b in orderbook.bids if b.price < best_bid
+                        ]
+                else:
+                    orderbook.feed_best_bid = None
+                    orderbook.bids = []
+
+            if best_ask is not None:
+                if 0 < best_ask < 1:
+                    orderbook.feed_best_ask = best_ask
+                    orderbook.asks = [a for a in orderbook.asks if a.price >= best_ask]
+                    if not orderbook.asks or orderbook.asks[0].price != best_ask:
+                        orderbook.asks = [OrderBookLevel(price=best_ask, size=1.0)] + [
+                            a for a in orderbook.asks if a.price > best_ask
+                        ]
+                else:
+                    orderbook.feed_best_ask = None
+                    orderbook.asks = []
 
             orderbook.timestamp = datetime.now(timezone.utc)
 

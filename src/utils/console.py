@@ -89,6 +89,9 @@ class ColoredFormatter(logging.Formatter):
         "ETH": Colors.BRIGHT_BLUE,
         "SOL": Colors.BRIGHT_MAGENTA,
         "XRP": Colors.BRIGHT_CYAN,
+        "DOGE": Colors.BRIGHT_GREEN,
+        "HYPE": Colors.BRIGHT_RED,
+        "BNB": Colors.YELLOW,
 
         # Sides
         "UP": Colors.BRIGHT_GREEN,

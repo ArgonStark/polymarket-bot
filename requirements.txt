@@ -1,7 +1,9 @@
 # Polymarket 15-Minute Crypto Arbitrage Bot Dependencies
 
-# Trading client
-py-clob-client>=0.1.0
+# Trading client for CLOB V2 (live since Apr 28 2026; legacy py-clob-client
+# V1 SDK no longer works — repo archived May 2026). pUSD replaces USDC.e as
+# collateral; order struct drops nonce/feeRateBps/taker.
+py-clob-client-v2>=1.0.1
 
 # WebSocket connections
 websocket-client>=1.6.0
